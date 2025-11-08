@@ -38,9 +38,11 @@ async function sendTG(msg) {
 
 // 📊 Fetch Candle Data (Binance)
 async function fetchData(symbol, interval = "1m", limit = 60) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance fetch failed ${res.status}`);
+  // Use proxy to bypass Binance region restriction
+const proxy = "https://api.allorigins.win/raw?url=";
+const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+const r = await fetch(proxy + encodeURIComponent(url));
+if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
   const data = await res.json();
   return data.map((k) => ({
     close: parseFloat(k[4]),
