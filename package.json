@@ -1,0 +1,13 @@
+{
+  "name": "ai-trader-bot",
+  "version": "1.0.0",
+  "main": "aiTraderBot.js",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.0.0"
+  },
+  "scripts": {
+    "start": "node aiTraderBot.js"
+  }
+}
