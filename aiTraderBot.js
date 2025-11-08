@@ -26,9 +26,11 @@ async function sendTG(msg){
 }
 
 async function fetchKlines(symbol, interval='1m', limit=60){
-  const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const r = await fetch(url);
-  if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
+  // Use proxy to bypass Binance region restriction
+const proxy = "https://api.allorigins.win/raw?url=";
+const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+const r = await fetch(proxy + encodeURIComponent(url));
+if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
   const data = await r.json();
   return data.map(k=>({
     open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
