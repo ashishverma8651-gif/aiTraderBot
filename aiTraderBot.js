@@ -1,5 +1,5 @@
-// ✅ AI Trader Bot v3 — Self-Ping + Telegram + Binance Proxy (24x7 Active)
-// ------------------------------------------------------------------------
+// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts
+// ----------------------------------------------------------------------
 
 import fetch from "node-fetch";
 import express from "express";
@@ -18,44 +18,54 @@ if (!BOT_TOKEN || !CHAT_ID) {
 
 // 🕒 Get India Time
 function getIndiaTime() {
-  return new Date().toLocaleString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour12: true,
-  });
+  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
 }
 
-// 📩 Send Telegram Message
+// 📩 Telegram Message
 async function sendTG(msg) {
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text: msg,
-        parse_mode: "HTML",
-      }),
+      body: JSON.stringify({ chat_id: CHAT_ID, text: msg, parse_mode: "HTML" }),
     });
   } catch (err) {
     console.error("Telegram Error:", err.message);
   }
 }
 
-// 📊 Binance Data (Proxy safe)
-async function fetchData(symbol, interval = "1m", limit = 60) {
-  const proxy = "https://api.allorigins.win/raw?url=";
-  const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const res = await fetch(proxy + encodeURIComponent(url));
-  if (!res.ok) throw new Error(`Binance fetch failed ${res.status}`);
-  const data = await res.json();
+// 🌍 Proxy List
+const proxies = [
+  "https://api.codetabs.com/v1/proxy?quest=",
+  "https://api.allorigins.win/raw?url=",
+  "https://thingproxy.freeboard.io/fetch/",
+  "https://corsproxy.io/?",
+];
 
-  return data.map((k) => ({
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+// 📊 Binance Fetch (Auto Fallback)
+async function fetchData(symbol, interval = "1m", limit = 60) {
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+
+  for (const proxy of proxies) {
+    try {
+      const finalUrl = proxy + encodeURIComponent(url);
+      const res = await fetch(finalUrl, { timeout: 10000 }); // 10s timeout
+      if (!res.ok) throw new Error(`Proxy ${proxy} failed ${res.status}`);
+      const data = await res.json();
+      return data.map((k) => ({
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+    } catch (err) {
+      console.warn(`⚠️ Proxy failed: ${proxy} → ${err.message}`);
+      continue; // try next proxy
+    }
+  }
+
+  throw new Error("❌ All proxies failed — Binance data unavailable");
 }
 
 // 📈 Analyze divergence + signal
@@ -75,7 +85,7 @@ function analyzeTF(data) {
   return { signal, dp: dp.toFixed(2), dv: dv.toFixed(2), strength };
 }
 
-// 🎯 Target & SL Calculator
+// 🎯 Target & SL
 function getTargetsAndSL(price, signal) {
   let tp1, tp2, tp3, sl;
   const move = price * 0.005;
@@ -97,18 +107,14 @@ function getTargetsAndSL(price, signal) {
   return { tp1, tp2, tp3, sl };
 }
 
-// 🧠 Analyze Once
+// 🧠 Analyzer
 async function analyzeOnce() {
   try {
     const tfs = ["1m", "5m", "15m", "1h"];
     let summary = `📊 <b>${SYMBOL} — AI Trade Summary</b>\n\n`;
-    summary += `📍 <b>Market Pressure:</b> Multi-TF Sentiment\n(1m → 1h)\n\n`;
-    summary += `🔎 <b>Divergence:</b>\n`;
+    summary += `📍 <b>Market Pressure:</b> Multi-TF Sentiment\n(1m → 1h)\n\n🔎 <b>Divergence:</b>\n`;
 
-    let bull = 0,
-      bear = 0,
-      totalStrength = 0,
-      lastPrice = 0;
+    let bull = 0, bear = 0, totalStrength = 0, lastPrice = 0;
 
     for (const tf of tfs) {
       const data = await fetchData(SYMBOL, tf, 60);
@@ -139,7 +145,7 @@ async function analyzeOnce() {
   }
 }
 
-// 🪄 Self Ping Function (keep Render alive)
+// 🔄 Self-Ping to prevent sleep
 async function selfPing() {
   const url = `https://${process.env.RENDER_EXTERNAL_URL || "localhost:3000"}`;
   try {
@@ -154,7 +160,7 @@ async function selfPing() {
 console.log("🤖 AI Trader Bot started...");
 analyzeOnce();
 setInterval(analyzeOnce, CHECK_INTERVAL_MIN * 60 * 1000);
-setInterval(selfPing, 5 * 60 * 1000); // Ping every 5 min
+setInterval(selfPing, 5 * 60 * 1000);
 
 // 🌐 Keep Alive HTTP Server
 const app = express();
