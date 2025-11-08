@@ -4,7 +4,7 @@ import 'dotenv/config';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID   = process.env.CHAT_ID;
 const SYMBOL    = process.env.SYMBOL || 'BTCUSDT';
-const CHECK_MS  = parseInt(process.env.CHECK_INTERVAL_MS || '60000', 10);
+const CHECK_MS  = parseInt(process.env.CHECK_INTERVAL_MS || '900000', 10);
 const INTERVALS = (process.env.INTERVALS || '1m,5m,15m,1h').split(',');
 
 if(!BOT_TOKEN || !CHAT_ID){
@@ -63,7 +63,7 @@ async function analyzeOnce(){
     }
 
     const bias = bull > bear ? 'Bullish 📈' : bear > bull ? 'Bearish 📉' : 'Neutral ⚖️';
-    msg += `\n🧠 Overall Bias: <b>${bias}</b>\n🕒 ${new Date().toLocaleString()}`;
+    msg += `\n🧠 Overall Bias: <b>${bias}</b>msg += `\n🕒 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
     await sendTG(msg);
   }catch(e){
     console.error('analyzeOnce error', e.message || e);
