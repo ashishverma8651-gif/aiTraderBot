@@ -26,7 +26,7 @@ async function sendTG(msg){
 }
 
 async function fetchKlines(symbol, interval='1m', limit=60){
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const r = await fetch(url);
   if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
   const data = await r.json();
