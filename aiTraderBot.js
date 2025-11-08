@@ -1,75 +1,104 @@
 import fetch from 'node-fetch';
 import 'dotenv/config';
 
+// --- Telegram Config ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID   = process.env.CHAT_ID;
-const SYMBOL    = process.env.SYMBOL || 'BTCUSDT';
-const CHECK_MS  = parseInt(process.env.CHECK_INTERVAL_MS || '900000', 150);
-const INTERVALS = (process.env.INTERVALS || '1m,5m,15m,1h').split(',');
+const CHAT_ID = process.env.CHAT_ID;
+const SYMBOL = process.env.SYMBOL || 'BTCUSDT';
 
-if(!BOT_TOKEN || !CHAT_ID){
-  console.error('ERROR: BOT_TOKEN or CHAT_ID not set in environment variables.');
-  process.exit(1);
-}
+// --- Interval Settings (15 min update) ---
+const CHECK_MS = 15 * 60 * 1000; // 15 minutes
 
-async function sendTG(msg){
-  try{
-    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ chat_id: CHAT_ID, text: msg, parse_mode:'HTML' })
+// --- Binance Intervals to analyze ---
+const INTERVALS = ['1m', '5m', '15m', '30m', '1h'];
+
+// --- Send Telegram Message ---
+async function sendTG(msg) {
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CHAT_ID,
+        text: msg,
+        parse_mode: 'HTML'
+      })
     });
-    console.log('Telegram message sent');
-  }catch(e){
-    console.error('Telegram send failed', e.message || e);
+  } catch (e) {
+    console.error('❌ Telegram send failed:', e.message);
   }
 }
 
-async function fetchKlines(symbol, interval='1m', limit=60){
-  // Use proxy to bypass Binance region restriction
-const proxy = "https://api.allorigins.win/raw?url=";
-const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-const r = await fetch(proxy + encodeURIComponent(url));
-if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
-  const data = await r.json();
-  return data.map(k=>({
-    open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
+// --- Fetch candle data from Binance ---
+async function fetchKlines(symbol, interval, limit = 60) {
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Binance fetch failed ${res.status}`);
+  const data = await res.json();
+  return data.map(k => ({
+    time: k[0],
+    open: +k[1],
+    high: +k[2],
+    low: +k[3],
+    close: +k[4],
+    volume: +k[5]
   }));
 }
 
-function detectDivergenceSimple(data){
-  if(!data || data.length < 10) return {signal:'Neutral', emoji:'⚖️'};
+// --- Simple divergence logic (mock) ---
+function detectDivergence(data) {
   const len = data.length;
-  const p1 = data[len - 8].close;
-  const p2 = data[len - 1].close;
-  const v1 = data[len - 8].volume;
-  const v2 = data[len - 1].volume;
-  if(p2 > p1 && v2 < v1) return {signal:'Bearish Divergence', emoji:'🔻'};
-  if(p2 < p1 && v2 > v1) return {signal:'Bullish Divergence', emoji:'🚀'};
-  return {signal:'Neutral', emoji:'⚖️'};
+  const p1 = data[len - 2].close, p2 = data[len - 1].close;
+  const v1 = data[len - 2].volume, v2 = data[len - 1].volume;
+  if (p2 > p1 && v2 < v1) return { signal: 'Bearish Divergence', emoji: '🔻' };
+  if (p2 < p1 && v2 > v1) return { signal: 'Bullish Divergence', emoji: '🚀' };
+  return { signal: 'Neutral', emoji: '⚖️' };
 }
 
-async function analyzeOnce(){
-  try{
-    let msg = `📊 <b>${SYMBOL} — AI 24/7 Monitor</b>\n`;
-    let bull=0, bear=0;
+// --- Convert UTC to India Time (Asia/Kolkata) ---
+function formatIndiaTime(date = new Date()) {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  }).format(date);
+}
 
-    for(const tf of INTERVALS){
-      const data = await fetchKlines(SYMBOL, tf.trim(), 60);
-      const d = detectDivergenceSimple(data);
-      msg += `${d.emoji} ${tf}: ${d.signal}\n`;
-      if(d.signal.includes('Bullish')) bull++;
-      if(d.signal.includes('Bearish')) bear++;
+// --- Main Analyzer ---
+async function analyzeOnce() {
+  try {
+    let msg = `📊 <b>${SYMBOL}</b> — AI 24/7 Monitor\n\n`;
+    let bull = 0, bear = 0;
+
+    for (const tf of INTERVALS) {
+      const data = await fetchKlines(SYMBOL, tf);
+      const d = detectDivergence(data);
+      msg += `${tf}: ${d.emoji} ${d.signal}\n`;
+      if (d.signal.includes('Bullish')) bull++;
+      if (d.signal.includes('Bearish')) bear++;
     }
 
-    const bias = bull > bear ? 'Bullish 📈' : bear > bull ? 'Bearish 📉' : 'Neutral ⚖️';
-    msg += `\n🧠 Overall Bias: <b>${bias}</b>msg += `\n🕒 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+    const bias =
+      bull > bear
+        ? 'Bullish 🚀'
+        : bear > bull
+        ? 'Bearish 📉'
+        : 'Neutral ⚖️';
+
+    msg += `\n🧠 <b>Overall Bias:</b> ${bias}\n⏰ ${formatIndiaTime()}`;
     await sendTG(msg);
-  }catch(e){
-    console.error('analyzeOnce error', e.message || e);
+    console.log('✅ Telegram alert sent:', formatIndiaTime());
+  } catch (e) {
+    console.error('analyzeOnce error:', e.message);
   }
 }
 
-console.log('🚀 ai-trader-bot starting...');
+// --- Run every 15 min ---
+console.log('🤖 ai-trader-bot started...');
 analyzeOnce();
 setInterval(analyzeOnce, CHECK_MS);
