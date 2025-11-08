@@ -4,7 +4,7 @@ import 'dotenv/config';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID   = process.env.CHAT_ID;
 const SYMBOL    = process.env.SYMBOL || 'BTCUSDT';
-const CHECK_MS  = parseInt(process.env.CHECK_INTERVAL_MS || '900000', 10);
+const CHECK_MS  = parseInt(process.env.CHECK_INTERVAL_MS || '900000', 150);
 const INTERVALS = (process.env.INTERVALS || '1m,5m,15m,1h').split(',');
 
 if(!BOT_TOKEN || !CHAT_ID){
