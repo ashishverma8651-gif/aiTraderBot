@@ -41,7 +41,7 @@ async function fetchData(symbol, interval = "1m", limit = 60) {
   // Use proxy to bypass Binance region restriction
 const proxy = "https://api.allorigins.win/raw?url=";
 const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-const r = await fetch(proxy + encodeURIComponent(url));
+const r = await fetch(proxy + encodeURIComponent(url)); 
 if(!r.ok) throw new Error(`Binance fetch failed ${r.status}`);
   const data = await res.json();
   return data.map((k) => ({
@@ -106,3 +106,7 @@ async function analyzeOnce() {
 console.log("🤖 AI Trader Bot started...");
 analyzeOnce();
 setInterval(analyzeOnce, CHECK_INTERVAL_MIN * 60 * 1000);
+import express from "express";
+const app = express();
+app.get("/", (req, res) => res.send("AI Trader Bot Running ✅"));
+app.listen(process.env.PORT || 3000);
