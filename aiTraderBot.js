@@ -1,10 +1,10 @@
 /**
  * 🤖 AI Trader v8.6 + ML Smart Alerts
  * - 15m multi-timeframe report
- * - 1m reversal watcher (Doji, Hammer, Shooting Star) w/ volume spike
+ * - 1m Reversal Watcher (Doji, Hammer, Shooting Star) w/ volume spike
  * - Machine Learning Smart Alerts (adaptive bias confidence)
  * - News fetch, Accuracy tracking, Self-ping, Smart cooldowns
- * - Render-ready single file version
+ * - Render-ready (standalone)
  */
 
 import fetch from "node-fetch";
@@ -17,10 +17,10 @@ const CONFIG = {
   SYMBOL: process.env.SYMBOL || "BTCUSDT",
   TELEGRAM_TOKEN: process.env.BOT_TOKEN,
   CHAT_ID: process.env.CHAT_ID,
-  INTERVAL_MIN: 15, // Main report every 15 mins
-  REV_CHECK_SEC: 60, // Reversal watcher every 1 min
-  REV_COOLDOWN_MIN: 5,
-  ML_THRESHOLD: 0.75, // Smart ML trigger threshold
+  INTERVAL_MIN: 15, // main report every 15 min
+  REV_CHECK_SEC: 60, // reversal watcher every 1 min
+  REV_COOLDOWN_MIN: 5, // avoid repeat alerts
+  ML_THRESHOLD: 0.75,
   PING_INTERVAL_MIN: 5,
 };
 
@@ -31,9 +31,9 @@ const nowTime = () =>
 const fmt = (n, d = 2) =>
   Number.parseFloat(n).toFixed(d).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 
-async function fetchWithFallback(url, options = {}) {
+async function fetchWithFallback(url) {
   try {
-    const res = await fetch(url, options);
+    const res = await fetch(url);
     if (!res.ok) throw new Error("API error");
     return await res.json();
   } catch (err) {
@@ -56,13 +56,14 @@ async function fetchKlines(symbol = "BTCUSDT", interval = "1m", limit = 50) {
 }
 
 async function fetchHeadlines() {
-  const url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&public=true";
+  const url =
+    "https://cryptopanic.com/api/v1/posts/?auth_token=demo&public=true";
   const res = await fetchWithFallback(url);
   if (!res?.results) return [];
   return res.results.slice(0, 3).map((r) => "• " + r.title);
 }
 
-// -------- CANDLE PATTERN DETECTION --------
+// -------- CANDLE PATTERNS --------
 function detectCandlePattern(c) {
   const body = Math.abs(c.close - c.open);
   const upper = c.high - Math.max(c.close, c.open);
@@ -82,7 +83,6 @@ function isVolumeSpike(candles) {
   const last = vols[vols.length - 1];
   return last > avg * 1.8;
 }
-
 // -------- SMART ML SYSTEM --------
 class OnlineLogistic {
   constructor(lr = 0.1) {
@@ -195,7 +195,10 @@ app.listen(3000, () => console.log("🌐 Server running on port 3000"));
 // -------- LOOP SCHEDULERS --------
 setInterval(mainReport, CONFIG.INTERVAL_MIN * 60 * 1000);
 setInterval(reversalWatcher, CONFIG.REV_CHECK_SEC * 1000);
-setInterval(() => fetch("https://aiTraderBot.onrender.com").catch(() => {}), CONFIG.PING_INTERVAL_MIN * 60 * 1000);
+setInterval(
+  () => fetch("https://aiTraderBot.onrender.com").catch(() => {}),
+  CONFIG.PING_INTERVAL_MIN * 60 * 1000
+);
 
 // Initial boot
 console.log("🚀 AI Trader v8.6+ML initialized...");
