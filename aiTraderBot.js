@@ -15,6 +15,78 @@ import express from "express";
 import fs from "fs";
 import dotenv from "dotenv";
 dotenv.config();
+// ------------------ Machine Learning Online Module (Logistic Regression) ------------------
+import fs from "fs";
+const ML_MODEL_FILE = "./ml_model_v86.json";
+
+function sigmoid(z){ return 1/(1+Math.exp(-z)); }
+
+function mlLoad(){
+  try{
+    if(fs.existsSync(ML_MODEL_FILE)){
+      return JSON.parse(fs.readFileSync(ML_MODEL_FILE,"utf8"));
+    }
+  }catch(e){ console.warn("mlLoad err",e.message); }
+  return {w:null,bias:0,n_features:0,lr:0.02,l2:0.0001,trained:0};
+}
+function mlSave(m){ try{ fs.writeFileSync(ML_MODEL_FILE,JSON.stringify(m,null,2)); }catch(e){console.warn("mlSave err",e.message);} }
+
+let ML = mlLoad();
+function mlInit(n){
+  if(!ML.w || ML.n_features!==n){
+    ML.n_features=n;
+    ML.w=new Array(n).fill(0).map(()=>Math.random()*0.01);
+    ML.bias=0; ML.trained=0;
+    mlSave(ML);
+    console.log("ML model initialized n_features=",n);
+  }
+}
+
+function mlExtractFeatures({klines15,lastCandle,avgVol20,divergenceSign,ellConf=0,systemBias=0}){
+  const first=klines15[0], last=klines15.at(-1);
+  const slope15=((last.close-first.close)/(first.close||1))*100;
+  const lastDeltaP=((last.close-last.open)/(last.open||1))*100;
+  const volRatio=avgVol20>0?(last.volume/avgVol20):1;
+  const body=Math.abs(last.close-last.open);
+  const range=(last.high-last.low)||1;
+  const isDoji=body<=range*0.15?1:0;
+  const lowerWick=Math.min(last.open,last.close)-last.low;
+  const upperWick=last.high-Math.max(last.open,last.close);
+  const isHammer=(lowerWick/range>0.4&&upperWick/range<0.25&&last.close>klines15.at(-2).close)?1:0;
+  const isShooting=(upperWick/range>0.4&&lowerWick/range<0.25&&last.close<klines15.at(-2).close)?1:0;
+  return [
+    slope15, lastDeltaP, volRatio-1,
+    isDoji, isHammer, isShooting,
+    divergenceSign||0, ellConf/100, systemBias||0
+  ];
+}
+
+function mlPredict(f){
+  if(!ML.w||ML.w.length!==f.length) mlInit(f.length);
+  const z=ML.bias+f.reduce((s,v,i)=>s+(ML.w[i]||0)*v,0);
+  return sigmoid(z);
+}
+
+function mlTrain(f,label){
+  if(!ML.w||ML.w.length!==f.length) mlInit(f.length);
+  const lr=ML.lr||0.02, l2=ML.l2||0.0001;
+  const p=mlPredict(f); const err=label-p;
+  for(let i=0;i<f.length;i++){
+    ML.w[i]+=lr*(err*f[i]-l2*ML.w[i]);
+  }
+  ML.bias+=lr*err; ML.trained=(ML.trained||0)+1;
+  if(ML.trained%5===0) mlSave(ML);
+  return p;
+}
+
+function biasToSign(b){
+  if(!b) return 0;
+  const s=b.toLowerCase();
+  if(s.includes("bull")) return 1;
+  if(s.includes("bear")) return -1;
+  return 0;
+}
+// ------------------ End ML module ------------------
 
 // ---------- Config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_TOKEN;
