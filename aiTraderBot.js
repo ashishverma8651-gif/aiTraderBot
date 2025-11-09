@@ -1,5 +1,5 @@
-// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts
-// ----------------------------------------------------------------------
+// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts (Render Optimized)
+// -----------------------------------------------------------------------------------------
 
 import fetch from "node-fetch";
 import express from "express";
@@ -61,7 +61,7 @@ async function fetchData(symbol, interval = "1m", limit = 60) {
       }));
     } catch (err) {
       console.warn(`⚠️ Proxy failed: ${proxy} → ${err.message}`);
-      continue; // try next proxy
+      continue;
     }
   }
 
@@ -145,14 +145,18 @@ async function analyzeOnce() {
   }
 }
 
-// 🔄 Self-Ping to prevent sleep
+// 🔄 Self-Ping to prevent Render sleep (optimized)
 async function selfPing() {
-  const url = `https://${process.env.RENDER_EXTERNAL_URL || "localhost:3000"}`;
+  const url = `https://${process.env.RENDER_EXTERNAL_URL || "ai-trader-bot.onrender.com"}`; // ⚠️ Replace with your actual Render URL
   try {
-    await fetch(url);
-    console.log("🔄 Self-ping successful at", getIndiaTime());
+    const res = await fetch(url);
+    if (res.ok) {
+      console.log("🔄 Self-ping OK →", getIndiaTime());
+    } else {
+      console.warn("⚠️ Self-ping got non-OK response:", res.status);
+    }
   } catch (err) {
-    console.log("⚠️ Self-ping failed:", err.message);
+    console.error("⚠️ Self-ping failed:", err.message);
   }
 }
 
@@ -160,7 +164,7 @@ async function selfPing() {
 console.log("🤖 AI Trader Bot started...");
 analyzeOnce();
 setInterval(analyzeOnce, CHECK_INTERVAL_MIN * 60 * 1000);
-setInterval(selfPing, 5 * 60 * 1000);
+setInterval(selfPing, 3 * 60 * 1000); // ping every 3 min (safe)
 
 // 🌐 Keep Alive HTTP Server
 const app = express();
