@@ -1,17 +1,19 @@
 /**
- * AI_Trader_v8.7.2.js
- * - Multi-source klines (Binance -> Coinbase -> CoinGecko fallback)
- * - 15-min multi-TF report + 1m reversal watcher with vol confirm
- * - ML: tiny online logistic-ish trainer & predict
- * - News (CoinTelegraph, CoinDesk), Reddit, Nitter
- * - Self-ping (RENDER_EXTERNAL_URL) to keep service awake
- * - Chunked Telegram messages
+ * AI_Trader_v8.8_full_ml.js
+ * Full single-file bot:
+ * - Multi-source klines: Binance -> Coinbase -> Kraken -> Bitstamp -> CoinGecko (with proxy fallbacks)
+ * - Multi-TF analysis (1m,5m,15m,30m,1h)
+ * - Fib + ATR targets & breakout zones
+ * - Reversal watcher (1m) detecting Doji/Hammer/ShootingStar + High volume
+ * - Tiny online ML (logistic-ish) trainer & predictor (features from price/vol/pattern)
+ * - News (CoinTelegraph, CoinDesk RSS) + Reddit + Nitter + heuristic sentiment
+ * - Accuracy tracking, self-ping, chunked Telegram messages, Express keepalive
  *
  * Requirements:
  *  npm i node-fetch@3 express dotenv
  *
- * Run:
- *  node AI_Trader_v8.7.2.js
+ * Usage:
+ *  node AI_Trader_v8.8_full_ml.js
  */
 
 import fetch from "node-fetch";
@@ -26,9 +28,9 @@ const CHAT_ID = process.env.CHAT_ID;
 const RAW_SYMBOL = process.env.SYMBOL || "BTCUSDT";
 const CHECK_INTERVAL_MIN = parseInt(process.env.CHECK_INTERVAL_MIN || "15", 10);
 const REV_CHECK_INTERVAL_SEC = parseInt(process.env.REV_CHECK_INTERVAL_SEC || "60", 10);
-const ML_ALERT_THRESH = parseFloat(process.env.ML_ALERT_THRESH || "0.7");
+const ML_ALERT_THRESH = parseFloat(process.env.ML_ALERT_THRESH || "0.70", 10);
 const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL || null;
-const SERVER_PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || "10000", 10);
+const PORT = parseInt(process.env.PORT || "10000", 10);
 
 // safety
 if (!BOT_TOKEN || !CHAT_ID) {
@@ -36,10 +38,11 @@ if (!BOT_TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
-// Timeframes
+// Timeframes & limits
 const TIMEFRAMES = ["1m","5m","15m","30m","1h"];
+const LIMITS = { "1m": 200, "5m": 150, "15m": 120, "30m": 100, "1h": 80 };
 
-// Proxies for fallback fetch
+// proxies to bypass CORS / blocks
 const PROXIES = [
   "https://api.codetabs.com/v1/proxy?quest=",
   "https://api.allorigins.win/raw?url=",
@@ -47,169 +50,211 @@ const PROXIES = [
   "https://corsproxy.io/?"
 ];
 
-// Binance mirror endpoints (try)
-const BINANCE_ENDPOINTS = [
+// Binance mirrors
+const BINANCE_MIRRORS = [
   "https://api.binance.com",
   "https://data-api.binance.vision",
   "https://api-gcp.binance.com"
 ];
 
+// Kraken public
+const KRAKEN_BASE = "https://api.kraken.com/0/public";
+
+// Bitstamp public
+const BITSTAMP_BASE = "https://www.bitstamp.net/api";
+
+// CoinGecko
+const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
+
 // storage files
-const ML_MODEL_FILE = "./ml_model_v87.json";
-const LAST_PRED_FILE = "./last_pred_v87.json";
-const ACC_FILE = "./acc_v87.json";
-const LAST_REPORT_FILE = "./last_report_prevclose_v87.json";
+const ML_MODEL_FILE = "./ml_model_v88.json";
+const LAST_PRED_FILE = "./last_pred_v88.json";
+const ACC_FILE = "./acc_v88.json";
+const LAST_REPORT_FILE = "./last_report_prevclose_v88.json";
 
 // ---------- helpers ----------
 const nowStr = () => new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
 
 function chunkMessage(text, chunkSize = 3800) {
-  const out = [];
-  for (let i=0;i<text.length;i+=chunkSize) out.push(text.slice(i,i+chunkSize));
-  return out;
+  const parts = [];
+  for (let i = 0; i < text.length; i += chunkSize) parts.push(text.slice(i, i + chunkSize));
+  return parts;
 }
 
-async function sendTG(text, parse_mode="HTML") {
+async function sendTG(text) {
   const parts = chunkMessage(text);
-  for (const part of parts) {
+  for (const p of parts) {
     try {
       const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ chat_id: CHAT_ID, text: part, parse_mode, disable_web_page_preview: true })
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ chat_id: CHAT_ID, text: p, parse_mode: "HTML", disable_web_page_preview: true })
       });
       const j = await res.json().catch(()=>({}));
       if (!j.ok) console.warn("TG send warning:", j);
     } catch (e) {
       console.warn("TG send failed:", e.message);
     }
-    await new Promise(r=>setTimeout(r, 250));
+    await new Promise(r => setTimeout(r, 220));
   }
 }
 
-async function safeFetch(url, opts={}, tryProxies=true) {
-  // try direct
+async function safeFetch(url, opts = {}, tryProxies = true) {
   try {
     const r = await fetch(url, opts);
     if (r.ok) return r;
-    // return r anyway to allow reading body (error JSON)
+    // if not ok, still return so caller can inspect body
     return r;
-  } catch(e){}
+  } catch(e) {}
   if (!tryProxies) throw new Error("Direct fetch failed");
   for (const p of PROXIES) {
     try {
       const full = p + encodeURIComponent(url);
       const r = await fetch(full, opts);
       if (r.ok) return r;
-    } catch(e){}
+    } catch(e) {}
   }
-  throw new Error("safeFetch: all proxies failed");
+  throw new Error("All proxied fetch attempts failed");
 }
 
-// symbol helpers: create versions for each provider
+// ---------- symbol normalization ----------
 function normalizeSymbols(raw) {
-  const up = raw.toUpperCase();
-  let binSymbol = up;
-  binSymbol = binSymbol.replace(/[-_]/g, "");
-  let coinbaseSymbol;
-  if (binSymbol.endsWith("USDT") || binSymbol.endsWith("USD")) {
-    const base = binSymbol.replace(/(USDT|USD)$/i,"");
-    coinbaseSymbol = `${base}-USD`;
-  } else if (binSymbol.includes("/")) {
-    coinbaseSymbol = binSymbol.replace("/","-");
-  } else {
-    coinbaseSymbol = binSymbol + "-USD";
-  }
-  let coingeckoId = "bitcoin";
-  if (/^BTC/.test(binSymbol)) coingeckoId = "bitcoin";
-  else if (/^ETH/.test(binSymbol)) coingeckoId = "ethereum";
-  else coingeckoId = binSymbol.slice(0,3).toLowerCase();
-  return { binSymbol, coinbaseSymbol, coingeckoId };
+  const up = raw.toUpperCase().replace(/[-_]/g, "");
+  // bin: BTCUSDT etc
+  const binSymbol = up;
+  // coinbase: BTC-USD
+  const coinbaseSymbol = (binSymbol.endsWith("USDT") || binSymbol.endsWith("USD")) ? `${binSymbol.replace(/(USDT|USD)$/i,"")}-USD` : `${binSymbol}-USD`;
+  // coingecko id
+  let coingecko = "bitcoin";
+  if (/^BTC/.test(binSymbol)) coingecko = "bitcoin";
+  else if (/^ETH/.test(binSymbol)) coingecko = "ethereum";
+  else coingecko = binSymbol.slice(0,3).toLowerCase();
+  // kraken symbol mapping (BTCUSD => XBTUSD)
+  const krakenSymbol = (() => {
+    const base = binSymbol.replace(/(USDT|USD)$/i, "");
+    const pair = `${base}USD`.replace(/^BTC/, "XBT");
+    return pair;
+  })();
+  // bitstamp: btcusd
+  const bitstampSymbol = coinbaseSymbol.replace("-", "").toLowerCase();
+  return { binSymbol, coinbaseSymbol, coingecko, krakenSymbol, bitstampSymbol };
 }
 const SYMBOLS = normalizeSymbols(RAW_SYMBOL);
 
-// ---------- DATA FETCHERS ----------
-
-// 1) Binance klines (try mirrors) - returns array of {time,open,high,low,close,volume}
+// ---------- low-level data fetchers ----------
+// 1) Binance klines (mirrors)
 async function fetchKlinesBinance(symbol, interval="15m", limit=80) {
   const path = `/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  for (const base of BINANCE_ENDPOINTS) {
+  for (const base of BINANCE_MIRRORS) {
     try {
-      const url = base.replace(/\/$/,"") + path;
-      const r = await fetch(url);
+      const url = base.replace(/\/$/, "") + path;
+      const r = await safeFetch(url, {}, false);
       const txt = await r.text();
       try {
         const j = JSON.parse(txt);
-        if (!Array.isArray(j)) throw new Error("binance response not array");
-        return j.map(k=>({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] }));
+        if (!Array.isArray(j)) throw new Error("non-array");
+        return j.map(k => ({ time: +k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5] }));
       } catch(e) {
-        console.warn("binance mirror gave non-array or error:", base, txt.slice(0,160));
+        console.warn("Binance mirror non-array or error:", base, e.message);
         continue;
       }
-    } catch(e){ console.warn("fetchKlinesBinance error", base, e.message); continue; }
+    } catch(e) {
+      console.warn("fetchKlinesBinance error", e.message);
+      continue;
+    }
   }
-  throw new Error("All Binance mirrors failed");
+  throw new Error("Binance mirrors failed");
 }
 
 // 2) Coinbase candles fallback
-// Coinbase returns arrays [time, low, high, open, close, volume]
-async function fetchKlinesCoinbase(coinbaseSymbol, interval="15m", limit=80) {
+// Coinbase API: GET /products/{product_id}/candles?granularity=SECONDS
+async function fetchKlinesCoinbase(symbol, interval="15m", limit=80) {
   const granMap = { "1m":60, "5m":300, "15m":900, "30m":1800, "1h":3600 };
   const gran = granMap[interval] || 900;
-  const url = `https://api.exchange.coinbase.com/products/${coinbaseSymbol}/candles?granularity=${gran}`;
-  try {
-    const r = await safeFetch(url, {}, true);
-    const j = await r.json();
-    if (!Array.isArray(j)) throw new Error("Coinbase returned non-array");
-    const sorted = j.slice(-limit).sort((a,b)=>a[0]-b[0]);
-    return sorted.map(k => ({ time: k[0]*1000, open:+k[3], high:+k[2], low:+k[1], close:+k[4], volume: (k[5]||0) }));
-  } catch(e){ throw new Error("Coinbase fetch failed: " + e.message); }
+  const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=${gran}`;
+  const r = await safeFetch(url, {}, true);
+  const j = await r.json();
+  if (!Array.isArray(j)) throw new Error("Coinbase returned non-array");
+  // j entries: [time, low, high, open, close, volume] often descending
+  const sorted = j.slice(-limit).sort((a,b)=>a[0]-b[0]);
+  return sorted.map(k => ({ time: k[0]*1000, open: +k[3], high: +k[2], low: +k[1], close: +k[4], volume: +k[5] }));
 }
 
-// 3) CoinGecko fallback (ohlc)
-async function fetchKlinesCoinGecko(coingeckoId="bitcoin", interval="15m", limit=80) {
-  try {
-    const url = `https://api.coingecko.com/api/v3/coins/${coingeckoId}/ohlc?vs_currency=usd&days=1`;
-    const r = await safeFetch(url);
-    const j = await r.json();
-    if (!Array.isArray(j)) throw new Error("coingecko invalid");
-    const slice = j.slice(-limit);
-    return slice.map(k => ({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume: 0 }));
-  } catch(e){ throw new Error("CoinGecko fetch failed: " + e.message); }
+// 3) Kraken OHLC fallback
+async function fetchKlinesKraken(krakenSymbol, interval="15m", limit=80) {
+  // Kraken intervals: 1,5,15,30,60 minutes mapped to 1,5,15,30,60
+  const map = { "1m":1, "5m":5, "15m":15, "30m":30, "1h":60 };
+  const intv = map[interval] || 15;
+  const url = `${KRAKEN_BASE}/OHLC?pair=${krakenSymbol}&interval=${intv}&since=0`;
+  const r = await safeFetch(url, {}, true);
+  const j = await r.json();
+  // j.result has pair key
+  const keys = Object.keys(j.result || {});
+  if (!keys.length) throw new Error("Kraken result empty");
+  const arr = j.result[keys[0]]; // entries: [time, open, high, low, close, vwap, volume, count]
+  const slice = arr.slice(-limit);
+  return slice.map(k => ({ time: k[0]*1000, open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[6] }));
 }
 
-// Unified fetchKlines that chooses best available source automatically
-async function fetchKlines(symbolRaw, interval="15m", limit=80) {
-  const { binSymbol, coinbaseSymbol, coingeckoId } = SYMBOLS;
-  // try Binance
+// 4) Bitstamp OHLC fallback
+async function fetchKlinesBitstamp(symbol, interval="15m", limit=80) {
+  // bitstamp has minute resolution endpoint: /v2/ohlc/{currency_pair}/?step=60&limit=1000
+  const stepMap = { "1m":60, "5m":300, "15m":900, "30m":1800, "1h":3600 };
+  const step = stepMap[interval] || 900;
+  const url = `${BITSTAMP_BASE}/v2/ohlc/${symbol}/?step=${step}&limit=${limit}`;
+  const r = await safeFetch(url, {}, true);
+  const j = await r.json();
+  if (!j?.data?.ohlc) throw new Error("Bitstamp invalid response");
+  const arr = j.data.ohlc;
+  const sorted = arr.slice(-limit).sort((a,b)=>a.timestamp - b.timestamp);
+  return sorted.map(k => ({ time: k.timestamp*1000, open:+k.open, high:+k.high, low:+k.low, close:+k.close, volume:+k.volume }));
+}
+
+// 5) CoinGecko OHLC fallback (no volume)
+async function fetchKlinesCoinGecko(id="bitcoin", interval="15m", limit=80) {
+  const url = `${COINGECKO_BASE}/coins/${id}/ohlc?vs_currency=usd&days=1`;
+  const r = await safeFetch(url, {}, true);
+  const j = await r.json();
+  if (!Array.isArray(j)) throw new Error("CoinGecko invalid");
+  const slice = j.slice(-limit);
+  return slice.map(k => ({ time: +k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume: 0 }));
+}
+
+// Unified multi-source fetch that tries in order and returns {data, source}
+async function fetchKlinesUnified(symbolRaw, interval="15m", limit=80) {
+  const { binSymbol, coinbaseSymbol, coingecko, krakenSymbol, bitstampSymbol } = SYMBOLS;
+  // 1) Binance
   try {
-    const kl = await fetchKlinesBinance(binSymbol, interval, limit);
-    return { data: kl, source: "Binance" };
-  } catch(e) {
-    console.warn("Binance failed:", e.message);
-  }
-  // try Coinbase
+    const bin = await fetchKlinesBinance(binSymbol, interval, limit);
+    if (bin && bin.length >= Math.max(10, Math.floor(limit/2))) return { data: bin, source: "Binance" };
+  } catch(e) { console.warn("Binance fail:", e.message); }
+  // 2) Coinbase
   try {
-    const kl = await fetchKlinesCoinbase(coinbaseSymbol, interval, limit);
-    return { data: kl, source: "Coinbase" };
-  } catch(e) {
-    console.warn("Coinbase failed:", e.message);
-  }
-  // try CoinGecko
+    const cb = await fetchKlinesCoinbase(coinbaseSymbol, interval, limit);
+    if (cb && cb.length >= Math.max(6, Math.floor(limit/3))) return { data: cb, source: "Coinbase" };
+  } catch(e) { console.warn("Coinbase fail:", e.message); }
+  // 3) Kraken
   try {
-    const kl = await fetchKlinesCoinGecko(coingeckoId, interval, limit);
-    return { data: kl, source: "CoinGecko" };
-  } catch(e) {
-    console.warn("CoinGecko failed:", e.message);
-  }
-  // all failed
+    const kr = await fetchKlinesKraken(krakenSymbol, interval, limit);
+    if (kr && kr.length >= Math.max(6, Math.floor(limit/3))) return { data: kr, source: "Kraken" };
+  } catch(e) { console.warn("Kraken fail:", e.message); }
+  // 4) Bitstamp
+  try {
+    const bs = await fetchKlinesBitstamp(bitstampSymbol, interval, limit);
+    if (bs && bs.length >= Math.max(6, Math.floor(limit/3))) return { data: bs, source: "Bitstamp" };
+  } catch(e) { console.warn("Bitstamp fail:", e.message); }
+  // 5) CoinGecko
+  try {
+    const cg = await fetchKlinesCoinGecko(coingecko, interval, limit);
+    if (cg && cg.length) return { data: cg, source: "CoinGecko" };
+  } catch(e) { console.warn("CoinGecko fail:", e.message); }
   return { data: [], source: "None" };
 }
 
-// ---------- News & Social fetchers ----------
+// ---------- News & social fetchers ----------
 async function fetchRSS(url, limit=6) {
   try {
-    const r = await safeFetch(url);
+    const r = await safeFetch(url, {}, true);
     const txt = await r.text();
     const items = txt.split("<item>").slice(1, limit+1);
     return items.map(it => {
@@ -233,23 +278,23 @@ async function fetchReddit(limit=8) {
     const j = await r.json();
     if (!j?.data?.children) return [];
     return j.data.children.map(c => ({ title: c.data.title||"", ups: c.data.ups||0 }));
-  } catch(e){ console.warn("fetchReddit", e.message); return []; }
+  } catch(e) { console.warn("fetchReddit fail", e.message); return []; }
 }
 async function fetchNitter(q="bitcoin", limit=6) {
   try {
     const url = `https://nitter.net/search?f=tweets&q=${encodeURIComponent(q)}&src=typed_query`;
-    const r = await safeFetch(url);
+    const r = await safeFetch(url, {}, true);
     const html = await r.text();
     const matches = [...html.matchAll(/class="tweet-content[^"]*"[^>]*>([\s\S]*?)<\/(a|div)>/g)];
     return matches.slice(0,limit).map(m => m[1].replace(/<[^>]+>/g,"").trim());
-  } catch(e){ console.warn("fetchNitter", e.message); return []; }
+  } catch(e) { console.warn("fetchNitter fail", e.message); return []; }
 }
 
-// ---------- Analysis helpers ----------
+// ---------- analysis helpers ----------
 function avgVolume(klines, n=20) {
   if (!klines || !klines.length) return 0;
   const slice = klines.slice(-n);
-  const s = slice.reduce((acc,k)=>acc + (k.volume||0), 0);
+  const s = slice.reduce((acc,k)=>acc + (k.volume || 0), 0);
   return s / slice.length;
 }
 function calcVolSent(klines) {
@@ -278,12 +323,13 @@ function atr(klines, period=14) {
   if (!klines || klines.length < period+1) return null;
   const trs = [];
   for (let i=1;i<klines.length;i++){
-    const cur = klines[i], prev = klines[i-1];
+    const cur=klines[i], prev=klines[i-1];
     const tr = Math.max(cur.high-cur.low, Math.abs(cur.high-prev.close), Math.abs(cur.low-prev.close));
     trs.push(tr);
   }
   const slice = trs.slice(-period);
-  return slice.reduce((a,b)=>a+b,0)/slice.length;
+  const sum = slice.reduce((a,b)=>a+b,0);
+  return sum / period;
 }
 function detectDivergence(kl) {
   if (!kl || kl.length < 2) return { type:"Neutral", dp:0, dv:0, strength:0 };
@@ -309,13 +355,22 @@ function detectCandlePatternSingle(last, prev) {
   const isShooting = upperRatio > 0.4 && lowerRatio < 0.25 && last.close < (prev?prev.close:last.open);
   return { isDoji:isDoji?1:0, isHammer:isHammer?1:0, isShooting:isShooting?1:0, body, range };
 }
-function getTargetsAndSL(price, dir="Neutral", atrVal=null) {
+function getTargetsAndSL(price, dir="Neutral", atrVal=null, fib=null) {
   if (!price || isNaN(price)) return { tp1:"N/A", tp2:"N/A", tp3:"N/A", sl:"N/A" };
+  // prefer fib levels if available for entries; use ATR for move sizing
   const move = (atrVal && isFinite(atrVal)) ? atrVal : price*0.005;
   if (dir.includes("Bull")) {
-    return { tp1:(price+move).toFixed(2), tp2:(price+move*1.8).toFixed(2), tp3:(price+move*3).toFixed(2), sl:(price-move*0.8).toFixed(2) };
+    const tp1 = (price + move).toFixed(2);
+    const tp2 = (price + move*1.8).toFixed(2);
+    const tp3 = (price + move*3).toFixed(2);
+    const sl = (price - (move * 0.8)).toFixed(2);
+    return { tp1, tp2, tp3, sl };
   } else if (dir.includes("Bear")) {
-    return { tp1:(price-move).toFixed(2), tp2:(price-move*1.8).toFixed(2), tp3:(price-move*3).toFixed(2), sl:(price+move*0.8).toFixed(2) };
+    const tp1 = (price - move).toFixed(2);
+    const tp2 = (price - move*1.8).toFixed(2);
+    const tp3 = (price - move*3).toFixed(2);
+    const sl = (price + (move * 0.8)).toFixed(2);
+    return { tp1, tp2, tp3, sl };
   } else return { tp1:"N/A", tp2:"N/A", tp3:"N/A", sl:"N/A" };
 }
 
@@ -324,7 +379,7 @@ function pushAccLocal(correct) {
   try {
     const arr = fs.existsSync(ACC_FILE) ? JSON.parse(fs.readFileSync(ACC_FILE,"utf8")) : [];
     arr.push(correct?1:0);
-    while (arr.length > 100) arr.shift();
+    while (arr.length > 120) arr.shift();
     fs.writeFileSync(ACC_FILE, JSON.stringify(arr,null,2));
   } catch(e) { console.warn("pushAccLocal", e.message); }
 }
@@ -338,11 +393,10 @@ function getAccLocal(lastN=10) {
   } catch(e) { return "N/A"; }
 }
 
-// ---------- ML (online logistic-ish) ----------
+// ---------- ML module ----------
 function mlLoad() {
-  try {
-    if (fs.existsSync(ML_MODEL_FILE)) return JSON.parse(fs.readFileSync(ML_MODEL_FILE,"utf8"));
-  } catch(e) { console.warn("mlLoad", e.message); }
+  try { if (fs.existsSync(ML_MODEL_FILE)) return JSON.parse(fs.readFileSync(ML_MODEL_FILE,"utf8")); }
+  catch(e){ console.warn("mlLoad", e.message); }
   return { w:null, bias:0, n_features:0, lr:0.02, l2:0.0001, trained:0, threshold: ML_ALERT_THRESH };
 }
 function mlSave() { try { fs.writeFileSync(ML_MODEL_FILE, JSON.stringify(ML,null,2)); } catch(e) { console.warn("mlSave", e.message); } }
@@ -411,9 +465,7 @@ async function selfPing() {
   try {
     const r = await fetch(url);
     console.log("Self-ping status", r.status);
-  } catch(e) {
-    console.warn("Self-ping failed", e.message);
-  }
+  } catch(e) { console.warn("Self-ping failed", e.message); }
 }
 
 // ---------- Reversal watcher ----------
@@ -421,8 +473,8 @@ let lastRevAt = 0;
 const REV_COOLDOWN_MS = 90 * 1000;
 async function reversalWatcherOnce() {
   try {
-    const { data: kl1, source } = await fetchKlines(RAW_SYMBOL, "1m", 50);
-    if (!kl1 || kl1.length < 3) return;
+    const { data: kl1, source } = await fetchKlinesUnified(RAW_SYMBOL, "1m", LIMITS["1m"]);
+    if (!kl1 || kl1.length < 5) return;
     const last = kl1.at(-1), prev = kl1.at(-2);
     const avgVol = avgVolume(kl1, 20) || 1;
     const patt = detectCandlePatternSingle(last, prev);
@@ -436,11 +488,11 @@ async function reversalWatcherOnce() {
     if (reason) {
       lastRevAt = now;
       const dir = patt.isHammer ? "Bullish" : patt.isShooting ? "Bearish" : "Neutral";
-      const feat = mlExtractFeatures({ klines15: kl1.slice(-20), lastCandle: last, avgVol20: avgVol, divergenceSign:0, ellConf:0, systemBias:0 });
-      const prob = mlPredict(feat);
-      const txt = `🚨 <b>Reversal Watcher</b>\n${nowStr()}\nSymbol: <b>${RAW_SYMBOL}</b>\nSource: ${source}\nPattern: <b>${reason}</b>\nVolume: ${last.volume.toFixed(0)} (avg ${avgVol.toFixed(0)})\nPrice: ${last.close.toFixed(2)}\nML Prob: ${(prob*100).toFixed(1)}%`;
+      const feat = mlExtractFeatures({ klines15: kl1.slice(-40), lastCandle: last, avgVol20: avgVol, divergenceSign:0, ellConf:0, systemBias:0 });
+     const prob = mlPredict(feat);
+      const txt = `🚨 <b>Reversal Watcher</b>\n${nowStr()}\nSymbol: <b>${RAW_SYMBOL}</b>\nSource: ${source}\nPattern: <b>${reason}</b>\nVolume: ${Math.round(last.volume)} (avg ${Math.round(avgVol)})\nPrice: ${last.close.toFixed(2)}\nML Prob: ${(prob*100).toFixed(1)}%`;
       await sendTG(txt);
-      // soft training: label 1 if prob > threshold else 0
+      // Soft training: label 1 if prob>threshold else 0 (heuristic)
       try { mlTrain(feat, prob > (ML.threshold || ML_ALERT_THRESH) ? 1 : 0); } catch(e){ console.warn("mlTrain error", e.message); }
     }
   } catch(e) { console.warn("reversalWatcherOnce error", e.message); }
@@ -449,27 +501,40 @@ async function reversalWatcherOnce() {
 // ---------- Main analyze & report ----------
 async function analyzeAndReport() {
   try {
-    // fetch TF klines
-    const tfData = {};
-    const sourcesUsed = {};
+    const tfData = {}, sourcesUsed = {};
     for (const tf of TIMEFRAMES) {
-      const { data, source } = await fetchKlines(RAW_SYMBOL, tf, tf === "1m" ? 120 : 100);
+      let { data, source } = await fetchKlinesUnified(RAW_SYMBOL, tf, LIMITS[tf] || 80);
+      // Force extra fallbacks if data too small
+      if ((!data || data.length < 6) && source === "Binance") {
+        try {
+          const cb = await fetchKlinesCoinbase(SYMBOLS.coinbaseSymbol, tf, LIMITS[tf] || 80);
+          if (cb && cb.length >= 6) { data = cb; source = "Coinbase"; }
+        } catch(e) { /* ignore */ }
+      }
+      if ((!data || data.length < 6) && source !== "CoinGecko") {
+        try {
+          const cg = await fetchKlinesCoinGecko(SYMBOLS.coingecko, tf, LIMITS[tf] || 80);
+          if (cg && cg.length) { data = cg; source = "CoinGecko"; }
+        } catch(e) {}
+      }
       tfData[tf] = data || [];
       sourcesUsed[tf] = source || "None";
     }
+
     const base = tfData["15m"] || [];
     if (!base || base.length < 8) {
-      const msg = `❗ Not enough 15m candles (${(base||[]).length}) — skipping (${nowStr()})`;
-      console.warn(msg);
-      try { await sendTG(msg); } catch(e){}
+      const txt = `❗ Not enough 15m candles (${(base||[]).length}) — skipping (${nowStr()})`;
+      console.warn(txt);
+      await sendTG(txt);
       return;
     }
+
     const lastPrice = base.at(-1).close;
     const tech = calcVolSent(base);
     const fib = calcFib(base);
     const atrVal = atr(base, 14);
 
-    // per-TF analysis
+    // per-TF
     let bull=0,bear=0,totalStrength=0;
     let perTfText = "";
     for (const tf of TIMEFRAMES) {
@@ -480,7 +545,7 @@ async function analyzeAndReport() {
       if (d.type.includes("Bull")) bull++;
       if (d.type.includes("Bear")) bear++;
       totalStrength += d.strength || 0;
-      perTfText += `\n⏱ ${tf} | ${d.type} | ΔP ${d.dp.toFixed(2)}% | ΔV ${d.dv.toFixed(2)}% | Strength ${Math.round(d.strength)} | Source: ${sourcesUsed[tf]}\nTrend: ${trend}\n`;
+      perTfText += `\n⏱ ${tf} | ${d.type} | ΔP ${d.dp.toFixed(2)}% | ΔV ${d.dv.toFixed(2)}% | Str ${Math.round(d.strength)} | Source: ${sourcesUsed[tf]}\nTrend: ${trend}\n`;
     }
 
     // news & socials
@@ -489,9 +554,9 @@ async function analyzeAndReport() {
     const redditArr = redditRes.status==="fulfilled"? redditRes.value : [];
     const tweetsArr = nitterRes.status==="fulfilled"? nitterRes.value : [];
 
-    // news sentiment
-    const posK = ["surge","approval","bull","bullish","gain","rally","soar","support","up","rise","positive"];
-    const negK = ["bear","dump","selloff","crash","fear","ban","hack","lawsuit","negative","fall"];
+    // news sentiment heuristic
+    const posK = ["surge","approval","bull","bullish","gain","rally","soar","support","up","rise","positive","etf"];
+    const negK = ["bear","dump","selloff","crash","fear","ban","hack","lawsuit","negative","fall","liquidation"];
     let newsScore = 0;
     for (const n of newsArr) {
       const t = (n.title||"").toLowerCase();
@@ -502,7 +567,7 @@ async function analyzeAndReport() {
     if (Math.abs(newsScore) >= 3) newsImpact = "High";
     else if (Math.abs(newsScore) >= 1) newsImpact = "Medium";
 
-        // merge signals
+    // merge signals
     const techNorm = Math.max(-1, Math.min(1, (tech.buyPct - tech.sellPct)/100 ));
     const newsNorm = Math.max(-1, Math.min(1, newsScore/6 ));
     let redditScoreVal = 0;
@@ -510,16 +575,15 @@ async function analyzeAndReport() {
     const socialNorm = Math.max(-1, Math.min(1, redditScoreVal/6 ));
     const COMBINED = 0.55*techNorm + 0.30*newsNorm + 0.15*socialNorm;
     const label = COMBINED > 0.12 ? "Bullish" : COMBINED < -0.12 ? "Bearish" : "Neutral";
-    const rawConfidence = Math.abs(COMBINED);
-    const confidencePct = Math.round(Math.min(99, rawConfidence * 100));
+    const confidencePct = Math.round(Math.min(99, Math.abs(COMBINED) * 100));
     if (label.includes("Bull")) bull++;
     if (label.includes("Bear")) bear++;
 
     // targets & breakout
-    const tgs = getTargetsAndSL(lastPrice, label, atrVal);
+    const tgs = getTargetsAndSL(lastPrice, label, atrVal, fib);
     const breakoutRange = (fib && isFinite(fib.fib382) && isFinite(fib.fib618)) ? `${fib.fib618.toFixed(2)} - ${fib.fib382.toFixed(2)}` : "N/A";
 
-    // ML training on previous prediction (if exists)
+    // ML: train on previous saved pred (if exists)
     try {
       if (fs.existsSync(LAST_PRED_FILE)) {
         const prev = JSON.parse(fs.readFileSync(LAST_PRED_FILE,"utf8"));
@@ -540,9 +604,9 @@ async function analyzeAndReport() {
           console.log("ML trained on previous prediction label", labelTrain, "probBefore", probBefore.toFixed(3));
         }
       }
-    } catch(e){ console.warn("ML training on prev error", e.message); }
+    } catch(e) { console.warn("ML train prev error", e.message); }
 
-    // prepare current features & predict
+    // ML predict current
     const feat = mlExtractFeatures({
       klines15: base.slice(-40),
       lastCandle: base.at(-1),
@@ -553,7 +617,7 @@ async function analyzeAndReport() {
     });
     const mlProb = mlPredict(feat);
 
-    // save last pred payload
+    // save last pred
     try {
       const lastPredPayload = {
         pred: label,
@@ -566,7 +630,7 @@ async function analyzeAndReport() {
       fs.writeFileSync(LAST_PRED_FILE, JSON.stringify(lastPredPayload,null,2));
     } catch(e) { console.warn("save last pred error", e.message); }
 
-    // update accuracy tracking (compare last saved report to current price)
+    // update accuracy
     try {
       if (fs.existsSync(LAST_REPORT_FILE)) {
         const prev = JSON.parse(fs.readFileSync(LAST_REPORT_FILE,"utf8"));
@@ -576,27 +640,22 @@ async function analyzeAndReport() {
         }
       }
       fs.writeFileSync(LAST_REPORT_FILE, JSON.stringify({ pred: label, prevClose: lastPrice, ts: Date.now() },null,2));
-    } catch(e){ console.warn("acc update", e.message); }
+    } catch(e) { console.warn("acc update", e.message); }
 
-    // build message
-    let msg = `<b>🤖 ${RAW_SYMBOL} | AI Trader v8.7.2</b>\n🕒 ${nowStr()}\n`;
+    // construct message
+    let msg = `<b>🤖 ${RAW_SYMBOL} — AI Trader v8.8 (Full ML)</b>\n🕒 ${nowStr()}\n`;
     msg += perTfText + "\n\n";
-    msg += `🎯 <b>Targets:</b>\nTP1: ${tgs.tp1} | TP2: ${tgs.tp2} | TP3: ${tgs.tp3}\nSL: ${tgs.sl}\n📊 Breakout Range: ${breakoutRange}\n\n`;
-    msg += `🧠 <b>Overall Bias:</b> ${label} | Confidence: ${confidencePct}%\n💰 Last Price: ${lastPrice.toFixed(2)}\n📈 Tech Vol: Buy ${tech.buyPct.toFixed(2)}% / Sell ${tech.sellPct.toFixed(2)}%\n📉 ATR(14): ${(atrVal||0).toFixed(2)}\nAccuracy(Last10): ${getAccLocal(10)}%\n📰 News Impact: ${newsImpact}\n`;
+    msg += `🎯 <b>Targets & Zones</b>\nTP1: ${tgs.tp1} | TP2: ${tgs.tp2} | TP3: ${tgs.tp3}\nSL: ${tgs.sl}\nBreakout: ${breakoutRange}\n\n`;
+    msg += `🧠 <b>Bias:</b> ${label} | Confidence: ${confidencePct}% | ML Prob: ${(mlProb*100).toFixed(1)}% (thr ${(ML.threshold||ML_ALERT_THRESH)*100}%)\n💰 Price: ${lastPrice.toFixed(2)} | ATR(14): ${(atrVal||0).toFixed(2)}\n📈 Vol: Buy ${tech.buyPct.toFixed(2)}% / Sell ${tech.sellPct.toFixed(2)}% | Accuracy(last10): ${getAccLocal(10)}%\n📰 News Impact: ${newsImpact}\nSources: ${Object.values(sourcesUsed).join(", ")}\n\n`;
+    if (newsArr.length) { msg += "<b>Headlines:</b>\n"; for (const n of newsArr) msg += `• ${n.title}\n`; }
+    else msg += "<b>Headlines:</b> None\n";
+    msg += `\n🔎 Reversal Watcher active. ML alerts will be sent when conditions & prob exceed threshold.\n`;
 
-    if (newsArr.length) {
-      msg += `\n📰 <b>Headlines:</b>\n`;
-      for (const n of newsArr) msg += `• ${n.title}\n`;
-    } else {
-      msg += `\n📰 <b>Headlines:</b> No recent headlines\n`;
+    // ML alert addition
+    if (mlProb >= (ML.threshold || ML_ALERT_THRESH) && confidencePct >= 40) {
+      msg += `\n🚨 <b>ML Smart Alert</b>: ${(mlProb*100).toFixed(1)}% chance of ${label} — watch breakout range\n`;
     }
 
-    msg += `\n🤖 ML Smart Prob: ${(mlProb*100).toFixed(1)}% (threshold ${(ML.threshold||ML_ALERT_THRESH)*100}%)\n`;
-    if (mlProb >= (ML.threshold || ML_ALERT_THRESH) && confidencePct > 40) {
-      msg += `\n🚨 <b>ML Smart Alert:</b> ${(mlProb*100).toFixed(1)}% probability of ${label} move — consider watching breakout zone\n`;
-    }
-
-    // send message
     await sendTG(msg);
 
   } catch (e) {
@@ -605,29 +664,26 @@ async function analyzeAndReport() {
   }
 }
 
-// ---------- periodic loops ----------
-async function startLoops() {
-  // run immediately
+// ---------- LOOP START ----------
+async function startAll() {
+  // ensure ML init
+  mlInit(9);
+  // immediate runs
   await analyzeAndReport();
-  // schedule main reports
+  await reversalWatcherOnce();
+  // intervals
   setInterval(analyzeAndReport, CHECK_INTERVAL_MIN * 60 * 1000);
-  // reversal watcher (checks every REV_CHECK_INTERVAL_SEC)
   setInterval(reversalWatcherOnce, REV_CHECK_INTERVAL_SEC * 1000);
-  // self-ping (every 5 minutes)
   if (SELF_PING_URL) setInterval(selfPing, 5 * 60 * 1000);
 }
 
-// ---------- minimal HTTP for Render (keepalive) ----------
+// ---------- Express keepalive ----------
 const app = express();
-app.get("/", (req,res) => res.send("AI Trader v8.7.2 running"));
-app.listen(SERVER_PORT, async () => {
-  console.log("Server listening on port", SERVER_PORT);
-  // initialize ML with default feature length (9) - will be re-init if needed
-  mlInit(9);
-  await startLoops();
-});
-
-// expose a simple /check endpoint to run immediate report
-app.get("/check", async (req,res) => {
+app.get("/", (_, res) => res.send("AI Trader v8.8 running"));
+app.get("/check", async (_, res) => {
   try { await analyzeAndReport(); res.json({ ok:true }); } catch(e){ res.status(500).json({ ok:false, err:e.message }); }
+});
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  startAll().catch(e=>console.error("startAll error", e.message));
 });
