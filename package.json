@@ -2,7 +2,7 @@
   "name": "ai-trader-bot",
   "version": "1.0.0",
   "description": "AI Trader Bot running on Render",
-  "main": "src/aiTraderBot_v7.js",
+  "main": "aiTraderBot.js",
   "type": "module",
   "dependencies": {
     "express": "^4.18.2",
@@ -10,6 +10,6 @@
     "dotenv": "^16.3.1"
   },
   "scripts": {
-    "start": "node src/aiTraderBot_v7.js"
+    "start": "node aiTraderBot.js"
   }
 }
