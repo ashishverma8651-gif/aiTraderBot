@@ -22,7 +22,7 @@ import {
   adjustAutoThreshold,
   loadModelSafe,
   saveModelSafe,
-  defaultModel
+  // defaultModel
 } from "./part2_ml_module_v8_7.js";
 
 // ---------- CONFIG ----------
