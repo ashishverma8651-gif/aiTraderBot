@@ -21,7 +21,7 @@ import express from "express";
 import fs from "fs";
 import dotenv from "dotenv";
 dotenv.config();
-
+import { initTelegramCommands } from "./tg_commands.js";
 // ---------- CONFIG ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
