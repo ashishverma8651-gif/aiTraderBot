@@ -688,16 +688,9 @@ app.listen(PORT, () => {
   startAll().catch(e=>console.error("startAll error", e.message));
 });
 // === Telegram Command System ===
-  try {
-    initTelegramCommands({
-      BOT_TOKEN,
-      CHAT_ID,
-      SYMBOL: SYMBOL || RAW_SYMBOL,
-      analyzeAndReport,
-      fetchHeadlines,
-      fetchKlines
-    });
-    console.log("✅ Telegram command handler active");
-  } catch (err) {
-    console.error("❌ Telegram command init failed:", err.message);
-  }
+  initTelegramCommands({
+  SYMBOL,
+  analyzeAndReport,
+  fetchHeadlines,
+  reversalWatcherOnce
+});
