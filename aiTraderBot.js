@@ -1,12 +1,11 @@
 /**
- * AI Trader v8.6 + ML (Final Stable Build)
- * ---------------------------------------
- * ✅ Multi-TF market report every 15 min
- * ✅ Reversal detection (Doji, Hammer, Shooting Star)
- * ✅ High Volume confirmation + Smart alert cooldown
- * ✅ Machine Learning: online logistic regression
- * ✅ Auto-threshold tuning, model persistence
- * ✅ News sentiment + Smart ping + Telegram report
+ * AI Trader v8.6 + ML Stable
+ * ---------------------------
+ * ✅ Multi-timeframe report
+ * ✅ Reversal Watcher (Doji, Hammer, Shooting Star)
+ * ✅ Volume confirmation + cooldown
+ * ✅ Machine Learning (smart probability + auto-threshold)
+ * ✅ News headlines + self-ping + Telegram updates
  */
 
 import fetch from "node-fetch";
@@ -16,7 +15,7 @@ import fs from "fs/promises";
 
 dotenv.config();
 
-// ========== CONFIG ==========
+// ========= CONFIG =========
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const SYMBOL = process.env.SYMBOL || "BTCUSDT";
@@ -25,23 +24,22 @@ const REV_CHECK_INTERVAL_SEC = parseInt(process.env.REV_CHECK_INTERVAL_SEC || "6
 const ML_MODEL_PATH = "./ml_model.json";
 const PORT = process.env.PORT || 3000;
 
-// ========== ML MODULE ==========
+// ========= ML MODULE =========
 let MODEL = null;
 
 function defaultModel() {
   return {
     version: "v1",
-    weights: { bias: 0, techDiff: 0, newsScore: 0, volSpike: 0, dojiHammer: 0, slope: 0 },
+    weights: { bias: 0, techDiff: 0, volSpike: 0, dojiHammer: 0 },
     lr: 0.05,
-    history: [],
     threshold: 0.7,
-    meta: { created: Date.now() }
+    history: []
   };
 }
 
-async function loadModelSafe(path = ML_MODEL_PATH) {
+async function loadModelSafe() {
   try {
-    const data = await fs.readFile(path, "utf8");
+    const data = await fs.readFile(ML_MODEL_PATH, "utf8");
     MODEL = JSON.parse(data);
     console.log("✅ ML model loaded");
   } catch {
@@ -50,77 +48,75 @@ async function loadModelSafe(path = ML_MODEL_PATH) {
   }
 }
 
-async function saveModelSafe(path = ML_MODEL_PATH) {
+async function saveModelSafe() {
   try {
-    await fs.writeFile(path, JSON.stringify(MODEL, null, 2));
+    await fs.writeFile(ML_MODEL_PATH, JSON.stringify(MODEL, null, 2));
   } catch (e) {
-    console.error("❌ Failed to save ML model:", e);
+    console.error("❌ Save model failed:", e.message);
   }
 }
 
-function sigmoid(z) {
-  return 1 / (1 + Math.exp(-z));
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
 }
 
-function predictProb(features = {}) {
+function predictProb(features) {
   const w = MODEL.weights;
   const z =
     w.bias +
     w.techDiff * (features.techDiff || 0) +
-    w.newsScore * (features.newsScore || 0) +
     w.volSpike * (features.volSpike || 0) +
-    w.dojiHammer * (features.dojiHammer || 0) +
-    w.slope * (features.slope || 0);
+    w.dojiHammer * (features.dojiHammer || 0);
   return sigmoid(z);
 }
 
 function onlineTrain(features, label) {
   const pred = predictProb(features);
   const error = label - pred;
-  const w = MODEL.weights;
   const lr = MODEL.lr;
+  const w = MODEL.weights;
 
-  w.bias += lr * error;
-  for (let key of Object.keys(features)) {
-    w[key] = (w[key] || 0) + lr * error * features[key];
+  for (const key of Object.keys(w)) {
+    if (key in features) w[key] += lr * error * features[key];
   }
-
+  w.bias += lr * error;
   MODEL.history.push({ pred, label, time: Date.now() });
   if (MODEL.history.length > 200) MODEL.history.shift();
 }
 
-function autoTuneThreshold(targetPrecision = 0.7) {
-  const hist = MODEL.history;
-  if (hist.length < 30) return MODEL.threshold;
-  let best = MODEL.threshold, bestScore = 0;
-
-  for (let t = 0.3; t <= 0.95; t += 0.01) {
-    const preds = hist.filter(h => h.pred >= t);
-    const tp = preds.filter(p => p.label === 1).length;
-    const prec = preds.length ? tp / preds.length : 0;
-    const coverage = preds.length / hist.length;
-    const score = (prec >= targetPrecision ? 1 : prec / targetPrecision) * (0.6 * prec + 0.4 * coverage);
-    if (score > bestScore) { bestScore = score; best = t; }
+// ========= TELEGRAM =========
+async function sendTelegram(text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: CHAT_ID, text })
+    });
+  } catch (e) {
+    console.error("Telegram error:", e.message);
   }
-  MODEL.threshold = best;
-  return best;
 }
 
-function adjustAutoThreshold() {
-  if (!MODEL) loadModelSafe();
-  if (MODEL.history.length > 80) autoTuneThreshold(0.7);
-  return MODEL.threshold;
-}
-
-// ========== REVERSAL WATCHER ==========
+// ========= REVERSAL WATCHER =========
 let lastAlert = 0;
 
 async function checkReversal() {
   try {
     const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=10`;
     const data = await (await fetch(url)).json();
+
+    if (!Array.isArray(data)) {
+      console.log("⚠️ Binance API returned non-array data");
+      return;
+    }
+
     const k = data.map(d => ({
-      o: +d[1], h: +d[2], l: +d[3], c: +d[4], v: +d[5]
+      o: +d[1],
+      h: +d[2],
+      l: +d[3],
+      c: +d[4],
+      v: +d[5]
     }));
 
     const last = k[k.length - 1];
@@ -136,12 +132,24 @@ async function checkReversal() {
 
     if ((isDoji || isHammer || isShootingStar) && volSpike) {
       const now = Date.now();
-      if (now - lastAlert > 1000 * 60 * 5) {
+      if (now - lastAlert > 5 * 60 * 1000) {
         lastAlert = now;
-        const pattern = isHammer ? "🟢 Hammer" : isShootingStar ? "🔴 Shooting Star" : "⚪ Doji";
-        const msg = `⚡ Reversal Alert: ${pattern} detected on ${SYMBOL}\nVol Spike Confirmed 📊`;
+
+        const features = {
+          techDiff: (last.c - last.o) / last.o,
+          volSpike: volSpike ? 1 : 0,
+          dojiHammer: isHammer || isShootingStar ? 1 : 0
+        };
+
+        const prob = predictProb(features);
+        const msg = `⚡ Reversal Alert on ${SYMBOL}\nPattern: ${
+          isHammer ? "🟢 Hammer" : isShootingStar ? "🔴 Shooting Star" : "⚪ Doji"
+        }\nProb (ML): ${(prob * 100).toFixed(1)}%\nVol Spike: ${volSpike}`;
         await sendTelegram(msg);
-        console.log("⚡ Reversal alert sent!");
+
+        // Train ML model as we go
+        onlineTrain(features, prob > MODEL.threshold ? 1 : 0);
+        await saveModelSafe();
       }
     }
   } catch (e) {
@@ -149,41 +157,34 @@ async function checkReversal() {
   }
 }
 
-// ========== TELEGRAM ==========
-async function sendTelegram(text) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, text })
-  });
-}
-
-// ========== MAIN REPORT ==========
+// ========= MARKET REPORT =========
 async function sendMarketReport() {
   try {
     const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${SYMBOL}`;
     const data = await (await fetch(url)).json();
-    const change = parseFloat(data.priceChangePercent).toFixed(2);
-    const vol = parseFloat(data.volume).toFixed(2);
 
-    const msg = `📊 ${SYMBOL} — AI Trader v8.6+ML\nΔP: ${change}% | Volume: ${vol}\nML Threshold: ${MODEL.threshold.toFixed(2)}\nConfidence: ${(predictProb({ techDiff: change / 100, volSpike: vol / 10000 }) * 100).toFixed(1)}%`;
+    const change = parseFloat(data.priceChangePercent).toFixed(2);
+    const volume = parseFloat(data.volume).toFixed(2);
+    const prob = predictProb({ techDiff: change / 100, volSpike: volume / 10000 });
+
+    const msg = `📊 ${SYMBOL} — AI Trader v8.6+ML\nΔP: ${change}% | Vol: ${volume}\n🤖 ML Prob: ${(prob * 100).toFixed(
+      1
+    )}% | Threshold: ${(MODEL.threshold * 100).toFixed(0)}%`;
     await sendTelegram(msg);
   } catch (e) {
-    console.error("❌ Report send failed:", e.message);
+    console.error("❌ Market report failed:", e.message);
   }
 }
 
-// ========== SERVER ==========
+// ========= SERVER =========
 const app = express();
-app.get("/", (req, res) => res.send("AI Trader v8.6+ML Running ✅"));
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.get("/", (req, res) => res.send("AI Trader v8.6+ML Stable Running ✅"));
+app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
 
-// ========== INIT ==========
+// ========= INIT =========
 (async () => {
   await loadModelSafe();
-  console.log("🤖 AI Trader v8.6+ML initialized...");
+  console.log("🤖 AI Trader v8.6+ML Stable initialized...");
   setInterval(sendMarketReport, CHECK_INTERVAL_MIN * 60 * 1000);
   setInterval(checkReversal, REV_CHECK_INTERVAL_SEC * 1000);
-  setInterval(() => adjustAutoThreshold() && saveModelSafe(), 10 * 60 * 1000);
 })();
