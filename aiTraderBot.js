@@ -689,7 +689,7 @@ app.listen(PORT, () => {
 });
 // === Telegram Command System ===
   initTelegramCommands({
-  SYMBOL,
+  SYMBOL: RAW_SYMBOL, // 👈 actual variable name
   analyzeAndReport,
   fetchHeadlines,
   reversalWatcherOnce
