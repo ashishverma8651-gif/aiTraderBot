@@ -1,27 +1,25 @@
-// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts (Render Fixed Version)
-// ---------------------------------------------------------------------------------------------
-
+// ✅ AI Trader Bot v5 — Detailed AI Summary + Fibonacci + Elliott + News Impact + Auto Proxy + Self-Ping
+// -----------------------------------------------------------------------------------------------------
 import fetch from "node-fetch";
 import express from "express";
 import "dotenv/config";
 
-// 🔑 Environment Variables
+// 🔑 Environment
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const SYMBOL = process.env.SYMBOL || "BTCUSDT";
 const CHECK_INTERVAL_MIN = parseInt(process.env.CHECK_INTERVAL_MIN || "15", 10);
 
 if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("❌ BOT_TOKEN or CHAT_ID missing in environment variables");
+  console.error("❌ Missing BOT_TOKEN or CHAT_ID in .env");
   process.exit(1);
 }
 
-// 🕒 Get India Time
-function getIndiaTime() {
-  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
-}
+// 🕒 India Time
+const getIndiaTime = () =>
+  new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
 
-// 📩 Telegram Message
+// 📩 Telegram Send
 async function sendTG(msg) {
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -43,136 +41,172 @@ const proxies = [
 ];
 
 // 📊 Binance Fetch (Auto Fallback)
-async function fetchData(symbol, interval = "1m", limit = 60) {
+async function fetchData(symbol, interval = "1m", limit = 80) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-
   for (const proxy of proxies) {
     try {
       const finalUrl = proxy + encodeURIComponent(url);
-      const res = await fetch(finalUrl, { timeout: 10000 }); // 10s timeout
+      const res = await fetch(finalUrl, { timeout: 10000 });
       if (!res.ok) throw new Error(`Proxy ${proxy} failed ${res.status}`);
       const data = await res.json();
       return data.map((k) => ({
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
+        open: +k[1],
+        high: +k[2],
+        low: +k[3],
+        close: +k[4],
+        volume: +k[5],
       }));
     } catch (err) {
       console.warn(`⚠️ Proxy failed: ${proxy} → ${err.message}`);
-      continue;
     }
   }
-
   throw new Error("❌ All proxies failed — Binance data unavailable");
 }
 
-// 📈 Analyze divergence + signal
-function analyzeTF(data) {
-  const len = data.length;
-  const last = data[len - 1];
-  const prev = data[len - 2];
-
-  const dp = ((last.close - prev.close) / prev.close) * 100;
-  const dv = ((last.volume - prev.volume) / prev.volume) * 100;
-
-  let signal = "Neutral ⚖️";
-  if (dp > 0 && dv < 0) signal = "Bearish Divergence 🔻";
-  if (dp < 0 && dv > 0) signal = "Bullish Divergence 🚀";
-
-  const strength = Math.min(Math.abs(dp) + Math.abs(dv), 100);
-  return { signal, dp: dp.toFixed(2), dv: dv.toFixed(2), strength };
-}
-
-// 🎯 Target & SL
-function getTargetsAndSL(price, signal) {
-  let tp1, tp2, tp3, sl;
-  const move = price * 0.005;
-
-  if (signal.includes("Bullish") || signal.includes("Buy")) {
-    tp1 = (price + move).toFixed(2);
-    tp2 = (price + move * 2).toFixed(2);
-    tp3 = (price + move * 3).toFixed(2);
-    sl = (price - move).toFixed(2);
-  } else if (signal.includes("Bearish") || signal.includes("Sell")) {
-    tp1 = (price - move).toFixed(2);
-    tp2 = (price - move * 2).toFixed(2);
-    tp3 = (price - move * 3).toFixed(2);
-    sl = (price + move).toFixed(2);
-  } else {
-    tp1 = tp2 = tp3 = sl = "N/A";
+// 📰 Free News Fetch (CoinDesk RSS)
+async function fetchNews(limit = 5) {
+  try {
+    const rss = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+    const proxy = "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(rss);
+    const res = await fetch(proxy);
+    const txt = await res.text();
+    const items = txt.split("<item>").slice(1, limit + 1);
+    return items.map((i) => (i.match(/<title>(.*?)<\/title>/i) || [])[1]?.replace(/<!\[CDATA\[|\]\]>/g, "") || "");
+  } catch {
+    return [];
   }
-
-  return { tp1, tp2, tp3, sl };
 }
 
-// 🧠 Analyzer
+// 🧠 Fibonacci Levels
+function fibLevels(data) {
+  const highs = data.map((d) => d.high);
+  const lows = data.map((d) => d.low);
+  const high = Math.max(...highs);
+  const low = Math.min(...lows);
+  const range = high - low;
+  return {
+    fib236: (high - range * 0.236).toFixed(2),
+    fib382: (high - range * 0.382).toFixed(2),
+    fib5: (high - range * 0.5).toFixed(2),
+    fib618: (high - range * 0.618).toFixed(2),
+    fib786: (high - range * 0.786).toFixed(2),
+  };
+}
+
+// 📈 Volume Sentiment
+function volumeSentiment(data) {
+  let buyVol = 0, sellVol = 0;
+  data.forEach((d) => {
+    if (d.close > d.open) buyVol += d.volume;
+    else sellVol += d.volume;
+  });
+  const buyPct = (buyVol / (buyVol + sellVol)) * 100;
+  const sellPct = 100 - buyPct;
+  const bias = buyPct > sellPct ? "Bullish 🚀" : buyPct < sellPct ? "Bearish 📉" : "Neutral ⚖️";
+  return { buyPct, sellPct, bias };
+}
+
+// 📉 Trend + Elliott Detection
+function detectElliott(data) {
+  const closes = data.map((d) => d.close);
+  const slope = ((closes.at(-1) - closes[0]) / closes[0]) * 100;
+  let type = "Sideways";
+  let conf = 40;
+  if (slope > 0.5) { type = "Impulse Wave (5W)"; conf = 75; }
+  else if (slope < -0.5) { type = "Corrective ABC"; conf = 70; }
+  return { type, conf, slope: slope.toFixed(3) };
+}
+
+// 🎯 Targets & SL
+function getTargets(price, bias) {
+  const move = price * 0.004;
+  let TP1, TP2, TP3, SL;
+  if (bias.includes("Bullish")) {
+    TP1 = (price + move).toFixed(2);
+    TP2 = (price + move * 2).toFixed(2);
+    TP3 = (price + move * 3).toFixed(2);
+    SL = (price - move).toFixed(2);
+  } else if (bias.includes("Bearish")) {
+    TP1 = (price - move).toFixed(2);
+    TP2 = (price - move * 2).toFixed(2);
+    TP3 = (price - move * 3).toFixed(2);
+    SL = (price + move).toFixed(2);
+  } else {
+    TP1 = TP2 = TP3 = SL = "—";
+  }
+  return { TP1, TP2, TP3, SL };
+}
+
+// 📈 Full Analyzer
 async function analyzeOnce() {
   try {
     const tfs = ["1m", "5m", "15m", "1h"];
-    let summary = `📊 <b>${SYMBOL} — AI Trade Summary</b>\n\n`;
-    summary += `📍 <b>Market Pressure:</b> Multi-TF Sentiment\n(1m → 1h)\n\n🔎 <b>Divergence:</b>\n`;
+    let summary = `🤖 <b>${SYMBOL} — Advanced AI Market Summary</b>\n\n🕒 ${getIndiaTime()}\n📊 Multi-Timeframe: (1m → 1h)\n\n`;
 
-    let bull = 0, bear = 0, totalStrength = 0, lastPrice = 0;
+    let bull = 0, bear = 0, confidence = 0, finalPrice = 0;
 
     for (const tf of tfs) {
-      const data = await fetchData(SYMBOL, tf, 60);
-      const d = analyzeTF(data);
-      lastPrice = data[data.length - 1].close;
-      summary += `${tf}: ${d.signal}\nΔP ${d.dp}% | ΔV ${d.dv}% | Strength ${d.strength}%\n\n`;
+      const data = await fetchData(SYMBOL, tf, 80);
+      finalPrice = data.at(-1).close;
 
-      if (d.signal.includes("Bullish")) bull++;
-      if (d.signal.includes("Bearish")) bear++;
-      totalStrength += d.strength;
+      const vol = volumeSentiment(data);
+      const fib = fibLevels(data);
+      const ell = detectElliott(data);
+      const dp = ((data.at(-1).close - data.at(-2).close) / data.at(-2).close) * 100;
+      const dv = ((data.at(-1).volume - data.at(-2).volume) / data.at(-2).volume) * 100;
+      const str = Math.min(Math.abs(dp) + Math.abs(dv), 100).toFixed(1);
+
+      if (vol.bias.includes("Bullish")) bull++;
+      if (vol.bias.includes("Bearish")) bear++;
+      confidence += parseFloat(str);
+
+      summary += `⏱ <b>${tf}</b> | ${vol.bias}\nΔP: ${dp.toFixed(2)}% | ΔV: ${dv.toFixed(2)}% | Fib(0.618): ${fib.fib618}\nElliott: ${ell.type} (${ell.conf}%)\nStrength: ${str}%\n\n`;
     }
 
-    const total = bull + bear;
-    let bias = "Neutral ⚖️";
-    if (bull > bear) bias = "Bullish 🚀";
-    else if (bear > bull) bias = "Bearish 📉";
+    // 🧮 Final bias
+    let overall = "Neutral ⚖️";
+    if (bull > bear) overall = "Bullish 🚀";
+    else if (bear > bull) overall = "Bearish 📉";
 
-    const confidence = Math.round((totalStrength / (tfs.length * 100)) * 10000) / 100;
-    const { tp1, tp2, tp3, sl } = getTargetsAndSL(lastPrice, bias);
+    const avgConf = (confidence / (tfs.length * 100) * 100).toFixed(2);
+    const { TP1, TP2, TP3, SL } = getTargets(finalPrice, overall);
+    const news = await fetchNews();
+    const impact = news.length > 0 ? (news.some(n => /ETF|Pump|Rally|Crash/i.test(n)) ? "High" : "Moderate") : "Low";
 
-    summary += `🎯 <b>Targets & Stop Loss:</b>\nTP1: ${tp1}\nTP2: ${tp2}\nTP3: ${tp3}\nSL: ${sl}\n\n`;
-    summary += `🧠 <b>Overall Bias:</b> ${bias} (${confidence}% Confidence)\n💰 Last Price: ${lastPrice}\n🕒 ${getIndiaTime()}`;
+    summary += `🎯 <b>Targets & Stop-Loss</b>\nTP1: ${TP1}\nTP2: ${TP2}\nTP3: ${TP3}\nSL: ${SL}\n\n`;
+    summary += `🧠 <b>Overall Bias:</b> ${overall}\n📈 Confidence: ${avgConf}%\n🔥 News Impact: ${impact}\n💰 Last Price: ${finalPrice}\n\n📰 <b>Latest Headlines:</b>\n${news.slice(0, 3).map((n) => "• " + n).join("\n")}`;
 
     await sendTG(summary);
-    console.log("✅ Telegram report sent", getIndiaTime());
+    console.log("✅ Telegram summary sent at", getIndiaTime());
   } catch (err) {
     console.error("Analyze Error:", err.message);
   }
 }
 
-// 🔄 Self-Ping to prevent Render sleep (fixed)
+// 🔄 Self-Ping (Render)
 async function selfPing() {
   const url = process.env.RENDER_EXTERNAL_URL
     ? process.env.RENDER_EXTERNAL_URL.startsWith("http")
       ? process.env.RENDER_EXTERNAL_URL
       : `https://${process.env.RENDER_EXTERNAL_URL}`
-    : "https://ai-trader-bot.onrender.com"; // <-- Replace with your actual Render URL
-
-  console.log("🧩 Trying self-ping to:", url);
+    : "https://ai-trader-bot.onrender.com";
   try {
     const res = await fetch(url);
-    console.log("📡 Self-ping status:", res.status);
-    if (res.ok) console.log("🔄 Self-ping OK →", getIndiaTime());
-    else console.warn("⚠️ Non-OK self-ping response:", res.status);
+    console.log("🔁 Self-ping", res.status, getIndiaTime());
   } catch (err) {
-    console.error("⚠️ Self-ping failed:", err.message);
+    console.warn("Ping failed:", err.message);
   }
 }
 
-// 🚀 Start Everything
-console.log("🤖 AI Trader Bot started...");
+// 🚀 Start
+console.log("🤖 AI Trader Bot v5 running...");
 analyzeOnce();
 setInterval(analyzeOnce, CHECK_INTERVAL_MIN * 60 * 1000);
-setInterval(selfPing, 3 * 60 * 1000); // ping every 3 min (safe)
+setInterval(selfPing, 3 * 60 * 1000);
 
-// 🌐 Keep Alive HTTP Server
+// 🌐 Express Keepalive
 const app = express();
-app.get("/", (req, res) => res.send("AI Trader Bot Running ✅"));
-app.listen(process.env.PORT || 3000, () => {
-  console.log("🌐 Web server active on port", process.env.PORT || 3000);
-});
+app.get("/", (req, res) => res.send("AI Trader Bot v5 running ✅"));
+app.listen(process.env.PORT || 3000, () =>
+  console.log("🌐 Web server active on port", process.env.PORT || 3000)
+);
