@@ -1,180 +1,155 @@
-/**
- * aiTraderBot_v8.6.js
- * - 15-min multi-TF report
- * - 1-min Reversal Watcher (Doji, Hammer, Shooting Star) with High Volume confirmation
- * - ML Smart Alert (online logistic-like trainer)
- * - Self-ping, news fallback proxies, chunked Telegram messages
- *
- * Requirements:
- *  npm i node-fetch@3 express dotenv
- * Run:
- *  node aiTraderBot_v8.6.js
- */
+// ===== Part 1: Config, helpers, lightweight ML model, pattern detectors =====
+// Paste this file FIRST (or paste this block at top of the single combined file)
 
 import fetch from "node-fetch";
-import express from "express";
 import fs from "fs";
+import path from "path";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ---------- Config ----------
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const SYMBOL = process.env.SYMBOL || "BTCUSDT";
-const CHECK_INTERVAL_MIN = parseInt(process.env.CHECK_INTERVAL_MIN || "15", 10);
-const REV_CHECK_INTERVAL_SEC = parseInt(process.env.REV_CHECK_INTERVAL_SEC || "60", 10);
-const ML_ALERT_THRESH = parseFloat(process.env.ML_ALERT_THRESH || "0.7");
-const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || null;
-const PROXIES = [
-  "https://api.codetabs.com/v1/proxy?quest=",
-  "https://api.allorigins.win/raw?url=",
-  "https://thingproxy.freeboard.io/fetch/",
-  "https://corsproxy.io/?"
-];
-const TIMEFRAMES = ["1m","5m","15m","30m","1h"];
+// ---------- CONFIG ----------
+const CONFIG = {
+  BOT_TOKEN: process.env.BOT_TOKEN || process.env.TELEGRAM_TOKEN || "",
+  CHAT_ID: process.env.CHAT_ID || "",
+  SYMBOL: process.env.SYMBOL || "BTCUSDT",
+  CHECK_INTERVAL_MIN: parseInt(process.env.CHECK_INTERVAL_MIN || "15", 10),
+  REV_CHECK_INTERVAL_SEC: parseInt(process.env.REV_CHECK_INTERVAL_SEC || "30", 10),
+  REV_COOLDOWN_MIN: parseInt(process.env.REV_COOLDOWN_MIN || "3", 10),
+  KLINE_LIMIT: 120,
+  PROXIES: [
+    "", // try direct first (empty string = no proxy)
+    "https://api.allorigins.win/raw?url=",
+    "https://api.codetabs.com/v1/proxy?quest=",
+    "https://thingproxy.freeboard.io/fetch/"
+  ],
+  MODEL_PATH: path.resolve(process.cwd(), "ml_model.json"),
+  ACC_KEY: path.resolve(process.cwd(), "acc_history.json"),
+  SELF_PING_URL: process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL || "",
+};
 
-// file storage
-const ML_MODEL_FILE = "./ml_model_v86.json";
-const LAST_PRED_FILE = "./last_pred_v86.json";
-const ACC_KEY = "ai_acc_v86_local"; // for localStorage fallback (we will store JSON file)
+// small util
+const nowTime = () => new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
 
-// ---------- Safety checks ----------
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("❌ BOT_TOKEN or CHAT_ID missing in .env — aborting.");
-  process.exit(1);
-}
-
-// ---------- Utility helpers ----------
-const nowStr = () => new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
-
-async function safeFetch(url, opt = {}, tryProxies = true) {
-  // try direct first
-  try {
-    const r = await fetch(url, { timeout: 12000, ...opt });
-    if (r.ok) return r;
-  } catch(e){ /* ignore */ }
-  if (!tryProxies) throw new Error("fetch failed (no proxy)");
-  for (const p of PROXIES) {
+// ---------- Safe fetch with simple proxy fallback ----------
+async function fetchWithFallback(url, options = {}) {
+  for (const p of CONFIG.PROXIES) {
     try {
-      const full = p + encodeURIComponent(url);
-      const r = await fetch(full, { timeout: 12000, ...opt });
-      if (r.ok) return r;
-    } catch (e) { /* continue */ }
+      const final = p ? p + encodeURIComponent(url) : url;
+      const r = await fetch(final, { timeout: 15000, ...options });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      // if proxy returns wrapper (allorigins), it returns raw body directly; handle JSON/text downstream
+      return r;
+    } catch (e) {
+      // try next proxy
+      // console.warn("proxy fail", p, e.message);
+      continue;
+    }
   }
-  throw new Error("All fetch attempts failed");
+  throw new Error("All proxies failed for " + url);
 }
 
-function chunkMessage(text, chunkSize = 3800) {
-  const parts = [];
-  for (let i=0;i<text.length;i+=chunkSize) parts.push(text.slice(i,i+chunkSize));
-  return parts;
-}
-
-async function sendTG(text, options = {}) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  const payload = {
-    chat_id: CHAT_ID,
-    text,
-    parse_mode: options.parse_mode || "HTML",
-    disable_web_page_preview: options.disable_web_page_preview !== false
-  };
-  const r = await fetch(url, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload) });
-  const json = await r.json();
-  if (!json.ok) throw new Error("Telegram send failed: " + JSON.stringify(json));
-  return json;
-}
-
-// ---------- Binance klines ----------
-async function fetchKlines(symbol, interval="15m", limit=80) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+// ---------- Fetch klines from Binance public endpoint ----------
+async function fetchKlines(symbol = CONFIG.SYMBOL, interval = "15m", limit = CONFIG.KLINE_LIMIT) {
+  const base = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   try {
-    const r = await safeFetch(url, {}, true);
-    const j = await r.json();
-    if (!Array.isArray(j)) throw new Error("Invalid klines");
-    return j.map(k => ({ time: +k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5] }));
+    const res = await fetchWithFallback(base);
+    const json = await res.json();
+    if (!Array.isArray(json)) throw new Error("Invalid klines response");
+    return json.map(k => ({
+      time: +k[0],
+      open: +k[1],
+      high: +k[2],
+      low: +k[3],
+      close: +k[4],
+      volume: +k[5]
+    }));
   } catch (err) {
-    console.warn("fetchKlines error", err.message);
+    console.warn("fetchKlines failed:", err.message);
     return [];
   }
 }
 
-// ---------- News / Social fetchers ----------
-async function fetchCoinTelegraph(limit=6) {
+// ---------- Simple news fetch (Cointelegraph fallback using proxy) ----------
+async function fetchHeadlines(limit = 5) {
   try {
     const url = "https://cointelegraph.com/rss";
-    const r = await safeFetch(url);
+    const r = await fetchWithFallback(url);
     const txt = await r.text();
-    const items = txt.split("<item>").slice(1, limit+1);
+    const items = txt.split("<item>").slice(1, limit + 1);
     return items.map(it => {
-      const t = (it.match(/<title>([\s\S]*?)<\/title>/i)||[])[1]||"";
-      return { title: t.replace(/<!\[CDATA\[|\]\]>/g,"").trim(), source: "CoinTelegraph" };
+      const t = (it.match(/<title>(.*?)<\/title>/i) || [ "", "" ])[1] || "";
+      return t.replace(/<!\[CDATA\[|\]\]>/g, "").trim();
     });
-  } catch(e){ console.warn("fetchCoinTelegraph", e.message); return []; }
+  } catch (e) {
+    // fallback to coinDesk
+    try {
+      const url = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+      const r = await fetchWithFallback(url);
+      const txt = await r.text();
+      const items = txt.split("<item>").slice(1, limit + 1);
+      return items.map(it => (it.match(/<title>(.*?)<\/title>/i) || ["", ""])[1].replace(/<!\[CDATA\[|\]\]>/g, "").trim());
+    } catch (err) {
+      console.warn("fetchHeadlines fail:", err.message);
+      return [];
+    }
+  }
 }
 
-async function fetchCoinDesk(limit=6) {
+// ---------- Simple reddit fetch for sentiment-ish ----------
+async function fetchRedditTop(sub = "Bitcoin", limit = 10) {
   try {
-    const url = "https://www.coindesk.com/arc/outboundfeeds/rss/";
-    const r = await safeFetch(url);
-    const txt = await r.text();
-    const items = txt.split("<item>").slice(1, limit+1);
-    return items.map(it => {
-      const t = (it.match(/<title>([\s\S]*?)<\/title>/i)||[])[1]||"";
-      return { title: t.replace(/<!\[CDATA\[|\]\]>/g,"").trim(), source: "CoinDesk" };
-    });
-  } catch(e){ console.warn("fetchCoinDesk", e.message); return []; }
-}
-
-async function fetchHeadlines() {
-  // combine a few sources
-  const a = await Promise.allSettled([fetchCoinTelegraph(6), fetchCoinDesk(6)]);
-  const out = [];
-  for (const r of a) if (r.status === "fulfilled") out.push(...r.value);
-  return out.slice(0,6);
-}
-
-async function fetchReddit(limit=10) {
-  try {
-    const url = `https://www.reddit.com/r/Bitcoin/new.json?limit=${limit}`;
-    const r = await safeFetch(url);
+    const url = `https://www.reddit.com/r/${sub}/new.json?limit=${limit}`;
+    const r = await fetchWithFallback(url);
     const j = await r.json();
     if (!j.data) return [];
-    return j.data.children.map(c => ({ title: c.data.title||"", ups: c.data.ups||0, created_utc: c.data.created_utc }));
-  } catch(e){ console.warn("fetchReddit", e.message); return []; }
+    return j.data.children.map(c => ({ title: c.data.title || "", ups: c.data.ups || 0, created_utc: c.data.created_utc || 0 }));
+  } catch (e) {
+    return [];
+  }
 }
 
-async function fetchNitter(q="bitcoin", limit=6) {
-  try {
-    const url = `https://nitter.net/search?f=tweets&q=${encodeURIComponent(q)}&src=typed_query`;
-    const r = await safeFetch(url);
-    const html = await r.text();
-    const matches = [...html.matchAll(/class="tweet-content[^"]*"[^>]*>([\s\S]*?)<\/(a|div)>/g)];
-    return matches.slice(0,limit).map(m => m[1].replace(/<[^>]+>/g,"").trim());
-  } catch(e){ console.warn("fetchNitter", e.message); return []; }
+// ---------- Pattern detectors (Doji, Hammer, Shooting Star) ----------
+function detectCandlePattern(c) {
+  // c: {open,high,low,close,volume}
+  const o = c.open, h = c.high, l = c.low, cl = c.close;
+  const body = Math.abs(cl - o);
+  const range = h - l || 1;
+  const upper = h - Math.max(cl, o);
+  const lower = Math.min(cl, o) - l;
+
+  const bodyPct = body / range;
+  // doji: small body
+  if (bodyPct < 0.1) return { pattern: "Doji", strength: 1 - bodyPct };
+
+  // hammer: small upper shadow, long lower shadow, near high/low positions
+  if (lower > body * 2.5 && upper < body * 0.6 && (cl > o ? cl > (h + l) / 2 : o > (h + l)/2)) {
+    return { pattern: "Hammer", strength: lower / range };
+  }
+  // shooting star: long upper shadow, small lower
+  if (upper > body * 2.5 && lower < body * 0.6 && (cl < o ? cl < (h + l) / 2 : o < (h + l)/2)) {
+    return { pattern: "ShootingStar", strength: upper / range };
+  }
+  return { pattern: null, strength: 0 };
 }
 
-// ---------- Analysis helpers ----------
-function avgVolume(klines, n=20) {
-  if (!klines || klines.length===0) return 0;
-  const slice = klines.slice(-n);
-  const s = slice.reduce((a,b)=>a+b.volume,0);
-  return s / slice.length;
+// ---------- Volume spike detection ----------
+function isVolumeSpike(klines, idx, mul = 1.6) {
+  // compare current candle volume with mean of previous N (default 20)
+  const look = 20;
+  const start = Math.max(0, idx - look);
+  const slice = klines.slice(start, idx);
+  if (slice.length < 4) return false;
+  const avg = slice.reduce((s, k) => s + k.volume, 0) / slice.length;
+  return klines[idx].volume > avg * mul;
 }
 
-function calcVolSent(klines) {
-  let buy=0,sell=0;
-  for (const k of klines) { if (k.close > k.open) buy += k.volume; else sell += k.volume; }
-  const tot = buy + sell || 1;
-  const buyPct = (buy / tot) * 100;
-  const sellPct = (sell / tot) * 100;
-  const bias = buyPct > sellPct ? "Bullish" : buyPct < sellPct ? "Bearish" : "Neutral";
-  return { buyPct, sellPct, bias, diff: Math.abs(buyPct - sellPct) };
-}
-
-function calcFib(klines) {
-  if (!klines||!klines.length) return null;
-  const highs = klines.map(k => k.high), lows = klines.map(k => k.low);
-  const high = Math.max(...highs), low = Math.min(...lows);
+// ---------- Fibonacci levels (basic) ----------
+function calcFibLevels(klines) {
+  if (!klines || klines.length === 0) return null;
+  const highs = klines.map(k => k.high);
+  const lows = klines.map(k => k.low);
+  const high = Math.max(...highs);
+  const low = Math.min(...lows);
   const range = high - low || 1;
   return {
     high, low,
@@ -186,397 +161,409 @@ function calcFib(klines) {
   };
 }
 
-function atr(klines, period=14) {
-  if (!klines || klines.length < period+1) return null;
-  const trs = [];
-  for (let i=1;i<klines.length;i++){
-    const cur=klines[i], prev=klines[i-1];
-    const tr = Math.max(cur.high-cur.low, Math.abs(cur.high-prev.close), Math.abs(cur.low-prev.close));
-    trs.push(tr);
+// ---------- small helpers ----------
+const fmt = (v, d = 2) => (typeof v === "number" ? v.toFixed(d) : v || "--");
+
+// ---------- Lightweight incremental logistic regression (online SGD) ----------
+class OnlineLogistic {
+  constructor(features = 4, opts = {}) {
+    this.w = new Array(features).fill(0).map((_, i) => (i === 0 ? 0 : 0)); // bias included separately if desired
+    this.lr = opts.lr || 0.05;
+    this.l2 = opts.l2 || 0.0001;
+    this.modelFile = CONFIG.MODEL_PATH;
+    this._load();
   }
-  const slice = trs.slice(-period);
-  const sum = slice.reduce((a,b)=>a+b,0);
-  return sum/period;
-}
 
-function detectDivergence(kl) {
-  // simple last-candle delta + volume delta divergence indicator (per TF)
-  if (!kl || kl.length < 2) return { type: "Neutral", dp: 0, dv: 0, strength: 0 };
-  const last = kl.at(-1), prev = kl.at(-2);
-  const dp = ((last.close - prev.close) / (prev.close||1)) * 100;
-  const dv = ((last.volume - prev.volume) / (prev.volume||1)) * 100;
-  let type = "Neutral";
-  if (dp > 0 && dv < 0) type = "Bearish Divergence";
-  if (dp < 0 && dv > 0) type = "Bullish Divergence";
-  const strength = Math.min(100, Math.abs(dp) + Math.abs(dv));
-  return { type, dp, dv, strength };
-}
+  _sigmoid(x) {
+    return 1 / (1 + Math.exp(-x));
+  }
 
-// Candle pattern detectors (Doji,Hammer,ShootingStar)
-function detectCandlePattern(kl) {
-  if(!kl || kl.length===0) return {};
-  const last = kl.at(-1), prev = kl.at(-2) || last;
-  const body = Math.abs(last.close - last.open);
-  const range = (last.high - last.low) || 1;
-  const isDoji = body <= range * 0.15;
-  const lowerWick = Math.min(last.open, last.close) - last.low;
-  const upperWick = last.high - Math.max(last.open, last.close);
-  const lowerRatio = lowerWick / range;
-  const upperRatio = upperWick / range;
-  const isHammer = lowerRatio > 0.4 && upperRatio < 0.25 && last.close > prev.close;
-  const isShooting = upperRatio > 0.4 && lowerRatio < 0.25 && last.close < prev.close;
-  return { isDoji: isDoji?1:0, isHammer: isHammer?1:0, isShooting: isShooting?1:0, body, range };
-}
+  predictRaw(features) {
+    let s = 0;
+    for (let i = 0; i < this.w.length; i++) s += (this.w[i] || 0) * (features[i] || 0);
+    return this._sigmoid(s);
+  }
 
-// Targets & SL
-function getTargetsAndSL(price, dir="Neutral") {
-  if (!price || isNaN(price)) return { tp1:"N/A", tp2:"N/A", tp3:"N/A", sl:"N/A" };
-  const move = price * 0.005; // 0.5% tiers
-  if (dir.includes("Bull")) {
-    return { tp1:(price+move).toFixed(2), tp2:(price+move*2).toFixed(2), tp3:(price+move*3).toFixed(2), sl:(price-move).toFixed(2) };
-  } else if (dir.includes("Bear")) {
-    return { tp1:(price-move).toFixed(2), tp2:(price-move*2).toFixed(2), tp3:(price-move*3).toFixed(2), sl:(price+move).toFixed(2) };
-  } else {
-    return { tp1:"N/A", tp2:"N/A", tp3:"N/A", sl:"N/A" };
+  predictLabel(features, threshold = 0.5) {
+    const p = this.predictRaw(features);
+    return { p, label: p >= threshold ? 1 : 0 };
+  }
+
+  update(features, target) {
+    // target: 0 or 1
+    const p = this.predictRaw(features);
+    const err = (target - p);
+    for (let i = 0; i < this.w.length; i++) {
+      // gradient descent update with L2
+      this.w[i] += this.lr * (err * (features[i] || 0) - this.l2 * (this.w[i] || 0));
+    }
+    // persist occasionally
+    this._save();
+    return p;
+  }
+
+  _save() {
+    try {
+      fs.writeFileSync(this.modelFile, JSON.stringify({ w: this.w, lr: this.lr, l2: this.l2 }, null, 2));
+    } catch (e) {
+      console.warn("model save fail", e.message);
+    }
+  }
+
+  _load() {
+    try {
+      if (fs.existsSync(this.modelFile)) {
+        const raw = fs.readFileSync(this.modelFile, "utf8");
+        const j = JSON.parse(raw);
+        if (j && Array.isArray(j.w)) this.w = j.w;
+        if (j.lr) this.lr = j.lr;
+        if (j.l2) this.l2 = j.l2;
+      }
+    } catch (e) {
+      console.warn("model load fail", e.message);
+    }
   }
 }
 
-// ---------- Accuracy tracking (local JSON file) ----------
-function pushAccLocal(correct) {
-  const F = "./acc_v86.json";
+// ---------- Accuracy/History storage ----------
+function pushAccuracy(correct) {
   try {
-    const arr = fs.existsSync(F) ? JSON.parse(fs.readFileSync(F,"utf8")) : [];
-    arr.push(correct?1:0);
-    while(arr.length>50) arr.shift();
-    fs.writeFileSync(F, JSON.stringify(arr));
-  } catch(e){ console.warn("pushAccLocal error", e.message); }
+    const file = CONFIG.ACC_KEY;
+    let arr = [];
+    if (fs.existsSync(file)) arr = JSON.parse(fs.readFileSync(file));
+    arr.push(correct ? 1 : 0);
+    if (arr.length > 200) arr.shift();
+    fs.writeFileSync(file, JSON.stringify(arr));
+  } catch (e) { /* ignore */ }
 }
-function getAccLocal(lastN=10) {
-  const F = "./acc_v86.json";
+function getAccuracy(lastN = 10) {
   try {
-    const arr = fs.existsSync(F) ? JSON.parse(fs.readFileSync(F,"utf8")) : [];
-    if (!arr.length) return "N/A";
+    const file = CONFIG.ACC_KEY;
+    if (!fs.existsSync(file)) return "--";
+    const arr = JSON.parse(fs.readFileSync(file));
+    if (!arr.length) return "--";
     const slice = arr.slice(-lastN);
-    const s = slice.reduce((a,b)=>a+b,0);
-    return ((s/slice.length)*100).toFixed(1);
-  } catch(e){ return "N/A"; }
+    const s = slice.reduce((a, b) => a + b, 0);
+    return ((s / slice.length) * 100).toFixed(1);
+  } catch (e) { return "--"; }
 }
 
-// ---------- ML Module (simple online logistic/regression) ----------
-function mlLoad() {
-  try {
-    if (fs.existsSync(ML_MODEL_FILE)) return JSON.parse(fs.readFileSync(ML_MODEL_FILE,"utf8"));
-  } catch(e){ console.warn("mlLoad", e.message); }
-  return { w:null, bias:0, n_features:0, lr:0.02, l2:0.0001, trained:0 };
-}
-function mlSave(m){ try{ fs.writeFileSync(ML_MODEL_FILE, JSON.stringify(m,null,2)); }catch(e){ console.warn("mlSave", e.message); } }
-let ML = mlLoad();
-
-function mlInit(n) {
-  if (!ML.w || ML.n_features !== n) {
-    ML.n_features = n;
-    ML.w = new Array(n).fill(0).map(()=> (Math.random()*0.02 - 0.01));
-    ML.bias = 0;
-    ML.trained = 0;
-    mlSave(ML);
-    console.log("ML initialized n_features=", n);
-  }
-}
-function sigmoid(z){ return 1 / (1 + Math.exp(-z)); }
-
-function mlExtractFeatures({klines15, lastCandle, avgVol20=1, divergenceSign=0, ellConf=0, systemBias=0}) {
-  const first = klines15[0] || lastCandle;
-  const last = lastCandle || klines15.at(-1);
-  const slope15 = ((last.close - (first.close||last.close)) / (first.close||1)) * 100;
-  const lastDeltaP = ((last.close - last.open) / (last.open||1)) * 100;
-  const volRatio = avgVol20>0 ? (last.volume / avgVol20) : 1;
-  const { isDoji, isHammer, isShooting } = detectCandlePattern(klines15);
-  return [
-    slope15,
-    lastDeltaP,
-    volRatio - 1,
-    isDoji,
-    isHammer,
-    isShooting,
-    divergenceSign || 0,
-    ellConf / 100,
-    systemBias || 0
-  ];
-}
-
-function mlPredict(features) {
-  if (!ML.w || ML.w.length !== features.length) mlInit(features.length);
-  const z = ML.bias + features.reduce((s,v,i)=>s + (ML.w[i]||0) * v, 0);
-  return sigmoid(z);
-}
-
-function mlTrain(features, label) {
-  if (!ML.w || ML.w.length !== features.length) mlInit(features.length);
-  const lr = ML.lr || 0.02, l2 = ML.l2 || 0.0001;
-  const p = mlPredict(features);
-  const err = label - p;
-  for (let i=0;i<features.length;i++){
-    ML.w[i] += lr * (err * features[i] - l2 * (ML.w[i]||0));
-  }
-  ML.bias += lr * err;
-  ML.trained = (ML.trained||0) + 1;
-  if (ML.trained % 5 === 0) mlSave(ML);
-  return p;
-}
-
-function biasToSign(biasStr) {
-  if (!biasStr) return 0;
-  const s = biasStr.toString().toLowerCase();
-  if (s.includes("bull")) return 1;
-  if (s.includes("bear")) return -1;
-  return 0;
-}
-
-// ---------- Self-ping ----------
-async function selfPing() {
-  if (!RENDER_EXTERNAL_URL) return;
-  let url = RENDER_EXTERNAL_URL;
-  if (!url.startsWith("http")) url = `https://${url}`;
-  try {
-    const r = await fetch(url);
-    console.log("Self-ping", r.status);
-  } catch(e){ console.warn("selfPing failed", e.message); }
-}
-
-// ---------- Main analysis & report ----------
-async function analyzeAndReport() {
-  try {
-    // 1) fetch klines for all TFs (15m primary)
-    const tfData = {};
-    for (const tf of TIMEFRAMES) {
-      tfData[tf] = await fetchKlines(SYMBOL, tf, tf === "1m" ? 120 : 100);
-    }
-    const base = tfData["15m"] || [];
-    if (base.length < 10) {
-      const txt = `❗ Not enough 15m candles (${base.length}) — skipping report (${nowStr()})`;
-      console.warn(txt);
-      await sendTG(txt);
-      return;
-    }
-
-    // 2) tech metrics
-    const tech = calcVolSent(base);
-    const fib = calcFib(base);
-    const atrVal = atr(base, 14);
-    const lastPrice = base.at(-1).close;
-
-    // 3) per-TF divergence & quick pattern/trend
-    let bullCount = 0, bearCount = 0, totalStrength = 0;
-    let perTfText = "";
-    for (const tf of TIMEFRAMES) {
-      const kl = tfData[tf] || [];
-      const d = detectDivergence(kl);
-      const slope = (kl.length>1) ? ((kl.at(-1).close - kl[0].close) / (kl[0].close||1)) * 100 : 0;
-      const trend = Math.abs(slope) < 0.2 ? "Flat" : slope > 0 ? "Uptrend" : "Downtrend";
-      if (d.type.includes("Bull")) bullCount++;
-      if (d.type.includes("Bear")) bearCount++;
-      totalStrength += d.strength || 0;
-      perTfText += `\n⏱ ${tf} | ${d.type} | ΔP ${d.dp.toFixed(2)}% | ΔV ${d.dv.toFixed(2)}% | Strength ${Math.round(d.strength)}\nTrend: ${trend}`;
-    }
-
-    // 4) pattern / fib zones
-    const fib618 = fib? fib.fib618 : NaN;
-    const entryBuy = fib? fib.fib618 : NaN;
-    const entrySell = fib? fib.fib382 : NaN;
-    const breakoutMin = Math.min(entrySell||Infinity, entryBuy||Infinity);
-    const breakoutMax = Math.max(entrySell||-Infinity, entryBuy||-Infinity);
-
-    // 5) news & social
-    const [newsList, redditPosts, tweets] = await Promise.allSettled([
-      fetchHeadlines(), fetchReddit(8), fetchNitter("bitcoin", 8)
-    ]);
-    const newsArr = newsList.status==="fulfilled"? newsList.value : [];
-    const redditArr = redditPosts.status==="fulfilled"? redditPosts.value : [];
-    const tweetsArr = tweets.status==="fulfilled"? tweets.value : [];
-
-    // simple news sentiment score (keyword heuristic)
-    const posK = ["bull","surge","gain","rally","support","up","positive","soar","approval","adopt"];
-    const negK = ["bear","dump","selloff","crash","fear","ban","hack","lawsuit","negative","fall"];
-    let newsScore = 0;
-    for (const n of newsArr) {
-      const t = (n.title||"").toLowerCase();
-      for (const k of posK) if (t.includes(k)) newsScore += 1;
-      for (const k of negK) if (t.includes(k)) newsScore -= 1;
-    }
-    let newsImpact = "Low";
-    if (Math.abs(newsScore) >= 3) newsImpact = "High";
-    else if (Math.abs(newsScore) >= 1) newsImpact = "Medium";
-
-    // 6) merge signals (weighted)
-    const techNorm = Math.max(-1, Math.min(1, (tech.buyPct - tech.sellPct)/100 ));
-    const newsNorm = Math.max(-1, Math.min(1, newsScore/6 ));
-    let redditScoreVal = 0;
-    for (const r of redditArr) { redditScoreVal += (r.title? ((/bull/i.test(r.title)?1:(/bear/i.test(r.title)?-1:0)) ) : 0); }
-    const socialNorm = Math.max(-1, Math.min(1, redditScoreVal/6 ));
-    const COMBINED = 0.55*techNorm + 0.30*newsNorm + 0.15*socialNorm;
-    const label = COMBINED > 0.12 ? "Bullish" : COMBINED < -0.12 ? "Bearish" : "Neutral";
-    const rawConfidence = Math.abs(COMBINED);
-    const confidencePct = Math.round(Math.min(99, rawConfidence * 100));
-
-    if (label.includes("Bull")) bullCount++;
-    if (label.includes("Bear")) bearCount++;
-
-    // 7) targets & breakout
-    const tgs = getTargetsAndSL(lastPrice, label);
-    const breakoutRange = (isFinite(breakoutMin) && isFinite(breakoutMax)) ? `${breakoutMin.toFixed(2)} - ${breakoutMax.toFixed(2)}` : "N/A";
-
-    // 8) ML Smart Alert prediction & training (online)
-    // load prev prediction to train model if available
-    try {
-      if (fs.existsSync(LAST_PRED_FILE)) {
-        const prev = JSON.parse(fs.readFileSync(LAST_PRED_FILE,"utf8"));
-        if (prev && prev.klines15 && prev.pred) {
-          const prevClose = prev.prevClose || 0;
-          const actual = lastPrice > prevClose ? "Bullish" : lastPrice < prevClose ? "Bearish" : "Neutral";
-          const labelTrain = (prev.pred === actual) ? 1 : 0;
-          const featPrev = mlExtractFeatures({
-            klines15: prev.klines15,
-            lastCandle: prev.klines15.at(-1),
-            avgVol20: avgVolume(prev.klines15,20),
-            divergenceSign: prev.divSign||0,
-            ellConf: prev.ellConf||0,
-            systemBias: biasToSign(prev.pred)
-          });
-          const probBefore = mlPredict(featPrev);
-          mlTrain(featPrev, labelTrain);
-          console.log("ML trained on previous prediction label", labelTrain, "probBefore", probBefore.toFixed(3));
-        }
-      }
-    } catch(e){ console.warn("ML training on prev error", e.message); }
-
-    // prepare features for current report
-    const feat = mlExtractFeatures({
-      klines15: base.slice(-40),
-      lastCandle: base.at(-1),
-      avgVol20: avgVolume(base,20),
-      divergenceSign: bullCount>bearCount?1:(bearCount>bullCount?-1:0),
-      ellConf: 0,
-      systemBias: biasToSign(label)
-    });
-    const mlProb = mlPredict(feat);
-
-    // 9) save last pred for training later
-    try {
-      const lastPredPayload = {
-        pred: label,
-        prevClose: lastPrice,
-        klines15: base.slice(-40),
-        divSign: bullCount>bearCount?1:(bearCount>bullCount?-1:0),
-        ellConf: 0,
-        ts: Date.now()
-      };
-      fs.writeFileSync(LAST_PRED_FILE, JSON.stringify(lastPredPayload));
-    } catch(e) { console.warn("save last pred error", e.message); }
-
-    // 10) accuracy: compare prev prediction to last candle movement (local file)
-    try {
-      const ACC_SAVE = "./last_report_prevclose.json";
-      if (fs.existsSync(ACC_SAVE)) {
-        const prev = JSON.parse(fs.readFileSync(ACC_SAVE,"utf8"));
-        if (prev && prev.pred && prev.prevClose) {
-          const actual = lastPrice > prev.prevClose ? "Bullish" : lastPrice < prev.prevClose ? "Bearish" : "Neutral";
-          pushAccLocal(prev.pred === actual);
-        }
-      }
-      fs.writeFileSync(ACC_SAVE, JSON.stringify({ pred: label, prevClose: lastPrice, ts: Date.now() }));
-    } catch(e){ console.warn("acc update", e.message); }
-
-    // 11) build message
-    let msg = `<b>🤖 ${SYMBOL} — AI Trader v8.6</b>\n🕒 ${nowStr()}\n`;
-    msg += perTfText + "\n\n";
-    msg += `🎯 <b>Targets:</b>\nTP1: ${tgs.tp1} | TP2: ${tgs.tp2} | TP3: ${tgs.tp3}\nSL: ${tgs.sl}\n📊 Breakout Range: ${breakoutRange}\n\n`;
-    msg += `🧠 <b>Overall Bias:</b> ${label} | Confidence: ${confidencePct}%\n💰 Last Price: ${lastPrice.toFixed(2)}\n📈 Tech Vol: Buy ${tech.buyPct.toFixed(2)}% / Sell ${tech.sellPct.toFixed(2)}%\n📉 ATR(14): ${(atrVal||0).toFixed(2)}\nAccuracy(Last10): ${getAccLocal(10)}%\n📰 News Impact: ${newsImpact}\n`;
-
-    if (newsArr.length) {
-      msg += `\n📰 <b>Headlines:</b>\n`;
-      for (const n of newsArr) msg += `• ${n.title}\n`;
-    } else {
-      msg += `\n📰 <b>Headlines:</b> No recent headlines\n`;
-    }
-
-    msg += `\n🤖 ML Smart Prob: ${(mlProb*100).toFixed(1)}% (threshold ${(ML_ALERT_THRESH*100).toFixed(0)}%)\n`;
-
-    if (mlProb >= ML_ALERT_THRESH && confidencePct > 40) {
-      msg += `\n🚨 <b>ML Smart Alert:</b> ${(mlProb*100).toFixed(1)}% probability of ${label} move — consider watching breakout zone\n`;
-    }
-
-      // send chunked message
-    const chunks = chunkMessage(msg, 3800);
-    for (const c of chunks) {
-      try { await sendTG(c); } catch(e){ console.warn("TG chunk send failed", e.message); }
-      await new Promise(r=>setTimeout(r, 400)); // small delay
-    }
-
-  } catch (err) {
-    console.error("analyzeAndReport error", err);
-    try { await sendTG(`⚠️ AI Trader error: ${err.message} — ${nowStr()}`); } catch(e){ console.warn("failed send error", e.message); }
-  }
-}
-
-// ---------- Reversal watcher (1-min loop) ----------
-let revCooldownUntil = 0;
-async function reversalWatcher() {
-  try {
-    const kl1 = await fetchKlines(SYMBOL, "1m", 40);
-    if (!kl1.length) return;
-    const last = kl1.at(-1);
-    const avgVol20 = avgVolume(kl1, 20);
-    const volRatio = avgVol20>0 ? (last.volume/avgVol20) : 1;
-    const { isDoji, isHammer, isShooting, body, range } = detectCandlePattern(kl1);
-
-    // require high volume confirmation and pattern
-    const highVol = volRatio > 1.8; // 80% above avg
-    const patternDetected = isDoji || isHammer || isShooting;
-    const now = Date.now();
-
-    if (patternDetected && highVol && now > revCooldownUntil) {
-      // decide direction
-      const dir = isHammer ? "Bullish Reversal" : isShooting ? "Bearish Reversal" : "Doji (possible reversal)";
-      const probFeat = mlExtractFeatures({
-        klines15: kl1.slice(-15),
-        lastCandle: last,
-        avgVol20,
-        divergenceSign: 0,
-        systemBias: 0
-      });
-      const p = mlPredict(probFeat);
-      const message = `<b>🚨 Reversal Watcher Alert</b>\n🕒 ${nowStr()}\nPattern: ${dir}\nPrice: ${last.close.toFixed(2)}\nVol ratio: ${volRatio.toFixed(2)}\nML Prob: ${(p*100).toFixed(1)}%\nTake action: watch breakout / confirm on higher TF.\n`;
-      const chunks = chunkMessage(message, 3800);
-      for (const c of chunks) { try { await sendTG(c); } catch(e){console.warn("rev TG fail", e.message);} }
-      // cooldown to avoid spam
-      revCooldownUntil = now + (5 * 60 * 1000); // 5 minutes cooldown
-    }
-  } catch(e){ console.warn("reversalWatcher err", e.message); }
-}
-
-// ---------- Simple periodic handlers ----------
-async function startLoops() {
-  // initial run
-  await analyzeAndReport().catch(e=>console.warn(e));
-  // schedule 15-min report
-  setInterval(()=>analyzeAndReport().catch(e=>console.warn(e)), CHECK_INTERVAL_MIN * 60 * 1000);
-  // schedule 1-min watcher
-  setInterval(()=>reversalWatcher().catch(e=>console.warn(e)), REV_CHECK_INTERVAL_SEC * 1000);
-  // self-ping every 3 minutes if configured
-  if (RENDER_EXTERNAL_URL) setInterval(()=>selfPing(), 3 * 60 * 1000);
-}
-
-// ---------- Express webserver to keep alive ----------
-const app = express();
-app.get("/", (req,res)=> res.send(`AI Trader Bot v8.6 running — ${nowStr()}`));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=> {
-  console.log("Web server listening on port", PORT);
-  // start loops after server ready
-  startLoops();
+// ---------- Expose to global for Part 2 to use ----------
+globalThis.aiTrader = globalThis.aiTrader || {};
+Object.assign(globalThis.aiTrader, {
+  CONFIG,
+  nowTime,
+  fetchKlines,
+  fetchHeadlines,
+  fetchRedditTop,
+  detectCandlePattern,
+  isVolumeSpike,
+  calcFibLevels,
+  fmt,
+  OnlineLogistic,
+  pushAccuracy,
+  getAccuracy,
+  fetchWithFallback
 });
 
-// expose for debugging if needed
-global.aiTrader = { ml: ML };
+// end of Part 1
+console.log("Part1 loaded: helpers & ML class ready");
+// ===== Part 2: Main pipeline — uses globals created by Part 1 =====
+// Paste this AFTER Part 1 in same runtime (same file below part1 or as separate file that imports part1)
 
-console.log("AI Trader v8.6 started —", nowStr());
+// ensure the Part1 globals exist
+const {
+  CONFIG, nowTime, fetchKlines, fetchHeadlines, fetchRedditTop,
+  detectCandlePattern, isVolumeSpike, calcFibLevels, fmt,
+  OnlineLogistic, pushAccuracy, getAccuracy, fetchWithFallback
+} = globalThis.aiTrader;
+
+import express from "express"; // already installed in package.json
+import fs from "fs";
+
+// telegram send helper
+async function sendTelegram(text) {
+  if (!CONFIG.BOT_TOKEN || !CONFIG.CHAT_ID) {
+    console.warn("Telegram credentials missing; not sending message");
+    return;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}/sendMessage`;
+    // chunk if > 4000 chars
+    const max = 3800;
+    if (text.length <= max) {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: CONFIG.CHAT_ID, text, parse_mode: "HTML" })
+      });
+      return;
+    }
+    // split nicely by line
+    const lines = text.split("\n");
+    let cur = "";
+    for (const ln of lines) {
+      if ((cur + ln + "\n").length > max) {
+        await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: CONFIG.CHAT_ID, text: cur, parse_mode: "HTML" }) });
+        cur = "";
+      }
+      cur += ln + "\n";
+    }
+    if (cur.length) await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: CONFIG.CHAT_ID, text: cur, parse_mode: "HTML" }) });
+  } catch (e) {
+    console.error("Telegram send error:", e.message);
+  }
+}
+
+// instantiate model (features: patternFlag, volumeSpikeFlag, slope, recentReturn)
+const MODEL_FEATURES = 4;
+const model = new OnlineLogistic(MODEL_FEATURES, { lr: 0.08, l2: 0.0002 });
+
+// Keep reversal cooldown map to avoid duplicate spam
+const revCooldowns = {}; // key: "BUY"|"SELL" -> timestamp until which suppressed
+
+function inCooldown(type) {
+  const now = Date.now();
+  if (!revCooldowns[type]) return false;
+  return revCooldowns[type] > now;
+}
+function setCooldown(type, minutes) {
+  revCooldowns[type] = Date.now() + minutes * 60 * 1000;
+}
+
+// feature builder for the model from a specific candle + context
+function buildFeatures(klines, idx) {
+  const k = klines[idx];
+  // pattern flag (Doji/Hammer/ShootingStar)
+  const p = detectCandlePattern(k);
+  const patternFlag = p.pattern ? (p.pattern === "Hammer" || p.pattern === "Doji" ? 1 : (p.pattern === "ShootingStar" ? -1 : 0)) : 0;
+  const volSpike = isVolumeSpike(klines, idx, 1.6) ? 1 : 0;
+  // slope of last N closes
+  const look = 8;
+  const start = Math.max(0, idx - look + 1);
+  const slice = klines.slice(start, idx + 1);
+  const slope = (slice.length >= 2) ? ((slice[slice.length - 1].close - slice[0].close) / slice[0].close) : 0;
+  // recent return (last candle relative change)
+  const recentReturn = (k.close - k.open) / (k.open || 1);
+  // features vector (normalize lightly)
+  return [patternFlag, volSpike, slope * 100, recentReturn * 100];
+}
+
+// produce a textual report for multiple tf
+async function produceReport() {
+  const tfs = ["1m","5m","15m","30m","1h"];
+  let report = `🤖 <b>${CONFIG.SYMBOL} — AI Trader v8.6+ML</b>\n${nowTime()}\n\n`;
+  let bull = 0, bear = 0, totalStrength = 0;
+  let lastPrice = null;
+
+  // collect multi-TF summaries
+  for (const tf of tfs) {
+    const kl = await fetchKlines(CONFIG.SYMBOL, tf, 80);
+    if (!kl.length) {
+      report += `⏱ ${tf} | No data\n`;
+      continue;
+    }
+    lastPrice = kl[kl.length - 1].close;
+    // get divergence approx: last percent change and last volume change pct
+    const last = kl[kl.length - 1];
+    const prev = kl[kl.length - 2] || kl[kl.length - 1];
+    const dp = ((last.close - prev.close) / (prev.close || last.close)) * 100;
+    const dv = ((last.volume - prev.volume) / (prev.volume || last.volume)) * 100;
+    let signal = "Neutral ⚖️";
+    if (dp > 0 && dv < 0) signal = "Bearish Divergence 🔻";
+    if (dp < 0 && dv > 0) signal = "Bullish Divergence 🚀";
+    const strength = Math.min(100, Math.abs(dp) + Math.abs(dv));
+    // analyze pattern and fib
+    const pat = detectCandlePattern(last).pattern || "—";
+    const fib = calcFibLevels(kl);
+    // small trend (slope)
+    const slope = ((last.close - kl[0].close) / kl[0].close) * 100;
+    const trendLabel = Math.abs(slope) < 0.2 ? "Flat" : (slope > 0 ? "Uptrend 📈" : "Downtrend 📉");
+
+    report += `⏱ ${tf} | ${signal} | ΔP ${fmt(dp)}% | ΔV ${fmt(dv)}% | Strength ${Math.round(strength)}\n`;
+    report += `   Elliot/Pattern: ${pat} | ${trendLabel}\n`;
+    if (fib) report += `   Fib0.618: ${fmt(fib.fib618)}\n`;
+
+    if (signal.includes("Bullish")) bull++;
+    if (signal.includes("Bearish")) bear++;
+    totalStrength += strength;
+  }
+
+  // get targets from 15m context (primary)
+  const kl15 = await fetchKlines(CONFIG.SYMBOL, "15m", 120);
+  if (kl15.length) {
+    const fib = calcFibLevels(kl15);
+    const last = kl15[kl15.length - 1].close;
+    const move = last * 0.005; // 0.5% step
+    // choose bias from counts
+    const bias = bull > bear ? "Bullish 🚀" : bear > bull ? "Bearish 📉" : "Neutral ⚖️";
+    const confidence = Math.round((totalStrength / (tfs.length * 100)) * 10000) / 100;
+    const tp1 = (bias.includes("Bullish") ? last + move : bias.includes("Bearish") ? last - move : last + move*0.3);
+    const tp2 = (bias.includes("Bullish") ? last + move*2 : bias.includes("Bearish") ? last - move*2 : last - move*0.2);
+    const tp3 = (bias.includes("Bullish") ? last + move*3 : bias.includes("Bearish") ? last - move*3 : last - move*0.5);
+    const sl  = (bias.includes("Bullish") ? last - move : bias.includes("Bearish") ? last + move : last - move);
+    // breakout range based on fib band
+    const breakoutLow = fib ? Math.min(fib.fib618, fib.fib5) : last - move;
+    const breakoutHigh = fib ? Math.max(fib.fib618, fib.fib5) : last + move;
+
+    report += `\n🎯 Targets:\nTP1: ${fmt(tp1)} | TP2: ${fmt(tp2)} | TP3: ${fmt(tp3)}\nSL: ${fmt(sl)}\n📊 Breakout Range: ${fmt(breakoutLow)} - ${fmt(breakoutHigh)}\n\n`;
+    report += `🧠 Overall Bias: ${bias} | Confidence: ${fmt(confidence,2)}%\n💰 Last Price: ${fmt(last)}\n📈 Accuracy (last10): ${getAccuracy(10)}%\n`;
+
+    // headlines & news sentiment
+    const headlines = await fetchHeadlines(6);
+    report += `\n📰 Headlines:\n`;
+    if (headlines.length) headlines.forEach(h => report += `• ${h}\n`);
+    else report += "• No news fetched\n";
+  }
+
+  // final send
+  await sendTelegram(report);
+  console.log("Main report sent", nowTime());
+  return true;
+}
+
+// ---------- Reversal watcher (1-min) runs independently and uses ML model ----------
+async function reversalWatcher() {
+  // fetch 1m candles (limit small)
+  const kl = await fetchKlines(CONFIG.SYMBOL, "1m", 80);
+  if (!kl.length) return;
+  const idx = kl.length - 1;
+  const feat = buildFeatures(kl, idx);
+  // model prediction (probability that this candle leads to reversal upward)
+  const pred = model.predictRaw(feat); // 0..1
+  // threshold adjustments (dynamic)
+  const threshold = 0.65; // tuneable
+  // rule-based signals
+  const pDetected = detectCandlePattern(kl[idx]);
+  const volSpike = isVolumeSpike(kl, idx, 1.6);
+  // decide label using combined heuristics + ML (hybrid)
+  let action = null;
+  if (pDetected.pattern === "Hammer" && volSpike && pred > threshold && !inCooldown("BUY")) {
+    action = { type: "BUY", conf: Math.round(pred * 100), pattern: pDetected.pattern };
+    setCooldown("BUY", CONFIG.REV_COOLDOWN_MIN);
+    // update model after we wait next candle for actual outcome (handled below)
+  } else if (pDetected.pattern === "ShootingStar" && volSpike && pred < (1 - threshold) && !inCooldown("SELL")) {
+    action = { type: "SELL", conf: Math.round((1 - pred) * 100), pattern: pDetected.pattern };
+    setCooldown("SELL", CONFIG.REV_COOLDOWN_MIN);
+  }
+  if (action) {
+    // smart alert message
+    const msg = `🔔 <b>Reversal Watcher Alert</b>\n${nowTime()}\nType: ${action.type}\nPattern: ${action.pattern}\nML Prob: ${action.conf}%\nPrice: ${fmt(kl[idx].close)}\nVolume spike: ${volSpike}\n\n(This is standalone alert)\n`;
+    await sendTelegram(msg);
+    console.log("Reversal alert sent", action);
+  }
+
+  // --- Training step (online): compare last candle's predicted vs actual move
+  // we look back one candle prediction stored in file/session and update model
+  // store last prediction features with timestamp
+  const STORE = path => path ? path + ".pred.json" : null;
+  const predFile = path.resolve(process.cwd(), "last_pred.json");
+  // Save current pred for next cycle to evaluate
+  try {
+    fs.writeFileSync(predFile, JSON.stringify({ time: kl[idx].time, features: feat, pred }));
+  } catch (e) { /* ignore */ }
+
+  // Evaluate previous prediction (if exists)
+  try {
+    if (fs.existsSync(predFile)) {
+      // read previous and if previous time < current time - one minute => evaluate
+      const raw = fs.readFileSync(predFile, "utf8");
+      const prev = JSON.parse(raw);
+      // if prev.features and prev.time < current candle time - 60s
+      if (prev && prev.time && prev.features && prev.time < kl[idx].time) {
+        // find the candle that follows prev.time in kl lines
+        const idxPrev = kl.findIndex(k => k.time === prev.time);
+        if (idxPrev >= 0 && idxPrev + 1 < kl.length) {
+          const nextCandle = kl[idxPrev + 1];
+          // determine actual label: if nextCandle.close > nextCandle.open => bullish move
+          const actual = nextCandle.close > nextCandle.open ? 1 : 0;
+          // update model
+          const pBefore = model.predictRaw(prev.features);
+          model.update(prev.features, actual);
+          // push accuracy history
+          const predLabel = pBefore >= 0.5 ? 1 : 0;
+          pushAccuracy(predLabel === actual);
+          console.log("Model updated. predBefore:", pBefore.toFixed(3), "actual:", actual);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("eval/training step failed:", e.message);
+  }
+}
+
+// ---------- Smart alerts: breakout on fib level + high-volume momentum ----------
+let lastSmartAlert = { fibBreak: 0, volReversal: 0 };
+async function smartAlertsCheck() {
+  // check 5m or 15m for fib breakout
+  const tf = "15m";
+  const kl = await fetchKlines(CONFIG.SYMBOL, tf, 120);
+  if (!kl.length) return;
+  const fib = calcFibLevels(kl);
+  const last = kl[kl.length - 1];
+  // breakout conditions
+  if (fib) {
+    // breakout above fib618 -> bullish, below fib618 -> bearish
+    if (last.close > fib.fib618 && (Date.now() - (lastSmartAlert.fibBreak || 0) > 5 * 60 * 1000)) {
+      lastSmartAlert.fibBreak = Date.now();
+      await sendTelegram(`🚨 <b>Smart Alert</b>\nBullish breakout above Fib 0.618 (${fmt(fib.fib618)})\nPrice: ${fmt(last.close)}\nTF: ${tf}`);
+    } else if (last.close < fib.fib618 && (Date.now() - (lastSmartAlert.fibBreak || 0) > 5 * 60 * 1000)) {
+      lastSmartAlert.fibBreak = Date.now();
+      await sendTelegram(`🚨 <b>Smart Alert</b>\nBearish breakdown below Fib 0.618 (${fmt(fib.fib618)})\nPrice: ${fmt(last.close)}\nTF: ${tf}`);
+    }
+  }
+  // high volume reversal on 1m (if a reversal pattern + spike)
+  const k1 = await fetchKlines(CONFIG.SYMBOL, "1m", 40);
+  if (k1.length >= 2) {
+    const idx = k1.length - 1;
+    const pat = detectCandlePattern(k1[idx]);
+    if ((pat.pattern === "Hammer" || pat.pattern === "ShootingStar") && isVolumeSpike(k1, idx, 2.0)) {
+      if (Date.now() - (lastSmartAlert.volReversal || 0) > 2 * 60 * 1000) {
+        lastSmartAlert.volReversal = Date.now();
+        await sendTelegram(`🔔 <b>Smart ML Alert</b>\nPattern: ${pat.pattern} with high volume\nPrice: ${fmt(k1[idx].close)}\nCheck: possible reversal`);
+      }
+    }
+  }
+}
+
+// ---------- Scheduler & self-ping ----------
+let mainTimer = null;
+let revTimer = null;
+let smartTimer = null;
+
+async function startAll() {
+  console.log("Starting aiTrader v8.6+ML ...", nowTime());
+  // start main report interval
+  await produceReport();
+  mainTimer = setInterval(produceReport, CONFIG.CHECK_INTERVAL_MIN * 60 * 1000);
+  // start reversal watcher (standalone)
+  await reversalWatcher();
+  revTimer = setInterval(reversalWatcher, CONFIG.REV_CHECK_INTERVAL_SEC * 1000);
+  // smart alerts
+  smartTimer = setInterval(smartAlertsCheck, 60 * 1000);
+
+  // self ping if configured (optional)
+  if (CONFIG.SELF_PING_URL) {
+    setInterval(async () => {
+      try {
+        const r = await fetchWithFallback(CONFIG.SELF_PING_URL);
+        console.log("Self-ping done", r.status || "ok");
+      } catch (e) {
+        console.warn("Self-ping fail", e.message);
+      }
+    }, 3 * 60 * 1000);
+  }
+}
+
+// ---------- Express HTTP server for keep-alive ----------
+const app = express();
+app.get("/", (req, res) => res.send("aiTraderBot v8.6+ML running ✅"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Web server listening on port", PORT);
+  // start bot pipeline when server ready
+  startAll().catch(err => console.error("startAll failed:", err));
+});
+
+// end of Part 2
+console.log("Part2 loaded: pipeline started (main, reversal, smart alerts)");
