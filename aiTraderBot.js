@@ -1,5 +1,5 @@
-// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts (Render Optimized)
-// -----------------------------------------------------------------------------------------
+// ✅ AI Trader Bot v4 — Auto Proxy Rotation + Self-Ping + Telegram Alerts (Render Fixed Version)
+// ---------------------------------------------------------------------------------------------
 
 import fetch from "node-fetch";
 import express from "express";
@@ -145,16 +145,20 @@ async function analyzeOnce() {
   }
 }
 
-// 🔄 Self-Ping to prevent Render sleep (optimized)
+// 🔄 Self-Ping to prevent Render sleep (fixed)
 async function selfPing() {
-  const url = `https://${process.env.RENDER_EXTERNAL_URL || "ai-trader-bot.onrender.com"}`; // ⚠️ Replace with your actual Render URL
+  const url = process.env.RENDER_EXTERNAL_URL
+    ? process.env.RENDER_EXTERNAL_URL.startsWith("http")
+      ? process.env.RENDER_EXTERNAL_URL
+      : `https://${process.env.RENDER_EXTERNAL_URL}`
+    : "https://ai-trader-bot.onrender.com"; // <-- Replace with your actual Render URL
+
+  console.log("🧩 Trying self-ping to:", url);
   try {
     const res = await fetch(url);
-    if (res.ok) {
-      console.log("🔄 Self-ping OK →", getIndiaTime());
-    } else {
-      console.warn("⚠️ Self-ping got non-OK response:", res.status);
-    }
+    console.log("📡 Self-ping status:", res.status);
+    if (res.ok) console.log("🔄 Self-ping OK →", getIndiaTime());
+    else console.warn("⚠️ Non-OK self-ping response:", res.status);
   } catch (err) {
     console.error("⚠️ Self-ping failed:", err.message);
   }
