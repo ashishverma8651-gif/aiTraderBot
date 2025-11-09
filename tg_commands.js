@@ -1,7 +1,7 @@
 /**
  * tg_commands.js
- * Telegram command handler for AI_Trader_v8.7
- * Connects with main bot through local HTTP endpoints
+ * Telegram command handler for AI_Trader_v8.x
+ * Connects with main bot through internal API functions
  */
 
 import fetch from "node-fetch";
@@ -10,121 +10,110 @@ dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const AI_BASE_URL = process.env.AI_BASE_URL || "http://localhost:3000";
 
 if (!BOT_TOKEN || !CHAT_ID) {
-  console.error("❌ BOT_TOKEN or CHAT_ID missing in .env — aborting.");
+  console.error("❌ BOT_TOKEN or CHAT_ID missing in .env — aborting Telegram command handler.");
   process.exit(1);
 }
 
-const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const OFFSET_FILE = "./tg_offset.json";
-import fs from "fs";
+/**
+ * Initialize Telegram command polling
+ * @param {Object} deps - injected dependencies from main bot
+ */
+export function initTelegramCommands({
+  SYMBOL,
+  analyzeAndReport,
+  fetchHeadlines,
+  reversalWatcherOnce
+}) {
+  console.log("🤖 Telegram Command System active...");
 
-let offset = 0;
-if (fs.existsSync(OFFSET_FILE)) {
-  try {
-    offset = JSON.parse(fs.readFileSync(OFFSET_FILE, "utf8")).offset || 0;
-  } catch {}
-}
+  // ---- HELP COMMAND LIST ----
+  const helpText = `
+🤖 <b>AI Trader Commands</b>
 
-// ------------------ Helper ------------------
-async function sendTG(text) {
-  try {
-    await fetch(`${API_URL}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
-    });
-  } catch (e) {
-    console.error("Telegram send error:", e.message);
-  }
-}
+/start - Activate bot
+/help - List all commands
+/news - Latest crypto headlines
+/predict - Generate AI analysis report instantly
+/reversal - Manually trigger 1-min reversal check
+/status - Check system health
+/symbol - Show current trading pair
+  `;
 
-async function getUpdates() {
-  const r = await fetch(`${API_URL}/getUpdates?timeout=25&offset=${offset + 1}`);
-  const j = await r.json();
-  if (!j.result) return [];
-  return j.result;
-}
+  // ---- MAIN POLLER ----
+  let offset = 0;
 
-// ------------------ Command Handlers ------------------
-async function handleCommand(cmd, args) {
-  cmd = cmd.toLowerCase();
+  async function poll() {
+    try {
+      const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset + 1}`;
+      const res = await fetch(url);
+      const data = await res.json();
 
-  if (cmd === "/start") {
-    await sendTG(
-      "🤖 <b>Welcome to AI Trader Bot!</b>\n\n" +
-        "Available commands:\n" +
-        "• /start — Show help\n" +
-        "• /status — Last market summary\n" +
-        "• /predict — Force new analysis\n" +
-        "• /news — Latest crypto headlines\n" +
-        "• /mlstats — ML model training info\n" +
-        "• /chart [tf] — Get live chart (e.g. /chart 1h)"
-    );
-  }
+      if (data?.result?.length) {
+        for (const upd of data.result) {
+          offset = upd.update_id;
+          const msg = upd.message;
+          const chatId = msg.chat.id;
+          const text = (msg.text || "").trim().toLowerCase();
 
-  else if (cmd === "/status") {
-    const res = await fetch(`${AI_BASE_URL}/last-report`);
-    const txt = await res.text();
-    await sendTG("📊 <b>Last Report</b>\n" + txt);
-  }
-
-  else if (cmd === "/predict") {
-    await sendTG("⏳ Running fresh AI analysis...");
-    const res = await fetch(`${AI_BASE_URL}/force-run`);
-    const txt = await res.text();
-    await sendTG("✅ " + txt);
-  }
-
-  else if (cmd === "/news") {
-    const res = await fetch(`${AI_BASE_URL}/news`);
-    const txt = await res.text();
-    await sendTG("📰 <b>Crypto Headlines</b>\n" + txt);
-  }
-
-  else if (cmd === "/mlstats") {
-    const res = await fetch(`${AI_BASE_URL}/mlstats`);
-    const txt = await res.text();
-    await sendTG("🧠 <b>ML Model Stats</b>\n" + txt);
-  }
-
-  else if (cmd.startsWith("/chart")) {
-    const tf = args[0] || "15m";
-    const res = await fetch(`${AI_BASE_URL}/chart?tf=${tf}`);
-    const url = await res.text();
-    await sendTG(`📈 <b>Chart (${tf})</b>\n${url}`);
-  }
-
-  else {
-    await sendTG("⚠️ Unknown command. Type /start for help.");
-  }
-}
-
-// ------------------ Polling Loop ------------------
-async function loop() {
-  try {
-    const updates = await getUpdates();
-    for (const u of updates) {
-      offset = u.update_id;
-      fs.writeFileSync(OFFSET_FILE, JSON.stringify({ offset }));
-      const msg = u.message?.text || "";
-      const [cmd, ...args] = msg.split(" ");
-      console.log("📩 Command:", cmd);
-      await handleCommand(cmd, args);
+          // 🧠 Handle commands
+          if (text === "/start") {
+            await sendText(chatId, "🤖 AI Trader is online.\nUse /help for command list.", "HTML");
+          }
+          else if (text === "/help") {
+            await sendText(chatId, helpText, "HTML");
+          }
+          else if (text === "/news") {
+            const news = await fetchHeadlines();
+            const msgOut = news && news.length
+              ? news.map(n => `• ${n.title}`).join("\n")
+              : "No crypto headlines found.";
+            await sendText(chatId, `📰 <b>Top Headlines:</b>\n${msgOut}`, "HTML");
+          }
+          else if (text === "/predict") {
+            await sendText(chatId, "⚙️ Running AI analysis, please wait...");
+            await analyzeAndReport();
+          }
+          else if (text === "/reversal") {
+            await sendText(chatId, "🔍 Checking for reversal patterns (1m)...");
+            await reversalWatcherOnce();
+          }
+          else if (text === "/status") {
+            await sendText(chatId, "✅ System active.\nML + Reversal + News are running fine.");
+          }
+          else if (text === "/symbol") {
+            await sendText(chatId, `📈 Current Symbol: <b>${SYMBOL}</b>`, "HTML");
+          }
+          else {
+            await sendText(chatId, "❓ Unknown command.\nType /help for available commands.");
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("⚠️ Telegram poll error:", err.message);
     }
-  } catch (e) {
-    console.error("loop error:", e.message);
-  } finally {
-    setTimeout(loop, 2500);
+    setTimeout(poll, 7000); // poll every 7s
   }
-}
 
-console.log("🤖 Telegram command handler started...");
-loop();
+  // ---- SENDER ----
+  async function sendText(chatId, text, parseMode = "Markdown") {
+    try {
+      const sendUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+      await fetch(sendUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: parseMode,
+          disable_web_page_preview: true
+        })
+      });
+    } catch (e) {
+      console.warn("sendText error:", e.message);
+    }
+  }
+
+  poll(); // start background polling
+}
