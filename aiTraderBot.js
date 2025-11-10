@@ -19,7 +19,7 @@ const express = require("express");
 require("dotenv").config();
 
 // ======= Telegram 409 Auto-Fix (Webhook Conflict) ======= //
-const TG_API = `https://api.telegram.org/bot${process.env.BOT_TOKEN}`;
+const //TG_API = `https://api.telegram.org/bot${process.env.BOT_TOKEN}`;
 
 async function fixTelegram409() {
   try {
