@@ -483,3 +483,99 @@ if (BOT_TOKEN) {
   });
   bot.command("predict", async (ctx) => {
     await ctx.reply("Running immediate analysis...");
+    await analyzeOnce();
+    await ctx.reply("Analysis sent to admin channel.");
+  });
+  bot.command("setthreshold", async (ctx) => {
+    const txt = ctx.message.text || "";
+    const parts = txt.split(" ");
+    if (parts.length < 2) return ctx.reply("Usage: /setthreshold 0.7");
+    const v = parseFloat(parts[1]);
+    if (isNaN(v) || v < 0 || v > 1) return ctx.reply("Provide 0..1");
+    ML.threshold = v;
+    mlSave();
+    return ctx.reply(`ML alert threshold set to ${v}`);
+  });
+  // auto report toggle stored in memory
+  let autoReporting = true;
+  bot.command("autoon", async (ctx)=> { autoReporting = true; ctx.reply("Auto reports enabled"); });
+  bot.command("autooff", async (ctx)=> { autoReporting = false; ctx.reply("Auto reports disabled"); });
+  bot.launch().then(()=> console.log("TG bot started")).catch(e=>console.warn("TG start fail", e.message));
+} else {
+  console.log("BOT_TOKEN not provided — Telegram features disabled. Use env BOT_TOKEN.");
+}
+
+// send to admin chat (fallback to console)
+async function sendTelegram(message) {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    console.log("TELEGRAM:", message);
+    return;
+  }
+  try {
+    const parts = chunkText(message);
+    for (const p of parts) {
+      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        chat_id: CHAT_ID, parse_mode: "HTML", text: p, disable_web_page_preview: true
+      });
+      await sleep(200);
+    }
+  } catch(e) {
+    console.warn("sendTelegram err", e.message);
+  }
+}
+
+// ---------- SELF PING for Render ----------
+async function selfPing() {
+  if (!SELF_PING_URL) return;
+  try {
+    const url = SELF_PING_URL.startsWith("http") ? SELF_PING_URL : `https://${SELF_PING_URL}`;
+    const r = await axios.get(url, { timeout: 5000 });
+    console.log("self-ping ok", r.status);
+  } catch(e) { console.warn("self-ping fail", e.message); }
+}
+
+// ---------- SCHEDULERS ----------
+mlLoad();
+let lastAnalysisAt = 0;
+async function startSchedulers() {
+  console.log("Starting schedulers...");
+  // 1m reversal watcher
+  setInterval(async ()=>{
+    try { await reversalWatcherOnce(); } catch(e){ /*ignore*/ }
+  }, Math.max(10, REV_CHECK_INTERVAL_SEC) * 1000);
+
+  // evaluate pending every 2 minutes
+  setInterval(async ()=> {
+    try { await evaluatePending(); } catch(e){ console.warn("eval pending err", e.message); }
+  }, 2*60*1000);
+
+  // main 15m reporting (aligned to clock roughly)
+  async function mainTick() {
+    const now = Date.now();
+    if (now - lastAnalysisAt < CHECK_INTERVAL_MIN*60*1000 - 1000) return;
+    lastAnalysisAt = now;
+    await analyzeOnce();
+  }
+  setInterval(mainTick, 30*1000); // check frequently, run when enough time passed
+
+  // self-ping every 8 minutes
+  setInterval(async ()=> { try { await selfPing(); } catch(e){} }, 8*60*1000);
+}
+
+// ---------- SIMPLE EXPRESS FOR Render healthcheck ----------
+const app = express();
+app.get("/", (req,res) => {
+  res.send(`<pre>AI Trader v9.2 running. Symbol: ${SYMBOL}\nTime: ${nowISO()}</pre>`);
+});
+app.get("/health", (req,res) => res.json({ ok:true, ts: nowISO() }));
+app.listen(PORT, ()=> {
+  console.log(`Server listening on port ${PORT}`);
+  // start schedulers after server up
+  startSchedulers();
+});
+
+// ---------- STARTUP message ----------
+(async ()=> {
+  console.log("AI Trader v9.2 starting", SYMBOL);
+  await sendTelegram(`<b>AI Trader v9.2 started</b>\n${nowIndia()}\nSymbol: ${SYMBOL}\nHost: Node`);
+})();
