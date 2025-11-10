@@ -1,6 +1,7 @@
 {
   "name": "ai-trader-bot",
-  "version": "9.2.1",
+  "version": "9.2.0",
+  "description": "AI-powered multi-source crypto trading analysis bot with ML, hybrid ATR+Fibonacci+Elliott Wave logic, and Telegram automation.",
   "main": "aiTraderBot.js",
   "type": "module",
   "scripts": {
@@ -19,5 +20,18 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "AI Trading",
+    "Crypto Bot",
+    "Telegram Bot",
+    "Binance",
+    "Machine Learning",
+    "Reversal Detection",
+    "ATR",
+    "Fibonacci",
+    "Elliott Wave"
+  ],
+  "author": "YourName",
+  "license": "MIT"
 }
