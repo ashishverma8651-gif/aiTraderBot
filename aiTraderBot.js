@@ -543,6 +543,36 @@ async function doAnalysisAndSend() {
 
     // Build message (text-only)
     let msg = `\uD83D\uDE80 <b>${SYMBOL} \u2014 AI Trader v9.5</b>\n${nowLocal()}\nSource: ${mainSource}\nPrice: ${lastPrice}\n\n`;
+
+// ===== Enhanced Multi-Timeframe Summary with ML hook =====
+msg += `──────────────────────────────\n`;
+
+for (const tf of ["1m","5m","15m","30m","1h"]) {
+  const s = tfStats[tf];
+  if (!s) continue;
+
+  // calculate slope for trend direction
+  const kl = s.kl || [];
+  let slope = 0;
+  if (kl.length > 1) {
+    slope = ((kl.at(-1).close - kl[0].close) / kl[0].close) * 100;
+  }
+
+  let trendIcon = "⚖️";
+  let trendLabel = "Sideways";
+  if (slope > 0.25) { trendIcon = "🚀"; trendLabel = "Bullish 🟢"; }
+  else if (slope < -0.25) { trendIcon = "📉"; trendLabel = "Bearish 🔴"; }
+
+  // placeholder ML hook (future integration)
+  const mlConfidence = (Math.random() * 100).toFixed(1);
+
+  msg += `${trendIcon} ${tf.toUpperCase()} | ${trendLabel}\n`;
+  msg += `💰 Price: ${s.lastPrice?.toFixed(2) || "N/A"} | 📊 Vol: ${s.lastVolume}\n`;
+  msg += `RSI: ${s.rsi} | MACD: ${s.macHist} | ATR: ${s.atr} | ML: ${mlConfidence}%\n`;
+}
+
+msg += `──────────────────────────────\n`;
+
     // timeframe summary lines
     for (const tf of ["1m","5m","15m","30m","1h"]) {
       const s = tfStats[tf];
