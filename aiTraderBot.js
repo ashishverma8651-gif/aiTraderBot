@@ -1,442 +1,485 @@
 /**
- * aiTraderBot_v9_2_pro.js
- * AI Trader v9.2 (Extended)
+ * aiTraderBot_v9_2.js
+ * v9.2 Extended single-file
  *
- * Features:
- * - Multi-source candles (Binance / Coinbase / Kraken / CoinGecko)
- * - Multi-TF analysis (1m,5m,15m,30m,1h)
- * - Reversal watcher (candles + MACD + RSI + volume/ATR)
- * - ML module (online incremental) via ml_module_v9_2.js
- * - Chart image generation using chartjs-node-canvas -> send to Telegram
- * - SmartAlertManager: dedupe & cool-downs & thresholds
- * - Telegram commands via tg_commands.js
+ * Required env:
+ * BOT_TOKEN, CHAT_ID (developer/admin chat id for summaries),
+ * SYMBOL (e.g. BTCUSDT),
+ * CHECK_INTERVAL_MIN (default 15),
+ * REV_CHECK_INTERVAL_SEC (default 60),
+ * ML_ALERT_THRESH (0-1, default 0.7),
+ * PORT (optional),
+ * RENDER_EXTERNAL_URL (optional, used for self-ping)
  *
- * Deploy: Node 18+, Install deps: `npm ci`
- * Run: `node aiTraderBot_v9_2_pro.js`
+ * Install:
+ *   npm install axios express dotenv telegraf
+ *
+ * Start:
+ *   BOT_TOKEN=xxx CHAT_ID=yyy node aiTraderBot_v9_2.js
  */
 
-import dotenv from "dotenv";
-dotenv.config();
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const express = require("express");
+const { Telegraf } = require("telegraf");
+require("dotenv").config();
 
-import axios from "axios";
-import express from "express";
-import fs from "fs";
-import path from "path";
-import { ChartJSNodeCanvas } from "chartjs-node-canvas";
-import { Telegraf } from "telegraf";
-import { MACD, RSI } from "technicalindicators";
-import * as ml from "./ml_module_v9_2.js";
-import { initTelegramCommands } from "./tg_commands.js";
+// ---------- CONFIG ----------
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const CHAT_ID = process.env.CHAT_ID || ""; // admin / channel id
+const SYMBOL_RAW = process.env.SYMBOL || "BTCUSDT";
+const CHECK_INTERVAL_MIN = parseInt(process.env.CHECK_INTERVAL_MIN || "15", 10);
+const REV_CHECK_INTERVAL_SEC = parseInt(process.env.REV_CHECK_INTERVAL_SEC || "60", 10);
+const ML_ALERT_THRESH = parseFloat(process.env.ML_ALERT_THRESH || "0.70");
+const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL || null;
+const PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || "3000", 10);
 
-const PORT = Number(process.env.PORT || 10000);
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const SYMBOL = process.env.SYMBOL || "BTCUSDT";
-const REPORT_INTERVAL_MIN = Number(process.env.REPORT_INTERVAL_MIN || 15);
-const REV_CHECK_INTERVAL_SEC = Number(process.env.REV_CHECK_INTERVAL_SEC || 20);
-const ML_ALERT_THRESH = Number(process.env.ML_ALERT_THRESH || 0.70);
-const FETCH_TIMEOUT = Number(process.env.FETCH_TIMEOUT || 9000);
+// endpoints / proxies
+const BINANCE_ENDPOINTS = [
+  "https://api.binance.com",
+  "https://api-gateway.binance.com", // some mirrors
+  "https://data-api.binance.vision",
+  "https://api.binance.us" // sometimes
+];
+const PROXY_PREFIXES = [
+  "https://api.codetabs.com/v1/proxy?quest=",
+  "https://api.allorigins.win/raw?url=",
+  "https://thingproxy.freeboard.io/fetch/",
+  "https://corsproxy.io/?"
+];
 
-const ax = axios.create({ timeout: FETCH_TIMEOUT, headers: { "User-Agent": "ai-trader-bot/9.2" } });
+// FILES
+const ML_FILE = path.join(__dirname, "ml_model_v92.json");
+const ACC_FILE = path.join(__dirname, "acc_v92.json");
+const REV_FILE = path.join(__dirname, "reversal_events_v92.json");
+const LAST_PRED_FILE = path.join(__dirname, "last_pred_v92.json");
 
-const app = express();
-app.get("/", (_, res) => res.send("AI Trader v9.2 running"));
+// ---------- UTIL ----------
+function nowISO() { return new Date().toISOString(); }
+function nowIndia() { return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }); }
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+function safeJSONread(file) { try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,"utf8")) : null; } catch(e){ return null; } }
+function safeJSONwrite(file, obj) { try { fs.writeFileSync(file, JSON.stringify(obj, null, 2)); } catch(e){ console.warn("write fail", file, e.message); } }
+function chunkText(s, n=3500) { const out=[]; for(let i=0;i<s.length;i+=n) out.push(s.slice(i,i+n)); return out; }
 
-/* ---------- Multi-source fetchers (same logic as v9.1) ---------- */
+// ---------- SYMBOL NORMALIZE ----------
+function normalizeSymbols(raw) {
+  const up = (raw||"BTCUSDT").toUpperCase().replace(/[-_]/g,"");
+  let coinbase;
+  if (up.endsWith("USDT")) {
+    const base = up.slice(0,-4);
+    coinbase = `${base}-USD`;
+  } else if (up.endsWith("USD")) {
+    const base = up.slice(0,-3);
+    coinbase = `${base}-USD`;
+  } else {
+    coinbase = up.replace(/(.{3})(.*)/,"$1-$2") + "-USD";
+  }
+  let cg = "bitcoin";
+  if (/^BTC/.test(up)) cg = "bitcoin";
+  else if (/^ETH/.test(up)) cg = "ethereum";
+  else cg = up.slice(0,3).toLowerCase();
+  return { bin: up, coinbase, cg };
+}
+const SYMBOLS = normalizeSymbols(SYMBOL_RAW);
+const SYMBOL = SYMBOLS.bin;
 
-const BINANCE_ENDPOINTS = ["https://api.binance.com", "https://data-api.binance.vision", "https://api-gcp.binance.com"];
-
-async function safeGet(url) {
-  try {
-    const r = await ax.get(url);
-    return r;
-  } catch (e) {
-    throw e;
+// ---------- ML simple online logistic ----------
+let ML = { w: null, bias:0, n:0, lr:0.02, l2:0.0001, trained:0, threshold: ML_ALERT_THRESH };
+function mlLoad() {
+  const j = safeJSONread(ML_FILE);
+  if (j) Object.assign(ML, j);
+}
+function mlSave() { safeJSONwrite(ML_FILE, ML); }
+function mlInit(n) {
+  if (!ML.w || ML.n !== n) {
+    ML.n = n;
+    ML.w = new Array(n).fill(0).map(()=> (Math.random()*0.02 - 0.01));
+    ML.bias = 0;
+    ML.trained = 0;
+    mlSave();
   }
 }
+function sigmoid(z) { return 1/(1+Math.exp(-z)); }
+function mlPredict(features) {
+  if (!ML.w || ML.w.length !== features.length) mlInit(features.length);
+  let z = ML.bias;
+  for (let i=0;i<features.length;i++) z += (ML.w[i]||0) * (features[i]||0);
+  return sigmoid(z);
+}
+function mlTrainOnline(features, label) {
+  if (!ML.w || ML.w.length !== features.length) mlInit(features.length);
+  const p = mlPredict(features);
+  const err = label - p;
+  for (let i=0;i<features.length;i++){
+    ML.w[i] += ML.lr * (err * features[i] - ML.l2 * (ML.w[i]||0));
+  }
+  ML.bias += ML.lr * err;
+  ML.trained += 1;
+  if (ML.trained % 10 === 0) mlSave();
+  return p;
+}
 
-async function fetchKlinesBinance(symbol, intervalStr, limit=500) {
-  const url = `/api/v3/klines?symbol=${symbol}&interval=${intervalStr}&limit=${limit}`;
+// accuracy store
+function pushAcc(v) {
+  let arr = safeJSONread(ACC_FILE) || [];
+  arr.push(v?1:0);
+  while (arr.length > 200) arr.shift();
+  safeJSONwrite(ACC_FILE, arr);
+}
+function getAcc(n=10) {
+  const arr = safeJSONread(ACC_FILE) || [];
+  if (!arr.length) return "N/A";
+  const slice = arr.slice(-n);
+  const sum = slice.reduce((a,b)=>a+b,0);
+  return ((sum / slice.length) * 100).toFixed(1) + "%";
+}
+
+// ---------- DATA FETCHERS (multi-source) ----------
+
+async function safeFetchText(url, timeout=12000) {
+  try {
+    const r = await axios.get(url, { timeout, responseType: "text" });
+    return r.data;
+  } catch(e) {}
+  for (const prefix of PROXY_PREFIXES) {
+    try {
+      const r = await axios.get(prefix + encodeURIComponent(url), { timeout, responseType: "text" });
+      return r.data;
+    } catch(e) {}
+  }
+  throw new Error("all proxies failed for " + url);
+}
+
+async function fetchKlinesBinance(symbol, interval="15m", limit=80) {
+  const path = `/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   for (const base of BINANCE_ENDPOINTS) {
     try {
-      const r = await ax.get(base.replace(/\/$/,"") + url);
-      if (Array.isArray(r.data) && r.data.length) {
-        return r.data.map(k => ({ t: k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], vol:+k[5] }));
-      }
-    } catch (e) {
-      console.warn("binance mirror fail", base, e.message || e);
+      const url = base.replace(/\/$/,"") + path;
+      const r = await axios.get(url, { timeout: 10000 });
+      if (!Array.isArray(r.data)) throw new Error("no array");
+      return { data: r.data.map(k=>({ time:+k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5] })), source: "Binance" };
+    } catch(e) {
+      // console.warn("binance failed:", base, e.message);
+      continue;
     }
   }
-  throw new Error("Binance all mirrors failed");
+  throw new Error("binance all failed");
 }
 
-async function fetchKlinesCoinbase(product="BTC-USD", granularitySec=900, limit=500) {
-  // Coinbase returns arrays: [time, low, high, open, close, volume] descending
-  const end = Math.floor(Date.now()/1000);
-  const start = end - granularitySec * limit;
-  const url = `https://api.exchange.coinbase.com/products/${product}/candles?start=${new Date(start*1000).toISOString()}&end=${new Date(end*1000).toISOString()}&granularity=${granularitySec}`;
-  const r = await ax.get(url);
-  const arr = r.data.slice(-limit).sort((a,b)=>a[0]-b[0]);
-  return arr.map(a => ({ t: a[0]*1000, open:+a[3], high:+a[2], low:+a[1], close:+a[4], vol:+(a[5]||0) }));
-}
-
-async function fetchKlinesKraken(pair="XBTUSD", interval=15) {
-  const url = `https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${interval}`;
-  const r = await ax.get(url);
-  const key = Object.keys(r.data.result).find(k=>k!=="last");
-  const arr = r.data.result[key].map(a=>({ t: a[0]*1000, open:+a[1], high:+a[2], low:+a[3], close:+a[4], vol:+a[6] }));
-  return arr;
-}
-
-async function fetchKlinesCoinGecko(id="bitcoin", vs="usd", tfMinutes=15) {
-  const r = await ax.get(`https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=${vs}&days=1`);
-  const prices = r.data.prices || [];
-  // bucket into timeframe intervals
-  const buckets = {};
-  for (const [ts, price] of prices) {
-    const bucket = Math.floor(ts / (tfMinutes*60*1000));
-    if (!buckets[bucket]) buckets[bucket] = { t: bucket*(tfMinutes*60*1000), open: price, high: price, low: price, close: price, vol: 0 };
-    buckets[bucket].high = Math.max(buckets[bucket].high, price);
-    buckets[bucket].low = Math.min(buckets[bucket].low, price);
-    buckets[bucket].close = price;
-  }
-  return Object.values(buckets).slice(-500);
-}
-
-function tfToIntervalStr(tfMinutes) {
-  if (tfMinutes === 1) return "1m";
-  if (tfMinutes === 3) return "3m";
-  if (tfMinutes === 5) return "5m";
-  if (tfMinutes === 15) return "15m";
-  if (tfMinutes === 30) return "30m";
-  if (tfMinutes === 60) return "1h";
-  return `${tfMinutes}m`;
-}
-
-async function fetchCandlesMulti(tfMinutes=15) {
-  const intervalStr = tfToIntervalStr(tfMinutes);
-  const binSymbol = process.env.BINANCE_SYMBOL || SYMBOL;
-  // try Binance (mirrors) -> Coinbase -> Kraken -> CoinGecko
+async function fetchKlinesCoinbase(coinbaseSymbol, interval="15m", limit=80) {
+  const granMap = { "1m":60, "5m":300, "15m":900, "30m":1800, "1h":3600 };
+  const gran = granMap[interval] || 900;
+  const url = `https://api.exchange.coinbase.com/products/${coinbaseSymbol}/candles?granularity=${gran}`;
   try {
-    const kl = await fetchKlinesBinance(binSymbol, intervalStr, 500);
-    return { data: kl, source: "Binance" };
-  } catch (e) { console.warn("binance failed:", e.message); }
+    const r = await axios.get(url, { timeout: 10000 });
+    if (!Array.isArray(r.data)) throw new Error("coinbase no array");
+    const sorted = r.data.slice(0,limit).sort((a,b)=>a[0]-b[0]);
+    return { data: sorted.map(k => ({ time:k[0]*1000, open:+k[3], high:+k[2], low:+k[1], close:+k[4], volume:+(k[5]||0) })), source: "Coinbase" };
+  } catch(e) { throw new Error("coinbase failed: " + e.message); }
+}
+
+async function fetchKlinesCoinGecko(cgid="bitcoin", interval="15m", limit=80) {
   try {
-    const granMap = {1:60,3:180,5:300,15:900,30:1800,60:3600};
-    const gran = granMap[tfMinutes] || tfMinutes*60;
-    const product = process.env.COINBASE_PRODUCT || "BTC-USD";
-    const kl = await fetchKlinesCoinbase(product, gran, 500);
-    return { data: kl, source: "Coinbase" };
-  } catch (e) { console.warn("coinbase failed:", e.message); }
-  try {
-    const pair = process.env.KRAKEN_PAIR || "XBTUSD";
-    const kl = await fetchKlinesKraken(pair, tfMinutes);
-    return { data: kl, source: "Kraken" };
-  } catch (e) { console.warn("kraken failed", e.message); }
-  try {
-    const id = process.env.COINGECKO_ID || "bitcoin";
-    const kl = await fetchKlinesCoinGecko(id, "usd", tfMinutes);
-    return { data: kl, source: "CoinGecko" };
-  } catch (e) { console.warn("coingecko failed", e.message); }
+    // Coingecko OHLC endpoint returns daily slices; we fallback to market_chart for price history
+    const url = `https://api.coingecko.com/api/v3/coins/${cgid}/market_chart?vs_currency=usd&days=1&interval=hourly`;
+    const r = await axios.get(url, { timeout: 10000 });
+    if (!r.data || !r.data.prices) throw new Error("coingecko invalid");
+    const prices = r.data.prices; // [timestamp, price]
+    // fabricate OHLC by using prices (simple)
+    const arr = prices.slice(-limit).map(p => ({ time: p[0], open: p[1], high: p[1], low: p[1], close: p[1], volume: 0 }));
+    return { data: arr, source: "CoinGecko" };
+  } catch(e){ throw new Error("coingecko failed: " + e.message); }
+}
+
+async function fetchKlines(symbol, interval="15m", limit=80) {
+  const { bin, coinbase, cg } = SYMBOLS;
+  try { return await fetchKlinesBinance(bin, interval, limit); } catch(e){ /*fallback*/ }
+  try { return await fetchKlinesCoinbase(coinbase, interval, limit); } catch(e){ /*fallback*/ }
+  try { return await fetchKlinesCoinGecko(cg, interval, limit); } catch(e){ /*fallback*/ }
   return { data: [], source: "None" };
 }
 
-/* ---------- Technical helpers ---------- */
-
-function atrFromCandles(candles, period=14) {
-  if (!candles || candles.length < period+1) return null;
+// ---------- TECHNICAL INDICATORS ----------
+function emaArray(values, period) {
+  if (!values || values.length === 0) return [];
+  const k = 2/(period+1);
+  const out = [values[0]];
+  for (let i=1;i<values.length;i++) out.push(values[i]*k + out[i-1]*(1-k));
+  return out;
+}
+function calcMACD(kl, short=12, long=26, signal=9) {
+  const closes = kl.map(k=>k.close);
+  if (closes.length < long) return { macd:0, signal:0, hist:0 };
+  const emaS = emaArray(closes, short);
+  const emaL = emaArray(closes, long);
+  const offset = emaS.length - emaL.length;
+  const macdLine = emaS.slice(offset).map((v,i)=>v - emaL[i]);
+  const signalLine = emaArray(macdLine, signal);
+  const hist = (macdLine.at(-1)||0) - (signalLine.at(-1)||0);
+  return { macd: macdLine.at(-1)||0, signal: signalLine.at(-1)||0, hist };
+}
+function calcRSI(kl, period=14) {
+  const closes = kl.map(k=>k.close);
+  if (closes.length <= period) return 50;
+  let gains = 0, losses = 0;
+  for (let i=1;i<closes.length;i++){
+    const d = closes[i] - closes[i-1];
+    if (d>0) gains += d; else losses -= d;
+  }
+  const avgG = gains / (closes.length-1);
+  const avgL = (losses || 0.000001) / (closes.length-1);
+  const rs = avgG / avgL;
+  return 100 - (100/(1+rs));
+}
+function atr(kl, period=14) {
+  if (!kl || kl.length <= period) return null;
   const trs = [];
-  for (let i=1;i<candles.length;i++){
-    const cur = candles[i], prev = candles[i-1];
-    const tr = Math.max(cur.high-cur.low, Math.abs(cur.high-prev.close), Math.abs(cur.low-prev.close));
+  for (let i=1;i<kl.length;i++){
+    const cur = kl[i], prev = kl[i-1];
+    const tr = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
     trs.push(tr);
   }
-  const s = trs.slice(-period).reduce((a,b)=>a+b,0);
-  return s / Math.max(1, Math.min(trs.length, period));
+  const slice = trs.slice(-period);
+  const sum = slice.reduce((a,b)=>a+b,0);
+  return sum / slice.length;
 }
-function simpleMACD(closeArr) {
-  try {
-    if (!closeArr || closeArr.length < 26) return null;
-    const macd = MACD.calculate({ values: closeArr, fastPeriod:12, slowPeriod:26, signalPeriod:9, SimpleMAOscillator:false, SimpleMASignal:false });
-    return macd.slice(-1)[0] || null;
-  } catch(e) { return null; }
+function calcFib(kl) {
+  if (!kl || !kl.length) return null;
+  const highs = kl.map(k=>k.high), lows = kl.map(k=>k.low);
+  const H = Math.max(...highs), L = Math.min(...lows), R = H-L || 1;
+  return { high:H, low:L, f382: H - R*0.382, f5: H - R*0.5, f618: H - R*0.618 };
 }
-function simpleRSI(closeArr, period=14) {
-  try {
-    if (!closeArr || closeArr.length < period+1) return null;
-    return RSI.calculate({ values: closeArr, period }).slice(-1)[0] || null;
-  } catch(e) { return null; }
-}
+
+// ---------- Candle patterns ----------
 function detectCandlePatternSingle(last, prev) {
-  if (!last) return null;
-  const o = last.open, c = last.close, h = last.high, l = last.low;
-  const body = Math.abs(c-o);
-  const range = h - l || 1;
-  const bodyRatio = body / range;
-  const lower = Math.min(o,c) - l;
-  const upper = h - Math.max(o,c);
-  if (lower > body * 2.5 && bodyRatio < 0.4 && upper < body * 0.6) return { name: "Hammer", dir: "bullish" };
-  if (upper > body * 2.5 && bodyRatio < 0.4 && lower < body * 0.6) return { name: "Shooting Star", dir: "bearish" };
-  if (bodyRatio < 0.12) return { name: "Doji", dir: "neutral" };
-  return null;
+  if (!last) return {};
+  const body = Math.abs(last.close - last.open);
+  const range = (last.high - last.low) || 1;
+  const isDoji = body <= range * 0.15;
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  const upperWick = last.high - Math.max(last.open, last.close);
+  const lowerRatio = lowerWick / range;
+  const upperRatio = upperWick / range;
+  const isHammer = lowerRatio > 0.4 && upperRatio < 0.25 && last.close >= (prev ? prev.close : last.open);
+  const isShooting = upperRatio > 0.4 && lowerRatio < 0.25 && last.close <= (prev ? prev.close : last.open);
+  return { isDoji, isHammer, isShooting, body, range };
 }
 
-/* ---------- Chart generation (chartjs-node-canvas) ---------- */
-
-const CHART_WIDTH = 1200;
-const CHART_HEIGHT = 520;
-const chartNode = new ChartJSNodeCanvas({ width: CHART_WIDTH, height: CHART_HEIGHT, backgroundColour: "#0b1220" });
-
-async function generateChartPNG(candles, targets = {}, opts={}) {
-  // candles: array of {t, open, high, low, close}
-  const labels = candles.map(c => new Date(c.t).toLocaleTimeString());
-  const closes = candles.map(c => c.close);
-  const opens = candles.map(c => c.open);
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
-  const datasets = [
-    {
-      label: "Close",
-      data: closes,
-      borderColor: "#60a5fa",
-      backgroundColor: "rgba(96,165,250,0.08)",
-      fill: true,
-      pointRadius: 0,
-      tension: 0.1,
-      yAxisID: 'y'
-    }
+// ---------- Feature extraction ----------
+function avgVolume(kl, n=20) {
+  if (!kl || !kl.length) return 1;
+  const slice = kl.slice(-n);
+  const sum = slice.reduce((a,b)=>a + (b.volume||0), 0);
+  return sum / slice.length;
+}
+function mlExtractFeatures({ klines15, lastCandle, avgVol20=1, divergenceSign=0, ellConf=0, systemBias=0 }) {
+  const first = (klines15 && klines15[0]) || lastCandle;
+  const last = lastCandle || (klines15 && klines15.at(-1));
+  const slope15 = ((last.close - (first.close||last.close)) / (first.close||1)) * 100;
+  const lastDeltaP = ((last.close - last.open) / (last.open||1)) * 100;
+  const volRatio = avgVol20>0 ? (last.volume / avgVol20) : 1;
+  const patt = detectCandlePatternSingle(last, klines15 && klines15.at(-2));
+  const rsi = calcRSI(klines15 || [last], 14);
+  const mac = calcMACD(klines15 || [last], 12, 26, 9);
+  const features = [
+    slope15,
+    lastDeltaP,
+    volRatio - 1,
+    patt.isDoji?1:0,
+    patt.isHammer?1:0,
+    patt.isShooting?1:0,
+    divergenceSign || 0,
+    (ellConf||0)/100,
+    systemBias || 0,
+    (rsi - 50) / 50,
+    mac.hist / (Math.abs(last.close) || 1)
   ];
-  // Add TP/SL horizontal lines as dataset items if provided
-  const extras = [];
-  if (targets.tp1) extras.push({ label: "TP1", value: Number(targets.tp1) });
-  if (targets.tp2) extras.push({ label: "TP2", value: Number(targets.tp2) });
-  if (targets.tp3) extras.push({ label: "TP3", value: Number(targets.tp3) });
-  if (targets.sl) extras.push({ label: "SL", value: Number(targets.sl) });
-
-  for (const ex of extras) {
-    datasets.push({
-      label: ex.label,
-      data: closes.map(()=>ex.value),
-      borderDash: [6,6],
-      borderColor: ex.label.startsWith("TP") ? "#22c55e" : "#ef4444",
-      pointRadius: 0,
-      type: 'line',
-      fill: false,
-      yAxisID: 'y'
-    });
-  }
-
-  const config = {
-    type: "line",
-    data: { labels, datasets },
-    options: {
-      plugins: { legend: { labels: { color: "#cfe9ff" } } },
-      scales: {
-        x: { ticks: { color: "#9fb7d6" } },
-        y: { ticks: { color: "#9fb7d6" } }
-      },
-      elements: { line: { borderWidth: 1.5 } },
-      layout: { padding: { left: 8, right: 8, top: 8, bottom: 8 } }
-    }
-  };
-
-  const image = await chartNode.renderToBuffer(config);
-  return image;
+  return features;
 }
 
-/* ---------- Smart Alert Manager ---------- */
-
-class SmartAlertManager {
-  constructor(opts={}) {
-    this.lastAlerts = {}; // key -> timestamp
-    this.cooldownMs = opts.cooldownMs || 15*60*1000; // default 15 minutes per key
-    this.minConfidence = opts.minConfidence || 40; // percent
-  }
-  canSend(key, confidence) {
-    const now = Date.now();
-    if (confidence < this.minConfidence) return false;
-    const last = this.lastAlerts[key] || 0;
-    if (now - last < this.cooldownMs) return false;
-    this.lastAlerts[key] = now;
-    return true;
-  }
-}
-const alertManager = new SmartAlertManager({ cooldownMs: Number(process.env.ALERT_COOLDOWN_MS || 15*60*1000), minConfidence: Number(process.env.MIN_CONFIDENCE || 40) });
-
-/* ---------- Telegram setup ---------- */
-
-let bot;
-async function initBot() {
-  if (!BOT_TOKEN) { console.error("BOT_TOKEN missing"); return; }
-  bot = new Telegraf(BOT_TOKEN);
-  initTelegramCommands(bot, { chatId: CHAT_ID });
-  await bot.launch();
-  console.log("Telegram bot launched");
-}
-async function sendTelegramText(text) {
-  if (!bot) return console.warn("Bot not init");
-  try { await bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: "Markdown", disable_web_page_preview: true }); } catch(e){ console.warn("sendTelegramText err", e.message); }
-}
-async function sendTelegramPhoto(buffer, caption) {
-  if (!bot) return console.warn("Bot not init");
-  try { await bot.telegram.sendPhoto(CHAT_ID, { source: buffer }, { caption, parse_mode: "Markdown" }); } catch(e){ console.warn("sendTelegramPhoto err", e.message); }
+// ---------- Merge Signals (tech + news + social) ----------
+function mergeSignals(techBuyPct, newsCount, redditScore, tweetScore, econCount) {
+  const techNorm = Math.max(-1, Math.min(1, (techBuyPct - 50) / 50)); // [-1,1]
+  const newsNorm = Math.max(-1, Math.min(1, (newsCount - 3) / 3));
+  const socialNorm = Math.max(-1, Math.min(1, (redditScore/20 + tweetScore/20)/2));
+  const econBoost = Math.min(1, econCount / 3) * 0.05;
+  const combined = 0.6*techNorm + 0.3*newsNorm + 0.1*socialNorm + econBoost;
+  const label = combined > 0.12 ? "Bullish" : combined < -0.12 ? "Bearish" : "Neutral";
+  return { combined, label, strength: Math.abs(combined) };
 }
 
-/* ---------- Reversal Watcher (improved with SmartAlert & chart) ---------- */
-
-let lastReversalTS = 0;
-const REV_COOLDOWN = Number(process.env.REV_COOLDOWN_MS || 90*1000);
+// ---------- Reversal watcher and pending auto-eval ----------
+let pendingReversals = safeJSONread(REV_FILE) || [];
+function savePending() { safeJSONwrite(REV_FILE, pendingReversals.slice(-200)); }
 
 async function reversalWatcherOnce() {
   try {
-    const tfs = [1,3,5];
-    const hits = [];
-    for (const tf of tfs) {
-      const { data, source } = await fetchCandlesMulti(tf);
-      if (!data || data.length < 10) continue;
-      const last = data.slice(-1)[0];
-      const prev = data.slice(-2,-1)[0];
-      const patt = detectCandlePatternSingle(last, prev);
-      const closes = data.map(c=>c.close);
-      const macd = simpleMACD(closes);
-      const rsi = simpleRSI(closes);
-      const atr = atrFromCandles(data,14) || 0;
-      const volSpike = last.vol > (atr * 1.2);
-      let conf = 0;
-      if (patt) conf += 40;
-      if (volSpike) conf += 20;
-      if (macd && macd.histogram && Math.abs(macd.histogram) > 0) conf += 15;
-      if (rsi && (rsi < 30 || rsi > 70)) conf += 15;
-      hits.push({ tf, last, patt, macd, rsi, atr, volSpike, conf, source });
-    }
-    // Compose best hit
-    const best = hits.sort((a,b)=>b.conf - a.conf)[0];
-    if (!best) return;
-    // need minimum confidence
-    if (best.conf < 45) return;
-    // global cooldown
-    if (Date.now() - lastReversalTS < REV_COOLDOWN) return;
-    // Smart alert dedupe by pattern+tf
-    const key = `rev:${best.patt?best.patt.name:"none"}:${best.tf}`;
-    if (!alertManager.canSend(key, best.conf)) return;
-    lastReversalTS = Date.now();
-    // build message
-    const prob = ml.predictSimple({ last: best.last, prevClose: best.prevClose, rsi: best.rsi, macd: best.macd, atr: best.atr, vol: best.last.vol });
-    const caption = [
-      `🚨 *Reversal Watcher (v9.2)*`,
-      `Symbol: *${SYMBOL}*`,
-      `TF: ${best.tf}m | Pattern: ${best.patt ? best.patt.name : "none"} | Dir: ${best.patt?best.patt.dir:"N/A"}`,
-      `Source: ${best.source}`,
-      `Price: ${best.last.close.toFixed(2)} | Vol:${Math.round(best.last.vol)}`,
-      `ATR:${best.atr.toFixed(2)} | Conf:${best.conf}%`,
-      `ML Prob: ${prob.toFixed(1)}%`
-    ].join("\n");
-    // chart for last 120 candles at TF
-    const chartBuf = await generateChartPNG( (await fetchCandlesMulti(best.tf)).data.slice(-120) , { tp1: null } );
-    await sendTelegramPhoto(chartBuf, caption);
-  } catch (e) {
-    console.warn("reversalWatcherOnce err", e.message || e);
+    const res = await fetchKlines(SYMBOL, "1m", 120);
+    const kl = res.data;
+    if (!kl || kl.length < 3) return null;
+    const last = kl.at(-1), prev = kl.at(-2);
+    const avgVol = avgVolume(kl, 20) || 1;
+    const patt = detectCandlePatternSingle(last, prev);
+    const volSpike = last.volume > avgVol * 1.5;
+    let reason = null;
+    if (patt.isHammer && volSpike) reason = "Hammer";
+    if (patt.isDoji && volSpike) reason = "Doji";
+    if (patt.isShooting && volSpike) reason = "Shooting Star";
+    if (!reason) return null;
+    const dir = patt.isHammer ? "Bullish" : patt.isShooting ? "Bearish" : "Neutral";
+    const feat = mlExtractFeatures({ klines15: kl.slice(-40), lastCandle: last, avgVol20: avgVol });
+    const prob = mlPredict(feat);
+    const msg = `🚨 <b>Reversal Watcher (v9.2)</b>\n${nowIndia()}\nSymbol: <b>${SYMBOL}</b>\nSource: ${res.source}\nPattern: <b>${reason}</b>\nDirection: <b>${dir}</b>\nPrice: ${last.close}\nVolume: ${Math.round(last.volume)} (avg ${Math.round(avgVol)})\nML Prob: ${(prob*100).toFixed(1)}%`;
+    await sendTelegram(msg);
+    pendingReversals.push({ time: Date.now(), reason, dir, prob, price: last.close, feat });
+    savePending();
+    // soft immediate training when very confident
+    if (prob > 0.95) mlTrainOnline(feat, 1);
+    if (prob < 0.05) mlTrainOnline(feat, 0);
+    return true;
+  } catch(e) {
+    console.warn("rev watch err", e.message);
+    return null;
   }
 }
 
-/* ---------- Main report (image + text) ---------- */
-
-async function analyzeAndReport() {
-  try {
-    const tfs = [1,5,15,30,60];
-    const results = [];
-    for (const tf of tfs) {
-      const { data, source } = await fetchCandlesMulti(tf);
-      if (!data || data.length < 10) { results.push({ tf, ok:false, source }); continue; }
-      const closes = data.map(c=>c.close);
-      const macd = simpleMACD(closes);
-      const rsi = simpleRSI(closes);
-      const atr = atrFromCandles(data,14);
-      const last = data.slice(-1)[0];
-      const prevAvg = data.slice(-4,-1).reduce((s,c)=>s+c.close,0)/3;
-      const delta = (last.close - prevAvg)/prevAvg*100;
-      const direction = delta > 0.2 ? "Uptrend" : delta < -0.2 ? "Downtrend" : "Flat";
-      results.push({ tf, ok:true, last, macd, rsi, atr, delta: delta.toFixed(2), direction, source, candles: data });
+async function evaluatePending() {
+  if (!pendingReversals.length) return;
+  const now = Date.now();
+  const keep = [];
+  for (const ev of pendingReversals) {
+    if (now - ev.time < 8*60*1000) { keep.push(ev); continue; } // wait 8 min
+    try {
+      const { data } = await fetchKlines(SYMBOL, "1m", 240);
+      if (!data || !data.length) { keep.push(ev); continue; }
+      const startPrice = ev.price;
+      const periodLow = Math.min(...data.map(k=>k.low));
+      const periodHigh = Math.max(...data.map(k=>k.high));
+      let success = false;
+      if (ev.dir === "Bullish" && periodHigh >= startPrice * 1.004) success = true;
+      if (ev.dir === "Bearish" && periodLow <= startPrice * 0.996) success = true;
+      // train
+      mlTrainOnline(ev.feat, success ? 1 : 0);
+      pushAcc(success?1:0);
+      // notify
+      await sendTelegram(`<b>Pending reversal evaluated</b>\n${nowIndia()}\nPattern: ${ev.reason}\nStartPrice: ${startPrice}\nResult: ${success? "Success":"Fail"}`);
+    } catch(e) {
+      keep.push(ev);
     }
-    // Primary: 15m
-    const res15 = results.find(r=>r.tf===15 && r.ok);
-    if (!res15) {
-      await sendTelegramText(`❗ Not enough 15m data to report (${new Date().toLocaleString()})`);
+  }
+  pendingReversals = keep;
+  savePending();
+}
+
+// ---------- ANALYSIS (15m main report) ----------
+async function analyzeOnce() {
+  try {
+    const { data: kl15, source } = await fetchKlines(SYMBOL, "15m", 120);
+    if (!kl15 || kl15.length < 10) {
+      await sendTelegram(`<b>Analysis failed</b>\nInsufficient klines from sources.`);
       return;
     }
-    const lastPrice = res15.last.close;
-    const atr15 = res15.atr || 0;
-    const mlProb = ml.predictFromCandles(res15.candles);
-    const bias = mlProb > 0.6 ? "Bullish" : mlProb < 0.4 ? "Bearish" : "Neutral";
-    const confidence = Math.round(Math.abs(mlProb - 0.5) * 200);
-
-    // Hybrid targets (ATR + simple fib multipliers)
-    const tp1 = lastPrice + atr15*1.0;
-    const tp2 = lastPrice + atr15*1.618;
-    const tp3 = lastPrice + atr15*2.618;
-    const sl = lastPrice - atr15*1.0;
-
-    const headlines = await (async ()=>{
-      try {
-        const r = await ax.get("https://www.coindesk.com/arc/outboundfeeds/rss/");
-        const txt = r.data;
-        const matches = [...txt.matchAll(/<title><!\[CDATA\[(.*?)\]\]><\/title>/g)].slice(1);
-        return matches.map(m=>m[1]).slice(0,6);
-      } catch(e) { return ["No headlines"]; }
-    })();
-
-    // build text
-    const lines = [];
-    lines.push(`🤖 *${SYMBOL} — AI Trader v9.2 (Extended)*`);
-    lines.push(`🕒 ${new Date().toLocaleString()}`);
-    results.forEach(r=>{
-      if (!r.ok) lines.push(`⏱ ${r.tf}m: No data (src:${r.source})`);
-      else lines.push(`⏱ ${r.tf}m: ${r.direction} | ΔP ${r.delta}% | ATR:${(r.atr||0).toFixed(2)} | src:${r.source}`);
-    });
-    lines.push("");
-    lines.push(`🎯 Targets: TP1 ${tp1.toFixed(2)} | TP2 ${tp2.toFixed(2)} | TP3 ${tp3.toFixed(2)} | SL ${sl.toFixed(2)}`);
-    lines.push(`🧠 Bias: *${bias}* | Confidence: ${confidence}% | ML Prob: ${(mlProb*100).toFixed(1)}%`);
-    lines.push(`💰 Last Price: ${lastPrice.toFixed(2)} | ATR(15m): ${atr15.toFixed(2)}`);
-    lines.push(`📰 Headlines Impact: ${headlines.slice(0,3).join(" // ")}`);
-    const text = lines.join("\n");
-
-    // Chart (150 candles of 15m)
-    const chartBuf = await generateChartPNG(res15.candles.slice(-150), { tp1, tp2, tp3, sl });
-    await sendTelegramPhoto(chartBuf, text);
-
-  } catch (e) {
-    console.error("analyzeAndReport err", e.message || e);
-    try { await sendTelegramText(`Error in report: ${e.message}`); } catch(e2){}
+    const last = kl15.at(-1);
+    const avgVol20 = avgVolume(kl15, 20);
+    const rsi = calcRSI(kl15, 14);
+    const mac = calcMACD(kl15, 12, 26, 9);
+    const atrVal = atr(kl15, 14) || 0;
+    const fib = calcFib(kl15);
+    // simple buy/sell tech vol (count of last 10 candles)
+    const buys = kl15.slice(-10).filter(k=>k.close > k.open).length;
+    const sells = 10 - buys;
+    const techBuyPct = (buys/10)*100;
+    // features & predict
+    const feat = mlExtractFeatures({ klines15: kl15, lastCandle: last, avgVol20 });
+    const prob = mlPredict(feat);
+    safeJSONwrite(LAST_PRED_FILE, { time: Date.now(), prob, feat });
+    // create targets (simple ATR-based)
+    const tp1 = +(last.close + atrVal*1).toFixed(2);
+    const tp2 = +(last.close + atrVal*2).toFixed(2);
+    const tp3 = +(last.close + atrVal*3).toFixed(2);
+    const sl = +(last.close - atrVal*1.5).toFixed(2);
+    // news/social quick fetch (non-blocking)
+    const news = await tryFetchHeadlines(); // returns array
+    const reddit = await tryFetchReddit();
+    const tweet = await tryFetchNitter();
+    const merged = mergeSignals(techBuyPct, news.length, reddit.length, tweet.length, 0);
+    const bias = merged.label;
+    // Push summary
+    const msg = [
+      `🤖 ${SYMBOL} — AI Trader v9.2`,
+      `${nowIndia()}`,
+      `Source: ${source}`,
+      `Price: ${last.close}`,
+      `Tech Vol: Buy ${techBuyPct.toFixed(1)}% / Sell ${(100-techBuyPct).toFixed(1)}%`,
+      `RSI(14): ${rsi.toFixed(1)} | MACD hist: ${mac.hist.toFixed(3)} | ATR(14): ${atrVal?atrVal.toFixed(2):"N/A"}`,
+      `Bias: <b>${bias}</b> | ML Prob: <b>${(prob*100).toFixed(1)}%</b> | Accuracy(last10): ${getAcc(10)}`,
+      `TP1: ${tp1} | TP2: ${tp2} | TP3: ${tp3} | SL: ${sl}`,
+      `Breakout zone (low-high): ${fib ? fib.low.toFixed(2) + " - " + fib.high.toFixed(2) : "N/A"}`,
+      `News headlines: ${news.slice(0,3).map(n=>"\n• "+n.title).join("")}`
+    ].join("\n");
+    await sendTelegram(msg);
+    // soft train: when label is extreme and prob aligns, train
+    if ((prob > 0.9 && bias === "Bullish") || (prob < 0.1 && bias === "Bearish")) {
+      mlTrainOnline(feat, bias==="Bullish"?1:0);
+      pushAcc(1);
+    } else {
+      pushAcc(0);
+    }
+  } catch(e) {
+    console.warn("analyzeOnce err", e.message);
+    await sendTelegram(`<b>Analysis Error</b>\n${e.message}`);
   }
 }
 
-/* ---------- Scheduling ---------- */
-
-function msUntilNextInterval(intervalMin) {
-  const now = new Date();
-  const ms = now.getTime();
-  const minutes = now.getUTCMinutes();
-  const remainder = minutes % intervalMin;
-  const next = new Date(now);
-  next.setUTCMinutes(minutes - remainder + intervalMin, 0, 0);
-  return next.getTime() - ms;
+// ---------- News / Social fetchers ----------
+async function tryFetchHeadlines() {
+  const out = [];
+  try {
+    const ct = await safeFetchText("https://cointelegraph.com/rss");
+    const items = ct.split("<item>").slice(1,6);
+    for (const it of items) {
+      const t = (it.match(/<title>([\s\S]*?)<\/title>/i)||[])[1];
+      if (t) out.push({ title: t.replace(/<!\[CDATA\[|\]\]>/g,"").trim() });
+    }
+  } catch(e){}
+  try {
+    const cd = await safeFetchText("https://www.coindesk.com/arc/outboundfeeds/rss/");
+    const items = cd.split("<item>").slice(1,6);
+    for (const it of items) {
+      const t = (it.match(/<title>([\s\S]*?)<\/title>/i)||[])[1];
+      if (t) out.push({ title: t.replace(/<!\[CDATA\[|\]\]>/g,"").trim() });
+    }
+  } catch(e){}
+  return out.slice(0,8);
+}
+async function tryFetchReddit(limit=8) {
+  try {
+    const r = await axios.get(`https://www.reddit.com/r/Bitcoin/new.json?limit=${limit}`, { timeout: 8000 });
+    if (!r.data || !r.data.data) return [];
+    return (r.data.data.children || []).map(c=>({ title: c.data.title, ups: c.data.ups }));
+  } catch(e){ return []; }
+}
+async function tryFetchNitter(q="bitcoin") {
+  try {
+    const html = await safeFetchText(`https://nitter.net/search?f=tweets&q=${encodeURIComponent(q)}&src=typed_query`);
+    const matches = [...html.matchAll(/class="tweet-content[^"]*"[^>]*>([\s\S]*?)<\/(a|div)>/g)];
+    if (!matches.length) return [];
+    return matches.slice(0,8).map(m => m[1].replace(/<[^>]+>/g,"").trim());
+  } catch(e){ return []; }
 }
 
-async function startAll() {
-  ml.initModel();
-  await initBot();
-  // Align first report to interval boundary
-  const delay = msUntilNextInterval(REPORT_INTERVAL_MIN);
-  console.log("First report in (ms):", delay);
-  setTimeout(()=>{
-    analyzeAndReport();
-    setInterval(() => analyzeAndReport(), REPORT_INTERVAL_MIN * 60 * 1000);
-  }, delay);
-
-  // reversal watcher fast loop
-  setInterval(reversalWatcherOnce, REV_CHECK_INTERVAL_SEC * 1000);
-
-  app.listen(PORT, ()=> console.log(`AI Trader v9.2 listening on ${PORT}`));
-}
-
-startAll().catch(e=>console.error("startAll failed", e.message || e));
+// ---------- TELEGRAM (Telegraf) ----------
+let bot = null;
+if (BOT_TOKEN) {
+  bot = new Telegraf(BOT_TOKEN);
+  bot.start((ctx) => ctx.reply("AI Trader v9.2 ready. Use /status or /predict."));
+  bot.help((ctx) => ctx.reply("/status\n/predict\n/setthreshold <0-1>\n/autoon\n/autooff"));
+  bot.command("status", async (ctx) => {
+    const acc = getAcc(10);
+    const last = safeJSONread(LAST_PRED_FILE) || {};
+    await ctx.replyWithHTML(`<b>AI Trader Status (v9.2)</b>\n${nowIndia()}\nSymbol: ${SYMBOL}\nML Prob (last): ${last.prob? (last.prob*100).toFixed(1)+"%": "N/A"}\nAccuracy(last10): ${acc}\nPending reversals: ${pendingReversals.length}`);
+  });
+  bot.command("predict", async (ctx) => {
+    await ctx.reply("Running immediate analysis...");
