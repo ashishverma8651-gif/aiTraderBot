@@ -1,7 +1,7 @@
 {
   "name": "ai-trader-bot",
   "version": "9.2.1",
-  "description": "AI Trader Bot v9.2 Extended — Multi-source ML-enhanced Hybrid Elliott+ATR+Fib system with Telegram automation and reversal detection.",
+  "description": "AI Trader Bot v9.2 Extended — ML + MultiSource + Hybrid (Elliott+ATR+Fib) + Telegram automation.",
   "main": "aiTraderBot.js",
   "type": "module",
   "scripts": {
@@ -16,8 +16,6 @@
     "moment": "^2.30.1",
     "mathjs": "^12.3.1",
     "dotenv": "^16.4.5",
-    "chart.js": "^4.4.2",
-    "chartjs-node-canvas": "^4.3.1",
     "ws": "^8.18.0",
     "tulind": "^0.8.21"
   },
@@ -33,7 +31,6 @@
     "machine-learning",
     "technical-analysis",
     "telegram-bot",
-    "cryptocurrency",
     "elliott-wave",
     "fibonacci",
     "reversal-alerts"
