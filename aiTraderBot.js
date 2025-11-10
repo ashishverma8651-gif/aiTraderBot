@@ -574,10 +574,8 @@ for (const tf of ["1m","5m","15m","30m","1h"]) {
 msg += `──────────────────────────────\n`;
 
     // timeframe summary lines
-    for (const tf of ["1m","5m","15m","30m","1h"]) {
-      const s = tfStats[tf];
-      msg += `\u23F0 ${tf} | Price: ${s.lastPrice || "N/A"} | Vol: ${s.lastVolume} | RSI(${tf}): ${s.rsi} | MACD hist(${tf}): ${s.macHist} | ATR(${tf}): ${s.atr}\n`;
-    }
+   
+
     msg += `\nBias: <b>${merged.label}</b> | Strength: ${(merged.strength*100).toFixed(0)}% | ML Prob: ${(mlProb*100).toFixed(1)}% | Accuracy(last10): ${getAccuracy(10)}\n\n`;
     msg += `TP1: ${tp1} | TP2: ${tp2} | TP3: ${tp3} | SL: ${sl}\n`;
     msg += `Breakout zone (low-high): ${LL.toFixed(2)} - ${HH.toFixed(2)}\n\n`;
