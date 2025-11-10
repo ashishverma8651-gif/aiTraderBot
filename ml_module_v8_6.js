@@ -1,6 +1,6 @@
 /**
  * ml_module_v9_2.js
- * Simple persistent online model (logistic style). Keeps small persisted weights.
+ * Simple persistent online model (logisti style). Keeps small persisted weights.
  */
 
 import fs from "fs";
