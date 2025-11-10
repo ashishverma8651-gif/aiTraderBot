@@ -18,6 +18,27 @@ const axios = require("axios");
 const express = require("express");
 require("dotenv").config();
 
+// ======= Telegram 409 Auto-Fix (Webhook Conflict) ======= //
+const TG_API = `https://api.telegram.org/bot${process.env.BOT_TOKEN}`;
+
+async function fixTelegram409() {
+  try {
+    const info = await axios.get(`${TG_API}/getWebhookInfo`);
+    if (info.data?.result?.url) {
+      console.log(`⚠️ Webhook detected (${info.data.result.url}), deleting to enable polling...`);
+      await axios.post(`${TG_API}/deleteWebhook`);
+      console.log("✅ Webhook deleted successfully. Polling will now work.");
+    } else {
+      console.log("✅ No webhook set, safe for polling.");
+    }
+  } catch (err) {
+    console.log("Telegram fix error:", err.message);
+  }
+}
+
+// Run it once on startup
+fixTelegram409();
+
 // ---------- CONFIG ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const CHAT_ID = process.env.CHAT_ID || ""; // required to post (use channel or group id)
