@@ -648,7 +648,8 @@ if (typeof ell_info !== "undefined" && ell_info.structure) {
   const waveIcon = waveDir ? "🔺" : "🔻";
   const waveColor = waveDir ? "lime" : "red";
 
-  msg += `\n📊 <b>Elliott Wave (15m)</b>\n${waveIcon} <span style='color:${waveColor}'>${ell_info.structure}</span>\n`;
+  msg += `\n📊 <b>Elliott Wave (15m)</b>\n${waveIcon} ${waveColor === "lime" ? "🟢" : "🔴"} ${ell_info.structure}\n`;
+
   msg += `Wave: <b>${ell_info.wave}</b> | Confidence: <b>${ell_info.confidence}%</b>\n`;
 
   // 🔔 Wave 5 Reversal Alert (experimental)
