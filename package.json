@@ -1,8 +1,9 @@
 {
   "name": "ai-trader-bot",
   "version": "9.2.0",
-  "description": "AI Trader v9.2 Extended — multi-source ML + reversal + Telegram",
+  "description": "AI Trader v9.2 Extended – multi-source ML + reversal + Telegram",
   "main": "aiTraderBot.js",
+  "type": "module",
   "scripts": {
     "start": "node aiTraderBot.js"
   },
@@ -13,9 +14,6 @@
     "telegraf": "^4.15.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "18.x"
   }
-}
-{
-  "type": "module"
 }
