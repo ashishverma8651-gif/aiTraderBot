@@ -16,10 +16,16 @@ import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ====== Import Internal Modules ======
-import { fetchMarketData, fetchNewsHeadlines } from "./fetch_module_v9.js";
-import { mlPredict, mlTrain, mlInit } from "./ml_module_v9.js";
-import { analyzeElliottWave } from "./elliott_module.js"; // optional
+
+import CONFIG from './config.js';
+import { calculateRSI, calculateMACD } from './core_indicators.js';
+import { analyzeElliott } from './elliott_module.js';
+import { mergeSignals } from './merge_signals.js';
+import { runMLPrediction } from './ml_module_v8_6.js';
+import { fetchNews } from './news_social.js';
+import { setupTelegramBot } from './tg_commands.js';
+import { keepAlive, fetchMarketData } from './utils.js';
+
 
 // ====== ENV + CONFIG ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
