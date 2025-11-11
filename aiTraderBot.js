@@ -8,6 +8,20 @@ import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
 import { keepAlive, nowLocal, fetchMarketData } from "./utils.js";
 
+// ====== KeepAlive / Express Server (v9.5 style) ======
+import express from "express";
+import { keepAlive } from "./utils.js";
+
+const app = express();
+app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running"));
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🌍 KeepAlive server running on port ${PORT}`);
+  // Ping every 5 min — same as v9.5
+  setInterval(() => keepAlive(), 5 * 60 * 1000);
+});
+
 console.log("🤖 AI Trader Bot Starting...");
 if (CONFIG.SELF_PING_URL) keepAlive(CONFIG.SELF_PING_URL);
 await setupTelegramBot();
