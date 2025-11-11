@@ -532,36 +532,35 @@ async function doAnalysisAndSend() {
     const techBuyPct = 50; // placeholder (could compute tech buy vs sell from indicators)
     const merged = mergeSignals(techBuyPct, newsEval.label);
 
-    // ---------- Elliott + Fibonacci + Hybrid TP/SL + Bias + ML Placeholder ----------
-function findSwingPoints(kl, lookback=80) {
+    // ===== Elliott + Hybrid Fibonacci TP/SL (15m Optimized) =====
+function findSwingPoints(kl, lookback = 80) {
   const highs = [], lows = [];
-  if (!kl || kl.length < 5) return {highs, lows};
+  if (!kl || !kl.length) return { highs, lows };
   const n = Math.min(kl.length, lookback);
-  for (let i = kl.length - n; i < kl.length - 2; i++) {
-    const cur = kl[i];
-    const left = kl[i - 2] || cur, right = kl[i + 2] || cur;
-    if (cur.high >= left.high && cur.high >= right.high) highs.push({i, price: cur.high});
-    if (cur.low <= left.low && cur.low <= right.low) lows.push({i, price: cur.low});
+  for (let i = kl.length - n; i < kl.length; i++) {
+    const cur = kl[i], left = kl[i - 2] || cur, right = kl[i + 2] || cur;
+    if (cur.high >= left.high && cur.high >= right.high) highs.push({ i, price: cur.high });
+    if (cur.low <= left.low && cur.low <= right.low) lows.push({ i, price: cur.low });
   }
-  return {highs, lows};
+  return { highs, lows };
 }
 
 function elliottAnalyze15m(kl15) {
-  if (!kl15 || kl15.length < 12) return {structure:"unknown", wave:"-", confidence:0.2};
-  const {highs, lows} = findSwingPoints(kl15, 80);
-  const swings = highs.concat(lows).sort((a,b)=>a.i-b.i).slice(-8);
-  if (swings.length < 4) return {structure:"flat", wave:"-", confidence:0.3};
-  const diffs = [];
-  for (let i=1;i<swings.length;i++) diffs.push(swings[i].price - swings[i-1].price);
-  const ups = diffs.filter(d=>d>0).length;
-  const downs = diffs.filter(d=>d<0).length;
-  const trendUp = ups > downs;
-  const structure = trendUp ? "impulse-up" : "impulse-down";
-  const wave = swings.length >= 5 ? "Wave 4-5 forming" : "Wave 3 developing";
-  const confidence = Math.min(0.95, 0.4 + Math.abs(ups-downs)/swings.length);
-  const lastLow = swings.slice().reverse().find(s=>kl15[s.i]?.low === s.price);
-  const lastHigh = swings.slice().reverse().find(s=>kl15[s.i]?.high === s.price);
-  return {structure, wave, lastLow, lastHigh, confidence:Math.round(confidence*100)};
+  if (!kl15 || kl15.length < 12) return { structure: "unknown", wave: "N/A", confidence: 0.3 };
+  const { highs, lows } = findSwingPoints(kl15, 80);
+  const swings = highs.concat(lows).sort((a, b) => a.i - b.i).slice(-8);
+  if (swings.length < 4) return { structure: "flat", wave: "W2", confidence: 0.4 };
+  
+  const prices = swings.map(s => s.price);
+  const diffs = prices.slice(1).map((p, i) => p - prices[i]);
+  const ups = diffs.filter(d => d > 0).length, downs = diffs.filter(d => d < 0).length;
+  const trendup = ups > downs;
+  const structure = trendup ? "impulse-up" : "impulse-down";
+  const wave = swings.length >= 5 ? "W4–W5 forming" : "W3 developing";
+  const confidence = Math.min(95, 30 + Math.abs(ups - downs) * 10);
+  const lastLow = swings.reverse().find(s => s.price === Math.min(...prices));
+  const lastHigh = swings.reverse().find(s => s.price === Math.max(...prices));
+  return { structure, wave, lastLow, lastHigh, confidence };
 }
 
 function fibExtensions(baseStart, baseEnd) {
@@ -573,14 +572,14 @@ function fibExtensions(baseStart, baseEnd) {
   };
 }
 
-(function computeHybridTP_SL(){
+(function computeHybridTP_SL() {
   try {
-    const kl15local = kl15 || (kmap && kmap["15m"]?.data) || [];
-    const HH = kl15local.length ? Math.max(...kl15local.map(k=>k.high)) : lastPrice;
-    const LL = kl15local.length ? Math.min(...kl15local.map(k=>k.low)) : lastPrice;
+    const k15local = kl15 || (kmap && kmap["15m"] && kmap["15m"].data) || [];
+    const HH = k15local.length ? Math.max(...k15local.map(k => k.high)) : lastPrice;
+    const LL = k15local.length ? Math.min(...k15local.map(k => k.low)) : lastPrice;
     const range = Math.max(1, HH - LL);
-
-    const ell = elliottAnalyze15m(kl15local);
+    
+    const ell = elliottAnalyze15m(k15local);
     let baseStart = LL, baseEnd = HH;
     if (ell.lastLow && ell.lastHigh) {
       if (ell.lastLow.i < ell.lastHigh.i) {
@@ -591,41 +590,43 @@ function fibExtensions(baseStart, baseEnd) {
     }
 
     const exts = fibExtensions(baseStart, baseEnd);
-    const bullTP1 = exts.ext100.toFixed(2);
-    const bullTP2 = exts.ext127.toFixed(2);
-    const bullTP3 = exts.ext161.toFixed(2);
-    const bearTP1 = (lastPrice - range * 0.236).toFixed(2);
-    const bearTP2 = (lastPrice - range * 0.382).toFixed(2);
-    const bearTP3 = (lastPrice - range * 0.618).toFixed(2);
-
-    const bullSL = (baseStart - range * 0.2).toFixed(2);
-    const bearSL = (baseEnd + range * 0.2).toFixed(2);
-
-    // ML placeholder
-    const mlSuggestion =
-      mlProb > 0.55
-        ? `🤖 ML favors <b>Bullish</b> trend (confidence ${(mlProb*100).toFixed(1)}%)`
-        : mlProb < 0.45
-        ? `🤖 ML favors <b>Bearish</b> trend (confidence ${(mlProb*100).toFixed(1)}%)`
-        : `🤖 ML indicates <b>Neutral</b> zone (confidence ${(mlProb*100).toFixed(1)}%)`;
-
-    // Append section to msg
-    msg += `\n📊 <b>Elliott Wave:</b> ${ell.structure} | ${ell.wave} | Confidence: ${ell.confidence}%\n`;
-    msg += `High: ${HH.toFixed(2)} | Low: ${LL.toFixed(2)}\n\n`;
-
-    msg += `📈 <b>Bullish Setup:</b>\nTP1: ${bullTP1} | TP2: ${bullTP2} | TP3: ${bullTP3} | SL: ${bullSL}\n`;
-    msg += `📉 <b>Bearish Setup:</b>\nTP1: ${bearTP1} | TP2: ${bearTP2} | TP3: ${bearTP3} | SL: ${bearSL}\n`;
-    msg += `\n${mlSuggestion}\n`;
-
-    msg += `🧩 <b>Strategy:</b> Fibonacci + Elliott + ATR Confirmation (15m base)\n`;
-  } catch (err) {
-    console.warn("Hybrid TP/SL compute err:", err.message);
+    tp1 = +exts.ext100.toFixed(2);
+    tp2 = +exts.ext127.toFixed(2);
+    tp3 = +exts.ext161.toFixed(2);
+    sl = ell.structure.includes("up")
+      ? +(Math.min(ell.lastLow?.price || LL, LL - range * 0.05)).toFixed(2)
+      : +(Math.max(ell.lastHigh?.price || HH, HH + range * 0.05)).toFixed(2);
+    ell_info = { structure: ell.structure, wave: ell.wave, confidence: ell.confidence };
+  } catch (e) {
+    console.warn("Hybrid TP/SL compute err", e.message);
   }
 })();
 
 
     // Build message (text-only)
     let msg = `\uD83D\uDE80 <b>${SYMBOL} \u2014 AI Trader v9.5</b>\n${nowLocal()}\nSource: ${mainSource}\nPrice: ${lastPrice}\n\n`;
+
+// === Elliott Wave Summary (15m frame) ===
+if (typeof ell_info !== "undefined" && ell_info.structure) {
+  const waveDir = ell_info.structure.includes("up");
+  const waveIcon = waveDir ? "🔺" : "🔻";
+  const waveColor = waveDir ? "lime" : "red";
+
+  msg += `\n📊 <b>Elliott Wave (15m)</b>\n${waveIcon} <span style='color:${waveColor}'>${ell_info.structure}</span>\n`;
+  msg += `Wave: <b>${ell_info.wave}</b> | Confidence: <b>${ell_info.confidence}%</b>\n`;
+
+  // 🔔 Wave 5 Reversal Alert (experimental)
+  if (ell_info.wave && ell_info.wave.toString().includes("5")) {
+    const alertIcon = waveDir ? "⚠️🟥" : "⚠️🟩";
+    const alertMsg = waveDir
+      ? "⚠️ <b>Possible Wave 5 Reversal Downtrend</b> — consider tightening SLs."
+      : "⚠️ <b>Possible Wave 5 Reversal Uptrend</b> — watch for breakout confirmation.";
+    msg += `\n${alertIcon} ${alertMsg}\n`;
+  }
+
+  msg += `──────────────────────────────\n`;
+};
+
 
 // ===== Enhanced Multi-Timeframe Summary with ML hook =====
 msg += `──────────────────────────────\n`;
