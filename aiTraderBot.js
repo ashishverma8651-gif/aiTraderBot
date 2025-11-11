@@ -648,3 +648,21 @@ process.on("SIGINT", () => {
   if (mainLoopHandle) clearInterval(mainLoopHandle);
   process.exit(0);
 });
+
+// ========== AUTO PING / KEEP ALIVE ==========
+const KEEPALIVE_URL = process.env.RENDER_EXTERNAL_URL || "https://aitraderbot.onrender.com";
+const KEEPALIVE_INTERVAL = 1000 * 60 * 5; // ping every 5 minutes
+
+async function keepAlive() {
+  try {
+    const res = await axios.get(KEEPALIVE_URL);
+    console.log(`🟢 Keep-alive ping success (${res.status}) at ${new Date().toLocaleTimeString()}`);
+    // Optional: Telegram message once every few hours
+    // await sendTelegram(`✅ Bot active — keep-alive ping OK (${new Date().toLocaleTimeString()})`);
+  } catch (err) {
+    console.log(`🔴 Keep-alive ping failed: ${err.message}`);
+  }
+}
+
+setInterval(keepAlive, KEEPALIVE_INTERVAL);
+keepAlive();
