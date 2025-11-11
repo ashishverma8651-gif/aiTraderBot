@@ -13,8 +13,15 @@ export function nowLocal() {
 export async function keepAlive(selfPingUrl = CONFIG.SELF_PING_URL) {
   if (!selfPingUrl) return;
   try {
-    await axios.get(selfPingUrl, { timeout: 5000 });
-    console.log("🌐 KeepAlive ping OK");
+    const res = await axios.get(selfPingUrl, {
+      timeout: 7000,
+      validateStatus: () => true // ignore 502 or 404 responses
+    });
+    if (res.status >= 200 && res.status < 400) {
+      console.log("🌐 KeepAlive ping OK:", res.status);
+    } else {
+      console.warn(`⚠️ KeepAlive non-200: ${res.status}`);
+    }
   } catch (e) {
     console.warn("KeepAlive failed:", e.message || e);
   }
