@@ -13,22 +13,27 @@ const CONFIG = {
   SELF_PING_URL: process.env.SELF_PING_URL || "",
   CACHE_FILE: path.join(CACHE_DIR, "marketData.json"),
 
-  // ✅ Multiple Binance sources
+  // ✅ Binance + Alternate unlocked mirrors
   BINANCE_SOURCES: [
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com"
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",        // official data mirror
+    "https://api-gcp.binance.com",            // GCP mirror
+    "https://api-cloud.binance.com",          // cloud relay
+    "https://api.binance.us",                 // fallback US endpoint
+    "https://binance-futures-data.onrender.com/proxy" // custom relay option
   ],
 
-  // ✅ Alternate + Fallback APIs
+  // ✅ Alternate APIs for other exchanges
   FALLBACK_SOURCES: {
     COINGECKO: "https://api.coingecko.com/api/v3",
     KUCOIN: "https://api.kucoin.com",
     YAHOO: "https://query1.finance.yahoo.com"
   },
 
-  // ✅ Market categories (this fixes your CRYPTO undefined error)
+  // ✅ Market classification
   MARKETS: {
     CRYPTO: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"],
     INDIAN: ["RELIANCE", "TCS", "INFY", "HDFCBANK"],
