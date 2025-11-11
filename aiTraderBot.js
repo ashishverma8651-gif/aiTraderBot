@@ -53,17 +53,7 @@ async function sendTelegramMessage(text, parse_mode = "HTML") {
   }
 }
 
-// ====== Keep Alive for Render ======
-async function keepAlive() {
-  if (!SELF_PING_URL) return;
-  try {
-    await axios.get(SELF_PING_URL);
-    console.log("🌐 KeepAlive ping OK");
-  } catch (e) {
-    console.warn("KeepAlive failed:", e.message);
-  }
-}
-setInterval(keepAlive, 3 * 60 * 1000); // every 3 mins
+
 
 // ====== Core Analysis ======
 async function generateReport() {
