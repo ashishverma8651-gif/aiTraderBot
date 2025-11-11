@@ -10,7 +10,8 @@ export const CONFIG = {
   // ===== Core Settings =====
   SYMBOL: process.env.SYMBOL || "BTCUSDT",
   INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
-  SELF_PING_URL: process.env.SELF_PING_URL || "https://aitraderbot.onrender.com/",
+
+  SELF_PING_URL: process.env.SELF_PING_URL || "https://web-production-f70a.up.railway.app/ping?url=https://aitraderbot.onrender.com",
   CACHE_FILE: path.join(CACHE_DIR, "marketData.json"),
 
   // ===== Market Categories =====
