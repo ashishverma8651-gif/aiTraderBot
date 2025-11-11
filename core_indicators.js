@@ -127,9 +127,10 @@ export function analyzeMultiTF(tfDataMap) {
 
   const confidence = Math.round((Math.max(bullish, bearish) / (valid.length || 1)) * 100);
   return { decision, confidence, tfSummary: results };
-}
+
 
 const strength = confidence > 70 ? "🟢 Strong" :
                   confidence > 40 ? "🟡 Moderate" : "🔴 Weak";
 
 return { decision, confidence, strength, tfSummary: results };
+}
