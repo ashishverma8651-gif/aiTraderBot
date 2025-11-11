@@ -7,7 +7,8 @@ dotenv.config();
 
 // ===== Internal Modules (Exact Repo Names) =====
 import CONFIG from "./config.js";
-import { calculateRSI, calculateMACD } from "./core_indicators.js";
+import indicators from './core_indicators.js';
+const { calculateRSI, calculateMACD } = indicators;
 import elliott from './elliott_module.js';
 const { analyzeElliott } = elliott;
 import { mergeSignals } from "./merge_signals.js";
