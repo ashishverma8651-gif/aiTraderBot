@@ -1,118 +1,254 @@
-// elliott_module.js — v9.7 Elliott + ML Hybrid
-import { runMLPrediction } from "./ml_module_v8_6.js";  // ML integration
-import { calculateRSI, calculateMACD } from "./core_indicators.js";
-import CONFIG from "./config.js";
+// elliott_module.js
+// Async Elliott / Fib / Channel + ML helper (multi-timeframe, multi-market)
+// Designed to be robust: dynamic imports for optional helpers (core_indicators, ml module).
+// Exports: analyzeElliott (async)
 
+export async function analyzeElliott(tfInput, options = {}) {
+  // tfInput: either
+  //  - an array of candles: [{ t, open, high, low, close, vol }, ...]  // single TF
+  //  - OR an object map: { "1m": [...], "15m": [...], "1h": [...] }    // multi-TF
+  //
+  // options: { useML: true/false, mlModulePath: "./ml_module_v8_6.js", lookback: 500, verbose: false }
+  const cfg = Object.assign(
+    { useML: true, mlModulePath: "./ml_module_v8_6.js", lookback: 500, verbose: false },
+    options
+  );
 
-// Example: after fetching 1-day data
-await trainModelFromData(dayCandles);
+  // Helper to normalize candle arrays (ensure fields and numbers)
+  const normalize = (arr) =>
+    Array.isArray(arr)
+      ? arr
+          .filter(Boolean)
+          .map((k) => ({
+            t: Number(k.t ?? k[0]),
+            open: Number(k.open ?? k[1]),
+            high: Number(k.high ?? k[2]),
+            low: Number(k.low ?? k[3]),
+            close: Number(k.close ?? k[4]),
+            vol: Number(k.vol ?? k[5] ?? 0),
+          }))
+          .sort((a, b) => a.t - b.t)
+      : [];
 
-// Example: predict from 15m window
-const ml = runMLPrediction(lastCandles);
-console.log("🤖 ML says:", ml.label, "Confidence:", ml.prob + "%");
-
-
-// ---------- Utility: find swing highs & lows ----------
-function findSwingPoints(kl, lookback = 50) {
-  const highs = [], lows = [];
-  if (!kl || kl.length < 5) return { highs, lows };
-
-  const n = Math.min(lookback, kl.length - 2);
-  for (let i = kl.length - n; i < kl.length - 2; i++) {
-    const prev = kl[i - 1] || kl[i];
-    const cur  = kl[i];
-    const next = kl[i + 1] || kl[i];
-
-    if (cur.high >= prev.high && cur.high >= next.high)
-      highs.push({ i, price: cur.high });
-    if (cur.low <= prev.low && cur.low <= next.low)
-      lows.push({ i, price: cur.low });
+  // Build tfMap
+  let tfMap = {};
+  if (Array.isArray(tfInput)) {
+    tfMap["raw"] = normalize(tfInput);
+  } else if (tfInput && typeof tfInput === "object") {
+    for (const [k, v] of Object.entries(tfInput)) tfMap[k] = normalize(v);
+  } else {
+    throw new Error("analyzeElliott: invalid input tfInput");
   }
-  return { highs, lows };
-}
 
-// ---------- Elliott analyzer (single timeframe) ----------
-function elliottAnalyze(kl) {
-  if (!kl || kl.length < 15) return null;
-  const { highs, lows } = findSwingPoints(kl, 80);
-  const swings = [...highs.map(h => ({ t: h.i, p: h.price, type: "H" })),
-                  ...lows.map(l => ({ t: l.i, p: l.price, type: "L" }))].sort((a,b)=>a.t-b.t);
-  if (swings.length < 5) return { structure: "flat", wave: "N/A", bias: "Neutral", confidence: 0.3 };
+  // Try to load indicator helpers (optional) dynamically.
+  let helpers = {};
+  try {
+    const core = await import("./core_indicators.js");
+    // safe aliases (function names may differ; we check availability)
+    helpers.calcRSI = core.calculateRSI || core.calcRSI || core.rsi || null;
+    helpers.calcMACD = core.calculateMACD || core.calcMACD || core.calcMacd || null;
+    helpers.sma = core.sma || core.SMA || null;
+  } catch (e) {
+    // Not fatal — we'll proceed without these helpers
+    if (cfg.verbose) console.warn("analyzeElliott: core_indicators not found or failed import:", e.message);
+  }
 
-  // trend detection
-  const seq = swings.slice(-6);
-  const prices = seq.map(s=>s.p);
-  const up = prices[prices.length-1] > prices[0];
-  const bias = up ? "Bullish" : "Bearish";
+  // Small utility functions
+  const lastN = (arr, n = 20) => (arr && arr.length ? arr.slice(Math.max(0, arr.length - n)) : []);
+  const pct = (a, b) => ((a - b) / b) * 100;
+  const round = (v, d = 3) => Math.round((v + Number.EPSILON) * Math.pow(10, d)) / Math.pow(10, d);
 
-  // naive wave label
-  const wave = seq.length >= 5 ? (up ? "Wave 5" : "Wave C") : (up ? "Wave 3" : "Wave A");
-  const structure = up ? "impulse" : "correction";
-  const confidence = Math.min(0.9, 0.4 + Math.abs(prices[prices.length-1] - prices[0]) / prices[0]);
+  // Basic wave detection heuristic:
+  // - Find local highs/lows (simple pivot detection)
+  function findPivots(series, lookback = 3) {
+    const highs = [], lows = [];
+    for (let i = lookback; i < series.length - lookback; i++) {
+      const c = series[i].close;
+      const left = series.slice(i - lookback, i).map(x => x.close);
+      const right = series.slice(i + 1, i + 1 + lookback).map(x => x.close);
+      if (left.every(v => v < c) && right.every(v => v < c)) highs.push({ idx: i, t: series[i].t, price: c });
+      if (left.every(v => v > c) && right.every(v => v > c)) lows.push({ idx: i, t: series[i].t, price: c });
+    }
+    return { highs, lows };
+  }
 
-  return { bias, structure, wave, confidence, seq };
-}
+  // Fibonacci level generator between two prices
+  function fibLevels(a, b) {
+    const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].map(r => ({
+      ratio: r,
+      level: round(a + (b - a) * r, 6),
+    }));
+    return levels;
+  }
 
-// ---------- Hybrid Analysis (Elliott + ML + Indicators) ----------
-export async function hybridElliottAnalysis(allData) {
-  const tfResults = {};
-  const timeframes = CONFIG.INTERVALS || ["1m","5m","15m","30m","1h"];
-
-  let bull = 0, bear = 0, confSum = 0;
-
-  for (const tf of timeframes) {
-    const kl = allData[tf] || [];
-    if (!kl.length) continue;
-
-    const ell = elliottAnalyze(kl);
-    if (!ell) continue;
-
-    // feature extraction for ML
-    const rsi = calcRSI(kl, 14);
-    const macd = calcMACD(kl, 12, 26, 9);
-    const last = kl.at(-1);
-    const change = ((last.close - kl[0].close) / kl[0].close) * 100;
-    const vol = kl.map(k=>k.vol||0).slice(-20);
-    const volAvg = vol.reduce((a,b)=>a+b,0)/(vol.length||1);
-    const feat = [
-      change / 10,                   // normalized price move
-      (rsi - 50) / 50,               // RSI deviation
-      macd.hist / (last.close || 1), // MACD histogram
-      (last.vol / volAvg) - 1,       // volume spike ratio
-      ell.confidence                 // from Elliott
-    ];
-
-    // ML prediction (trained model output 0–1)
-    const mlScore = await runMLPrediction(feat); // e.g. 0.85 means bullish
-    const mlBias = mlScore > 0.55 ? "Bullish" : mlScore < 0.45 ? "Bearish" : "Neutral";
-
-    // merge Elliott + ML
-    const mergedBias = (ell.bias === mlBias) ? ell.bias : 
-                       (mlScore > 0.55 ? "Bullish" : mlScore < 0.45 ? "Bearish" : "Neutral");
-    const combinedConfidence = Math.round(((ell.confidence * 100) + (mlScore * 100)) / 2);
-
-    if (mergedBias === "Bullish") bull++;
-    if (mergedBias === "Bearish") bear++;
-    confSum += combinedConfidence;
-
-    tfResults[tf] = {
-      elliott: ell,
-      mlScore: (mlScore*100).toFixed(1),
-      bias: mergedBias,
-      confidence: combinedConfidence
+  // Channel detection (simple linear regression on high and low)
+  function detectChannel(series) {
+    if (!series || series.length < 10) return null;
+    const n = series.length;
+    // compute simple linear fits for highs and lows using least squares (time index as x)
+    const xs = series.map((s, i) => i);
+    const fit = (vals) => {
+      const xbar = (n - 1) / 2;
+      let num = 0, den = 0;
+      for (let i = 0; i < n; i++) {
+        num += (xs[i] - xbar) * (vals[i] - (vals.reduce((a, b) => a + b, 0) / n));
+        den += (xs[i] - xbar) * (xs[i] - xbar);
+      }
+      const slope = den === 0 ? 0 : num / den;
+      const intercept = (vals.reduce((a, b) => a + b, 0) / n) - slope * xbar;
+      return { slope, intercept };
     };
+    const highs = series.map(s => s.high), lows = series.map(s => s.low);
+    const top = fit(highs), bottom = fit(lows);
+    return { top, bottom, width: Math.abs(top.intercept - bottom.intercept) };
   }
 
-  // overall bias
-  let overallBias = "Neutral";
-  if (bull > bear) overallBias = "Bullish";
-  else if (bear > bull) overallBias = "Bearish";
+  // Core single-TF analysis: indicators + wave heuristics
+  function analyzeSingle(series, tfName = "raw") {
+    const res = { ok: false, tf: tfName, summary: "No data", pattern: null, confidence: 0, wave: null, fibLevels: [], channel: null, indicators: {} };
+    if (!series || series.length < 6) return res;
+    res.ok = true;
 
-  const avgConf = Math.round(confSum / (bull + bear || 1));
+    // Basic price action
+    const recent = lastN(series, 50); // lookback for structure
+    const first = recent[0].close, last = recent[recent.length - 1].close;
+    const change = last - first;
+    const changePct = pct(last, first);
 
-  return {
-    overallBias,
-    confidence: avgConf,
-    results: tfResults
+    // Pivots
+    const piv = findPivots(recent, 3);
+    // Rough wave count: number of alternating pivots (high->low->high->low)
+    const waveCount = Math.max(0, (piv.highs.length + piv.lows.length) - 1);
+
+    // Fibonacci: from last major low to last major high (if available)
+    let majorLow = null, majorHigh = null;
+    if (piv.lows.length) majorLow = piv.lows[piv.lows.length - 1].price;
+    if (piv.highs.length) majorHigh = piv.highs[piv.highs.length - 1].price;
+    if (!majorLow && !majorHigh) {
+      // fallback: use min/max of recent
+      majorLow = Math.min(...recent.map(r => r.low));
+      majorHigh = Math.max(...recent.map(r => r.high));
+    }
+    res.fibLevels = fibLevels(majorLow, majorHigh);
+
+    // Channel
+    res.channel = detectChannel(recent);
+
+    // Indicators (optional)
+    try {
+      if (helpers.calcRSI) {
+        const closes = recent.map(x => x.close);
+        res.indicators.rsi = await Promise.resolve(helpers.calcRSI(closes, 14));
+      }
+      if (helpers.calcMACD) {
+        const closes = recent.map(x => x.close);
+        res.indicators.macd = await Promise.resolve(helpers.calcMACD(closes));
+      }
+    } catch (e) {
+      if (cfg.verbose) console.warn("analyzeSingle: indicator helper failed", e.message);
+    }
+
+    // Decide pattern label using heuristics
+    let pattern = "Neutral";
+    if (changePct > 1.2 && waveCount >= 3) pattern = "Impulse-up";
+    else if (changePct < -1.2 && waveCount >= 3) pattern = "Impulse-down";
+    else if (Math.abs(changePct) < 0.4 && waveCount <= 1) pattern = "Range";
+    else if (waveCount >= 4) pattern = changePct > 0 ? "W4-W5 forming (up)" : "W4-W5 forming (down)";
+
+    // Confidence heuristic: combine pivot count, channel width and change magnitude
+    const pivotScore = Math.min(1, waveCount / 6);
+    const moveScore = Math.min(1, Math.abs(changePct) / 5);
+    const channelScore = res.channel ? Math.min(1, Math.abs(res.channel.width) / Math.max(1, Math.abs(last))) : 0.2;
+    const baseConfidence = round((pivotScore * 0.5 + moveScore * 0.3 + channelScore * 0.2) * 100, 2);
+
+    res.pattern = pattern;
+    res.confidence = baseConfidence;
+    res.wave = { count: waveCount, lastHigh: majorHigh, lastLow: majorLow, changePct: round(changePct, 4) };
+
+    // extra summary
+    res.summary = `${pattern} | ${res.wave.count} pivots | ${res.confidence}%`;
+
+    return res;
+  }
+
+  // Run analysis across TFs
+  const tfSummary = {};
+  for (const [tf, series] of Object.entries(tfMap)) {
+    tfSummary[tf] = analyzeSingle(series, tf);
+  }
+
+  // Aggregate decision across TFs (simple voting)
+  const valid = Object.values(tfSummary).filter(r => r.ok);
+  let decision = "Neutral";
+  if (valid.length) {
+    const bullish = valid.filter(v => /up|Impulse|W4-W5|forming/i.test(v.pattern)).length;
+    const bearish = valid.filter(v => /down|Corrective|Correction|Impulse-down/i.test(v.pattern)).length;
+    if (bullish > bearish) decision = "Bullish";
+    else if (bearish > bullish) decision = "Bearish";
+    // confidence aggregate
+  }
+  const confidence = Math.round((valid.reduce((s, v) => s + (v.confidence || 0), 0) / (valid.length || 1)) * 100) / 100;
+
+  // Optional ML integration (dynamic import), catch gracefully if missing
+  let mlResult = { available: false, prediction: null, score: 0 };
+  if (cfg.useML) {
+    try {
+      const ml = await import(cfg.mlModulePath);
+      // runMLPrediction should accept: (tfMap, options) and return { pred: 'Buy'|'Sell'|'Neutral', prob: 0.xx }
+      if (typeof ml.runMLPrediction === "function") {
+        const mlOut = await ml.runMLPrediction(tfMap, { lookback: cfg.lookback });
+        if (mlOut) {
+          mlResult.available = true;
+          mlResult.prediction = mlOut.pred || mlOut.label || mlOut.prediction || null;
+          mlResult.score = mlOut.prob || mlOut.score || mlOut.confidence || 0;
+        }
+      } else if (typeof ml.default === "function") {
+        // support default export function
+        const mlOut = await ml.default(tfMap, { lookback: cfg.lookback });
+        if (mlOut) {
+          mlResult.available = true;
+          mlResult.prediction = mlOut.pred || mlOut.label || mlOut.prediction || null;
+          mlResult.score = mlOut.prob || mlOut.score || mlOut.confidence || 0;
+        }
+      }
+    } catch (e) {
+      if (cfg.verbose) console.warn("analyzeElliott: ML import failed (optional):", e.message);
+      mlResult = { available: false, error: e.message };
+    }
+  }
+
+  // Add recommended TP/SL roughs if user asked for bias-specific TP
+  // Here we compute simple TP1/TP2/SL estimates based on fibLevels of main TF (prefer '15m' then any)
+  const preferTFs = ["15m", "1h", "raw"];
+  let main = valid.length ? valid[0] : null;
+  for (const p of preferTFs) if (tfSummary[p] && tfSummary[p].ok) { main = tfSummary[p]; break; }
+  let recommendations = { TP1: null, TP2: null, SL: null, breakoutZone: null };
+  if (main && main.fibLevels && main.fibLevels.length) {
+    const fibs = main.fibLevels;
+    // choose TP levels on impulse direction
+    const dir = /up|Impulse|Bullish/i.test(main.pattern) ? 1 : -1;
+    if (dir === 1) {
+      recommendations.TP1 = fibs[3].level; // 0.5
+      recommendations.TP2 = fibs[4].level; // 0.618
+      recommendations.SL = main.wave.lastLow ? round(main.wave.lastLow * 0.999, 6) : round(main.wave.lastLow || fibs[0].level, 6);
+    } else {
+      recommendations.TP1 = fibs[3].level; // 0.5
+      recommendations.TP2 = fibs[2].level; // 0.382 (for downward)
+      recommendations.SL = main.wave.lastHigh ? round(main.wave.lastHigh * 1.001, 6) : round(main.wave.lastHigh || fibs[fibs.length - 1].level, 6);
+    }
+    recommendations.breakoutZone = [fibs[1].level, fibs[5].level];
+  }
+
+  // Final composed result
+  const result = {
+    decision,
+    confidence: round(confidence, 2),
+    tfSummary,
+    recommendations,
+    ml: mlResult,
+    timestamp: Date.now(),
+    note: "Elliott-module v9 compatible; uses dynamic ML/core imports if available",
   };
+
+  return result;
 }
