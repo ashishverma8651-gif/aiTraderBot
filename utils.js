@@ -1,8 +1,11 @@
-// utils.js
+// utils.js — AI Trader v9.6 (Stable)
 import axios from "axios";
 import fs from "fs";
 import CONFIG from "./config.js";
 
+// ===========================
+// 🕒 Time + KeepAlive
+// ===========================
 export function nowLocal() {
   return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 }
@@ -17,38 +20,32 @@ export async function keepAlive(selfPingUrl = CONFIG.SELF_PING_URL) {
   }
 }
 
-function saveCache(obj) {
+// ===========================
+// 💾 Cache System (1-day retention)
+// ===========================
+function saveCache(symbol, data) {
   try {
-    fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify(obj, null, 2));
+    let cache = {};
+    if (fs.existsSync(CONFIG.CACHE_FILE))
+      cache = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
+    cache[symbol] = { ts: Date.now(), data };
+    fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify(cache, null, 2));
   } catch (e) {
-    console.warn("Cache write failed:", e.message || e);
-  }
-}
-function loadCache() {
-  try {
-    if (!fs.existsSync(CONFIG.CACHE_FILE)) return {};
-    const raw = fs.readFileSync(CONFIG.CACHE_FILE, "utf8");
-    return JSON.parse(raw || "{}");
-  } catch (e) {
-    return {};
+    console.warn("Cache save failed:", e.message);
   }
 }
 
-export function readCache() {
-  const c = loadCache();
-  return c;
-}
-export function writeCache(symbol, klines) {
-  const c = loadCache();
-  c[symbol] = { ts: Date.now(), data: klines };
-  saveCache(c);
+function readCache() {
+  try {
+    if (fs.existsSync(CONFIG.CACHE_FILE))
+      return JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
+  } catch {}
+  return {};
 }
 
 // ===========================
-// utils.js — AI Trader v9.6 Unified Fetch
+// 🌍 Multi-Source Market Data Fetcher
 // ===========================
-
-
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function safeFetch(url, label, transform) {
@@ -57,7 +54,7 @@ async function safeFetch(url, label, transform) {
       timeout: 8000,
       headers: {
         "User-Agent": "Mozilla/5.0 (AI-TraderBot-v9.6)",
-        "Accept": "application/json,text/plain,*/*"
+        Accept: "application/json,text/plain,*/*"
       }
     });
     if (res.status === 200) {
@@ -74,9 +71,9 @@ async function safeFetch(url, label, transform) {
   }
 }
 
-// --------------
-// 🟢 Crypto fetcher (Binance + alt + fallback)
-// --------------
+// ===========================
+// 🟢 Crypto (Binance + alt + fallback)
+// ===========================
 async function fetchCrypto(symbol, interval = "15m", limit = 500) {
   for (const base of CONFIG.BINANCE_SOURCES) {
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
@@ -95,37 +92,43 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
   }
 
   // CoinGecko fallback
-  const cg = await safeFetch(`${CONFIG.FALLBACK_SOURCES.COINGECKO}/coins/bitcoin/market_chart?vs_currency=usd&days=1`, "CoinGecko", (raw) =>
-    raw.prices.map(p => ({
-      t: p[0],
-      open: p[1],
-      high: p[1],
-      low: p[1],
-      close: p[1],
-      vol: 0
-    }))
+  const cg = await safeFetch(
+    `${CONFIG.FALLBACK_SOURCES.COINGECKO}/coins/bitcoin/market_chart?vs_currency=usd&days=1`,
+    "CoinGecko",
+    (raw) =>
+      raw.prices.map(p => ({
+        t: p[0],
+        open: p[1],
+        high: p[1],
+        low: p[1],
+        close: p[1],
+        vol: 0
+      }))
   );
   if (cg.ok) return cg;
 
   // KuCoin fallback
-  const ku = await safeFetch(`${CONFIG.FALLBACK_SOURCES.KUCOIN}/api/v1/market/candles?symbol=${symbol}&type=15min`, "KuCoin", (raw) =>
-    raw.data.map(k => ({
-      t: +k[0] * 1000,
-      open: +k[1],
-      high: +k[2],
-      low: +k[3],
-      close: +k[4],
-      vol: +k[5],
-    }))
+  const ku = await safeFetch(
+    `${CONFIG.FALLBACK_SOURCES.KUCOIN}/api/v1/market/candles?symbol=${symbol}&type=15min`,
+    "KuCoin",
+    (raw) =>
+      raw.data.map(k => ({
+        t: +k[0] * 1000,
+        open: +k[1],
+        high: +k[2],
+        low: +k[3],
+        close: +k[4],
+        vol: +k[5],
+      }))
   );
   if (ku.ok) return ku;
 
   return { ok: false };
 }
 
-// --------------
-// 🇮🇳 Indian Market (NSE + Yahoo + backup)
-// --------------
+// ===========================
+// 🇮🇳 Indian Market (NSE + Yahoo)
+// ===========================
 async function fetchIndian(symbol) {
   const nseUrl = `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`;
   const yahooUrl = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
@@ -154,9 +157,9 @@ async function fetchIndian(symbol) {
   return { ok: false };
 }
 
-// --------------
-// 🟡 Metals (Gold, Silver) via Yahoo / backup
-// --------------
+// ===========================
+// 🟡 Metals (Gold, Silver)
+// ===========================
 async function fetchMetals(symbol) {
   const tick = symbol === "GOLD" ? "GC=F" : "SI=F";
   const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${tick}?interval=15m&range=1d`;
@@ -177,9 +180,9 @@ async function fetchMetals(symbol) {
   return { ok: false };
 }
 
-// --------------
-// 🌍 Unified Fetch Entry
-// --------------
+// ===========================
+// 🌍 Unified Market Fetch Entry
+// ===========================
 export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
   let result = { ok: false };
   console.log(`\n⏳ Fetching data for ${symbol}...`);
@@ -205,27 +208,4 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
 
   console.error("🚫 No market data available for", symbol);
   return { data: [], source: "none" };
-}
-
-// --------------
-// 💾 Cache System (1-day retention)
-// --------------
-function saveCache(symbol, data) {
-  try {
-    let cache = {};
-    if (fs.existsSync(CONFIG.CACHE_FILE))
-      cache = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
-    cache[symbol] = { ts: Date.now(), data };
-    fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify(cache, null, 2));
-  } catch (e) {
-    console.warn("Cache save failed:", e.message);
-  }
-}
-
-function readCache() {
-  try {
-    if (fs.existsSync(CONFIG.CACHE_FILE))
-      return JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
-  } catch {}
-  return {};
 }
