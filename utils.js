@@ -47,9 +47,7 @@ export function writeCache(symbol, klines) {
 // ===========================
 // utils.js — AI Trader v9.6 Unified Fetch
 // ===========================
-import axios from "axios";
-import fs from "fs";
-import CONFIG from "./config.js";
+
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
