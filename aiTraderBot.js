@@ -6,7 +6,7 @@ import { mergeSignals } from "./merge_signals.js";
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
-import { keepAlive, nowLocal, fetchMarketData } from "./utils.js";
+import { nowLocal, fetchMarketData } from "./utils.js";
 
 // ====== KeepAlive / Express Server (v9.5 style) ======
 import express from "express";
