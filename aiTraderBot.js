@@ -649,18 +649,19 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 
-// ========== AUTO PING / KEEP ALIVE ==========
-const KEEPALIVE_URL = process.env.RENDER_EXTERNAL_URL || "https://aitraderbot.onrender.com";
-const KEEPALIVE_INTERVAL = 1000 * 60 * 5; // ping every 5 minutes
+// ========== FIXED AUTO PING / KEEP ALIVE (Render Safe) ==========
+import https from "https";
+
+const KEEPALIVE_INTERVAL = 1000 * 60 * 5; // every 5 mins
+const KEEPALIVE_URL = "https://aitraderbot.onrender.com"; // 👈 apna Render URL (check spelling)
 
 async function keepAlive() {
   try {
-    const res = await axios.get(KEEPALIVE_URL);
-    console.log(`🟢 Keep-alive ping success (${res.status}) at ${new Date().toLocaleTimeString()}`);
-    // Optional: Telegram message once every few hours
-    // await sendTelegram(`✅ Bot active — keep-alive ping OK (${new Date().toLocaleTimeString()})`);
+    const agent = new https.Agent({ rejectUnauthorized: false }); // avoid SSL verify fail
+    const res = await axios.get(KEEPALIVE_URL, { httpsAgent: agent, timeout: 8000 });
+    console.log(`🟢 Keep-alive OK (${res.status}) — ${new Date().toLocaleTimeString()}`);
   } catch (err) {
-    console.log(`🔴 Keep-alive ping failed: ${err.message}`);
+    console.warn(`🔴 Keep-alive failed (${err.response?.status || err.code}): ${err.message}`);
   }
 }
 
