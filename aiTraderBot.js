@@ -1,31 +1,19 @@
-/**
- * main_control.js (v9.5)
- * Central orchestrator — integrates:
- *  - Multi-source market data (crypto + Indian stocks)
- *  - ML prediction module
- *  - Elliott Wave / Fibonacci analysis
- *  - Telegram bot with auto reports
- *  - Reversal watcher + keep-alive for Render
- *
- * ⚙️ Dependencies:
- *   npm install axios express dotenv
- */
-
+// ===== aiTraderBot.js =====
+// ✅ Core Dependencies
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
-
-import CONFIG from './config.js';
-import { calculateRSI, calculateMACD } from './core_indicators.js';
-import { analyzeElliott } from './elliott_module.js';
-import { mergeSignals } from './merge_signals.js';
-import { runMLPrediction } from './ml_module_v8_6.js';
-import { fetchNews } from './news_social.js';
-import { setupTelegramBot } from './tg_commands.js';
-import { keepAlive, fetchMarketData } from './utils.js';
-
+// ===== Internal Modules (Exact Repo Names) =====
+import CONFIG from "./config.js";
+import { calculateRSI, calculateMACD } from "./core_indicators.js";
+import { analyzeElliott } from "./elliott_module.js";
+import { mergeSignals } from "./merge_signals.js";
+import { runMLPrediction } from "./ml_module_v8_6.js";
+import { fetchNews } from "./news_social.js";
+import { setupTelegramBot } from "./tg_commands.js";
+import { keepAlive, fetchMarketData, nowLocal } from "./utils.js";
 
 // ====== ENV + CONFIG ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -39,126 +27,67 @@ if (!BOT_TOKEN || !CHAT_ID) {
   console.warn("⚠️ BOT_TOKEN or CHAT_ID missing in .env!");
 }
 
-// ====== Telegram Helper ======
-async function sendTelegramMessage(text, parse_mode = "HTML") {
+// ===== Telegram Helper =====
+async function sendTelegramMessage(text) {
   try {
     await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       chat_id: CHAT_ID,
       text,
-      parse_mode,
+      parse_mode: "HTML",
       disable_web_page_preview: true,
     });
   } catch (err) {
-    console.warn("Telegram send failed:", err.message);
+    console.warn("❌ Telegram send failed:", err.message);
   }
 }
 
-
-
-// ====== Core Analysis ======
+// ===== Core Analysis =====
 async function generateReport() {
-  console.log("📊 Generating report...");
+  console.log(`📊 Generating report for ${SYMBOL} (${INTERVAL}) at ${nowLocal()}`);
 
   try {
-    // ---- Fetch Market Data ----
+    // Fetch Market Data
     const { data: klines, source } = await fetchMarketData(SYMBOL, INTERVAL);
-    if (!klines || !klines.length) {
-      await sendTelegramMessage(`❌ No market data for ${SYMBOL}`);
-      return;
-    }
 
-    const last = klines.at(-1);
-    const lastPrice = last.close;
+    // Run Technical + ML + News Analysis
+    const rsi = calculateRSI(klines);
+    const macd = calculateMACD(klines);
+    const elliott = analyzeElliott(klines);
+    const mlSignal = await runMLPrediction(klines);
+    const news = await fetchNews(SYMBOL);
 
-    // ---- Elliott Wave & Fib ----
-    let ellReport = { structure: "unknown", wave: "-", confidence: 0 };
-    try {
-      ellReport = analyzeElliottWave(klines);
-    } catch {
-      console.log("Elliott module unavailable, skipping...");
-    }
+    // Merge All Signals
+    const merged = mergeSignals({ rsi, macd, elliott, mlSignal, news });
 
-    // ---- ML Features ----
-    mlInit(8); // ensure model ready
-    const features = [
-      last.close,
-      last.volume,
-      last.high - last.low,
-      Math.random(),
-      Math.random(),
-      Math.random(),
-      1,
-      0.5,
-    ];
-    const mlProb = mlPredict(features);
-
-    // ---- News Sentiment ----
-    const news = await fetchNewsHeadlines();
-    const sentimentCount = news.filter((n) =>
-      /(rise|bull|gain|soar|rally|support|positive)/i.test(n.title)
-    ).length;
-    const sentimentScore = sentimentCount - (news.length - sentimentCount);
-
-    // ---- Bias Decision ----
-    const bias =
-      mlProb > 0.6
-        ? "Bullish"
-        : mlProb < 0.4
-        ? "Bearish"
-        : sentimentScore > 0
-        ? "Bullish"
-        : "Neutral";
-
-    // ---- Compose Message ----
+    // Final Message
     const msg = `
-📊 <b>AI Trader Report v9.5</b>
-🕒 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
-💱 Symbol: <b>${SYMBOL}</b> (${source})
-💰 Last Price: <b>${lastPrice.toFixed(2)}</b>
-
-📈 <b>Bias:</b> ${bias}
-🤖 ML Confidence: ${(mlProb * 100).toFixed(1)}%
-🌊 Elliott Wave: ${ellReport.structure} (Wave ${ellReport.wave}, ${(
-      ellReport.confidence * 100
-    ).toFixed(0)}%)
-
-📰 News Impact: ${sentimentScore > 0 ? "Positive" : sentimentScore < 0 ? "Negative" : "Neutral"}
-
+<b>🧠 AI Trader Report</b> (${nowLocal()})
+<b>Symbol:</b> ${SYMBOL}
+<b>Interval:</b> ${INTERVAL}
+<b>RSI:</b> ${rsi.status} (${rsi.value})
+<b>MACD:</b> ${macd.trend}
+<b>Elliott:</b> ${elliott.structure}
+<b>ML Prediction:</b> ${mlSignal.trend} (${(mlSignal.confidence * 100).toFixed(1)}%)
+<b>News:</b> ${news.sentiment}
+<b>📊 Final Bias:</b> ${merged.label} (${(merged.strength * 100).toFixed(1)}%)
+Source: ${source}
 `;
 
     await sendTelegramMessage(msg);
-  } catch (e) {
-    console.error("generateReport error:", e.message);
-  }
-}
-
-// ====== Reversal Watcher (every 1 min) ======
-async function reversalWatcher() {
-  try {
-    const { data } = await fetchMarketData(SYMBOL, "1m");
-    if (!data || data.length < 3) return;
-
-    const last = data.at(-1);
-    const prev = data.at(-2);
-    const change = ((last.close - prev.close) / prev.close) * 100;
-
-    if (Math.abs(change) > 0.5) {
-      const dir = change > 0 ? "Bullish" : "Bearish";
-      await sendTelegramMessage(`🚨 <b>${dir} Reversal Alert</b>\nPrice: ${last.close}`);
-    }
+    console.log("✅ Report sent successfully!");
   } catch (err) {
-    console.warn("reversalWatcher failed:", err.message);
+    console.error("❌ Report generation failed:", err.message);
   }
 }
-setInterval(reversalWatcher, 60 * 1000);
 
-// ====== Scheduler ======
-setInterval(generateReport, 15 * 60 * 1000); // every 15 min
+// ===== Auto Ping (Render keep-alive) =====
+if (SELF_PING_URL) keepAlive(SELF_PING_URL);
 
-// ====== Express Keep-Alive Server ======
+// ===== Express Server =====
 const app = express();
-app.get("/", (req, res) => res.send("AI Trader v9.5 running ✅"));
-app.listen(SERVER_PORT, () => console.log(`🚀 Server up on port ${SERVER_PORT}`));
+app.get("/", (req, res) => res.send("🤖 AI Trader Bot is live and healthy!"));
+app.listen(SERVER_PORT, () => console.log(`🚀 Server running on port ${SERVER_PORT}`));
 
-// ====== Startup Trigger ======
+// ===== Auto Report Interval =====
+setInterval(generateReport, 15 * 60 * 1000); // every 15 mins
 generateReport();
