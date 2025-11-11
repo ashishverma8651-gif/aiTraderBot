@@ -572,33 +572,69 @@ function fibExtensions(baseStart, baseEnd) {
   };
 }
 
-(function computeHybridTP_SL() {
+// ===== Hybrid / Elliott TP-SL (15m-based, fixed) =====
+let tp1, tp2, tp3, sl, HH, LL, ell_info;
+
+(function computeHybridTP_SL(){
   try {
     const k15local = kl15 || (kmap && kmap["15m"] && kmap["15m"].data) || [];
-    const HH = k15local.length ? Math.max(...k15local.map(k => k.high)) : lastPrice;
-    const LL = k15local.length ? Math.min(...k15local.map(k => k.low)) : lastPrice;
+    HH = k15local.length ? Math.max(...k15local.map(k => k.high)) : lastPrice;
+    LL = k15local.length ? Math.min(...k15local.map(k => k.low)) : lastPrice;
     const range = Math.max(1, HH - LL);
-    
+
+    // run elliott detection
     const ell = elliottAnalyze15m(k15local);
     let baseStart = LL, baseEnd = HH;
+
     if (ell.lastLow && ell.lastHigh) {
       if (ell.lastLow.i < ell.lastHigh.i) {
-        baseStart = ell.lastLow.price; baseEnd = ell.lastHigh.price;
+        baseStart = ell.lastLow.price;
+        baseEnd = ell.lastHigh.price;
       } else {
-        baseStart = ell.lastHigh.price; baseEnd = ell.lastLow.price;
+        baseStart = ell.lastHigh.price;
+        baseEnd = ell.lastLow.price;
       }
+    } else {
+      const lastSlice = k15local.slice(-10);
+      baseStart = lastSlice.length ? Math.min(...lastSlice.map(k => k.low)) : lastPrice;
+      baseEnd = lastSlice.length ? Math.max(...lastSlice.map(k => k.high)) : lastPrice;
     }
 
     const exts = fibExtensions(baseStart, baseEnd);
-    tp1 = +exts.ext100.toFixed(2);
-    tp2 = +exts.ext127.toFixed(2);
-    tp3 = +exts.ext161.toFixed(2);
-    sl = ell.structure.includes("up")
-      ? +(Math.min(ell.lastLow?.price || LL, LL - range * 0.05)).toFixed(2)
-      : +(Math.max(ell.lastHigh?.price || HH, HH + range * 0.05)).toFixed(2);
-    ell_info = { structure: ell.structure, wave: ell.wave, confidence: ell.confidence };
+
+    const rawTp1 = exts.ext100;
+    const rawTp2 = exts.ext127;
+    const rawTp3 = exts.ext161;
+
+    // SL logic
+    let rawSl = lastPrice - range * 0.5;
+    if (ell.lastLow && ell.lastHigh) {
+      if (ell.lastLow.i < ell.lastHigh.i) {
+        rawSl = Math.min(ell.lastLow.price, LL - Math.max(10, range * 0.05));
+      } else {
+        rawSl = Math.max(ell.lastHigh.price, HH + Math.max(10, range * 0.05));
+      }
+    }
+
+    const round2 = v => Math.round(v * 100) / 100;
+    tp1 = round2(rawTp1);
+    tp2 = round2(rawTp2);
+    tp3 = round2(rawTp3);
+    sl  = round2(rawSl);
+    HH  = round2(HH);
+    LL  = round2(LL);
+    ell_info = { structure: ell.structure, wave: ell.wave, confidence: Math.round(ell.confidence * 100) };
+
   } catch (e) {
     console.warn("Hybrid TP/SL compute err", e.message);
+    const rangeFb = Math.max(1, (lastPrice * 0.01));
+    tp1 = Math.round((lastPrice + rangeFb * 0.236) * 100) / 100;
+    tp2 = Math.round((lastPrice + rangeFb * 0.382) * 100) / 100;
+    tp3 = Math.round((lastPrice + rangeFb * 0.618) * 100) / 100;
+    sl  = Math.round((lastPrice - rangeFb * 0.5) * 100) / 100;
+    HH  = Math.round((lastPrice + rangeFb) * 100) / 100;
+    LL  = Math.round((lastPrice - rangeFb) * 100) / 100;
+    ell_info = { structure: "fallback", wave: "unknown", confidence: 20 };
   }
 })();
 
