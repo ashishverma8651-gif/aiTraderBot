@@ -1,6 +1,6 @@
 // elliott_module.js — v9.7 Elliott + ML Hybrid
 import { runMLPrediction } from "./ml_module_v8_6.js";  // ML integration
-import { calcRSI, calcMACD } from "./core_indicators.js";
+import { calculateRSI, calculateMACD } from "./core_indicators.js";
 import CONFIG from "./config.js";
 
 
