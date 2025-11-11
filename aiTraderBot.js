@@ -29,6 +29,7 @@ const fs = require("fs");
 const axios = require("axios");
 const express = require("express");
 require("dotenv").config();
+const https = require("https");
 
 // ---------- CONFIG ----------
 const BOT_TOKEN = process.env.BOT_TOKEN || ""; // telegram bot token (botxxxx:YYYY)
@@ -650,7 +651,6 @@ process.on("SIGINT", () => {
 });
 
 // ========== FIXED AUTO PING / KEEP ALIVE (Render Safe) ==========
-import https from "https";
 
 const KEEPALIVE_INTERVAL = 1000 * 60 * 5; // every 5 mins
 const KEEPALIVE_URL = "https://aitraderbot.onrender.com"; // 👈 apna Render URL (check spelling)
