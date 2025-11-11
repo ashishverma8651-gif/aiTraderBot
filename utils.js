@@ -9,3 +9,5 @@ export function keepAlive(url) {
 export function nowLocal() {
   return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 }
+
+export { fetchMarketData } from './ml_module_v8_6.js';
