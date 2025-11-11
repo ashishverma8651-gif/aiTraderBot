@@ -532,15 +532,97 @@ async function doAnalysisAndSend() {
     const techBuyPct = 50; // placeholder (could compute tech buy vs sell from indicators)
     const merged = mergeSignals(techBuyPct, newsEval.label);
 
-    // TP/SL via hybrid ATR+Fibonacci (simple)
-    const highs = kl15.map(k=>k.high); const lows = kl15.map(k=>k.low);
-    const HH = highs.length ? Math.max(...highs) : lastPrice;
-    const LL = lows.length ? Math.min(...lows) : lastPrice;
+    // ---------- Elliott + Fibonacci + Hybrid TP/SL + Bias + ML Placeholder ----------
+function findSwingPoints(kl, lookback=80) {
+  const highs = [], lows = [];
+  if (!kl || kl.length < 5) return {highs, lows};
+  const n = Math.min(kl.length, lookback);
+  for (let i = kl.length - n; i < kl.length - 2; i++) {
+    const cur = kl[i];
+    const left = kl[i - 2] || cur, right = kl[i + 2] || cur;
+    if (cur.high >= left.high && cur.high >= right.high) highs.push({i, price: cur.high});
+    if (cur.low <= left.low && cur.low <= right.low) lows.push({i, price: cur.low});
+  }
+  return {highs, lows};
+}
+
+function elliottAnalyze15m(kl15) {
+  if (!kl15 || kl15.length < 12) return {structure:"unknown", wave:"-", confidence:0.2};
+  const {highs, lows} = findSwingPoints(kl15, 80);
+  const swings = highs.concat(lows).sort((a,b)=>a.i-b.i).slice(-8);
+  if (swings.length < 4) return {structure:"flat", wave:"-", confidence:0.3};
+  const diffs = [];
+  for (let i=1;i<swings.length;i++) diffs.push(swings[i].price - swings[i-1].price);
+  const ups = diffs.filter(d=>d>0).length;
+  const downs = diffs.filter(d=>d<0).length;
+  const trendUp = ups > downs;
+  const structure = trendUp ? "impulse-up" : "impulse-down";
+  const wave = swings.length >= 5 ? "Wave 4-5 forming" : "Wave 3 developing";
+  const confidence = Math.min(0.95, 0.4 + Math.abs(ups-downs)/swings.length);
+  const lastLow = swings.slice().reverse().find(s=>kl15[s.i]?.low === s.price);
+  const lastHigh = swings.slice().reverse().find(s=>kl15[s.i]?.high === s.price);
+  return {structure, wave, lastLow, lastHigh, confidence:Math.round(confidence*100)};
+}
+
+function fibExtensions(baseStart, baseEnd) {
+  const move = baseEnd - baseStart;
+  return {
+    ext100: baseEnd + move * 1.0,
+    ext127: baseEnd + move * 1.272,
+    ext161: baseEnd + move * 1.618
+  };
+}
+
+(function computeHybridTP_SL(){
+  try {
+    const kl15local = kl15 || (kmap && kmap["15m"]?.data) || [];
+    const HH = kl15local.length ? Math.max(...kl15local.map(k=>k.high)) : lastPrice;
+    const LL = kl15local.length ? Math.min(...kl15local.map(k=>k.low)) : lastPrice;
     const range = Math.max(1, HH - LL);
-    const tp1 = (lastPrice + range*0.236).toFixed(2);
-    const tp2 = (lastPrice + range*0.382).toFixed(2);
-    const tp3 = (lastPrice + range*0.618).toFixed(2);
-    const sl = (lastPrice - range*0.5).toFixed(2);
+
+    const ell = elliottAnalyze15m(kl15local);
+    let baseStart = LL, baseEnd = HH;
+    if (ell.lastLow && ell.lastHigh) {
+      if (ell.lastLow.i < ell.lastHigh.i) {
+        baseStart = ell.lastLow.price; baseEnd = ell.lastHigh.price;
+      } else {
+        baseStart = ell.lastHigh.price; baseEnd = ell.lastLow.price;
+      }
+    }
+
+    const exts = fibExtensions(baseStart, baseEnd);
+    const bullTP1 = exts.ext100.toFixed(2);
+    const bullTP2 = exts.ext127.toFixed(2);
+    const bullTP3 = exts.ext161.toFixed(2);
+    const bearTP1 = (lastPrice - range * 0.236).toFixed(2);
+    const bearTP2 = (lastPrice - range * 0.382).toFixed(2);
+    const bearTP3 = (lastPrice - range * 0.618).toFixed(2);
+
+    const bullSL = (baseStart - range * 0.2).toFixed(2);
+    const bearSL = (baseEnd + range * 0.2).toFixed(2);
+
+    // ML placeholder
+    const mlSuggestion =
+      mlProb > 0.55
+        ? `🤖 ML favors <b>Bullish</b> trend (confidence ${(mlProb*100).toFixed(1)}%)`
+        : mlProb < 0.45
+        ? `🤖 ML favors <b>Bearish</b> trend (confidence ${(mlProb*100).toFixed(1)}%)`
+        : `🤖 ML indicates <b>Neutral</b> zone (confidence ${(mlProb*100).toFixed(1)}%)`;
+
+    // Append section to msg
+    msg += `\n📊 <b>Elliott Wave:</b> ${ell.structure} | ${ell.wave} | Confidence: ${ell.confidence}%\n`;
+    msg += `High: ${HH.toFixed(2)} | Low: ${LL.toFixed(2)}\n\n`;
+
+    msg += `📈 <b>Bullish Setup:</b>\nTP1: ${bullTP1} | TP2: ${bullTP2} | TP3: ${bullTP3} | SL: ${bullSL}\n`;
+    msg += `📉 <b>Bearish Setup:</b>\nTP1: ${bearTP1} | TP2: ${bearTP2} | TP3: ${bearTP3} | SL: ${bearSL}\n`;
+    msg += `\n${mlSuggestion}\n`;
+
+    msg += `🧩 <b>Strategy:</b> Fibonacci + Elliott + ATR Confirmation (15m base)\n`;
+  } catch (err) {
+    console.warn("Hybrid TP/SL compute err:", err.message);
+  }
+})();
+
 
     // Build message (text-only)
     let msg = `\uD83D\uDE80 <b>${SYMBOL} \u2014 AI Trader v9.5</b>\n${nowLocal()}\nSource: ${mainSource}\nPrice: ${lastPrice}\n\n`;
