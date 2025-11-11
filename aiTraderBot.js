@@ -15,7 +15,8 @@ import { mergeSignals } from "./merge_signals.js";
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { fetchNews } from "./news_social.js";
 import { setupTelegramBot } from "./tg_commands.js";
-import { keepAlive, fetchMarketData, nowLocal } from "./utils.js";
+import { keepAlive, nowLocal } from './utils.js';
+import { fetchMarketData } from './ml_module_v8_6.js';
 
 // ====== ENV + CONFIG ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
