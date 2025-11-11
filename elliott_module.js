@@ -3,6 +3,15 @@ import { runMLPrediction } from "./ml_module_v9.js";  // ML integration
 import { calcRSI, calcMACD } from "./core_indicators.js";
 import CONFIG from "./config.js";
 
+
+// Example: after fetching 1-day data
+await trainModelFromData(dayCandles);
+
+// Example: predict from 15m window
+const ml = runMLPrediction(lastCandles);
+console.log("🤖 ML says:", ml.label, "Confidence:", ml.prob + "%");
+
+
 // ---------- Utility: find swing highs & lows ----------
 function findSwingPoints(kl, lookback = 50) {
   const highs = [], lows = [];
