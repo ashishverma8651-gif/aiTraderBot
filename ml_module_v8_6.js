@@ -1,165 +1,170 @@
-// ml_module_v9.1.js — Self-Learning Market Prediction Engine
+// ml_module_v8_6.js
+// Machine Learning Engine (v9 logic merged into v8.6)
+// Provides: training, prediction, accuracy tracking & persistence
+// Works directly with Elliott + core_indicators + telegram modules
+
 import fs from "fs";
 import path from "path";
-import * as tf from "@tensorflow/tfjs-node";
-import CONFIG from "./config.js";
 
-const MODEL_PATH = path.resolve("./cache/ml_model.json");
-const METRICS_PATH = path.resolve("./cache/ml_metrics.json");
+const CACHE_DIR = path.resolve("./cache");
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-let model = null;
-let metrics = { total: 0, correct: 0, accuracy: 0 };
+const MODEL_FILE = path.join(CACHE_DIR, "ml_model.json");
+const METRICS_FILE = path.join(CACHE_DIR, "ml_metrics.json");
 
-// ===========================
-// 🔧 Load or Init Model + Metrics
-// ===========================
-export async function initMLModel(inputSize = 5) {
-  try {
-    if (fs.existsSync(METRICS_PATH)) {
-      metrics = JSON.parse(fs.readFileSync(METRICS_PATH, "utf8"));
-    }
+// ---------------- Utils ----------------
+const sigmoid = x => 1 / (1 + Math.exp(-x));
+const nowISO = () => new Date().toISOString();
 
-    if (fs.existsSync(MODEL_PATH)) {
-      model = await tf.loadLayersModel(`file://${MODEL_PATH}`);
-      console.log("✅ Loaded trained ML model");
-      return model;
-    }
-  } catch (e) {
-    console.warn("⚠️ Model/metrics load failed:", e.message);
+function saveJSON(file, obj) {
+  try { fs.writeFileSync(file, JSON.stringify(obj, null, 2)); }
+  catch (e) { console.warn("ML save error", e.message); }
+}
+function loadJSON(file, def = null) {
+  try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch { /* ignore */ }
+  return def;
+}
+
+// ---------------- Feature Extraction ----------------
+// candles = array of {t, open, high, low, close, vol}
+// window → recent N candles for features
+function extractFeatures(window) {
+  const n = window.length;
+  if (n < 2) return null;
+
+  const closes = window.map(c => Number(c.close));
+  const vols = window.map(c => Number(c.vol) || 0);
+
+  const rets = [];
+  for (let i = 1; i < n; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
+
+  const avgRet = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const sma = closes.reduce((a, b) => a + b, 0) / n;
+  const smaDiff = (closes[n - 1] - sma) / sma;
+  const volAvg = vols.slice(0, -1).reduce((a, b) => a + b, 0) / (n - 1);
+  const volChange = volAvg ? (vols[n - 1] - volAvg) / volAvg : 0;
+  const lastRet = rets[rets.length - 1];
+  const sumRet = rets.reduce((a, b) => a + b, 0);
+
+  return [avgRet, lastRet, sumRet, smaDiff, volChange];
+}
+
+// ---------------- Model Core ----------------
+function initModel(dim = 5) {
+  const w = new Array(dim).fill(0).map(() => (Math.random() - 0.5) * 0.1);
+  return { w, b: 0, dim, trainedAt: nowISO() };
+}
+
+function predictRaw(model, x) {
+  let s = model.b;
+  for (let i = 0; i < model.dim; i++) s += (model.w[i] || 0) * (x[i] || 0);
+  return sigmoid(s);
+}
+
+function updateSGD(model, x, y, lr = 0.01) {
+  const p = predictRaw(model, x);
+  const e = p - y;
+  for (let i = 0; i < model.dim; i++) model.w[i] -= lr * e * (x[i] || 0);
+  model.b -= lr * e;
+}
+
+// ---------------- Training Data Prep ----------------
+function buildSamples(candles, windowSize = 8) {
+  const samples = [];
+  for (let i = 0; i + windowSize < candles.length; i++) {
+    const win = candles.slice(i, i + windowSize);
+    const next = candles[i + windowSize];
+    const feat = extractFeatures(win);
+    if (!feat) continue;
+    const label = Number(next.close) > Number(win[win.length - 1].close) ? 1 : 0;
+    samples.push({ x: feat, y: label });
+  }
+  return samples;
+}
+
+// ---------------- Main Training ----------------
+export async function trainModelFromData(candles, opts = {}) {
+  const cfg = { windowSize: 8, epochs: 25, lr: 0.02, testSplit: 0.2, ...opts };
+  if (!Array.isArray(candles) || candles.length < cfg.windowSize + 2)
+    throw new Error("Not enough candles for ML training");
+
+  const samples = buildSamples(candles, cfg.windowSize);
+  if (!samples.length) throw new Error("No valid samples built");
+
+  // Shuffle
+  for (let i = samples.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [samples[i], samples[j]] = [samples[j], samples[i]];
   }
 
-  model = tf.sequential({
-    layers: [
-      tf.layers.dense({ units: 8, activation: "relu", inputShape: [inputSize] }),
-      tf.layers.dense({ units: 4, activation: "relu" }),
-      tf.layers.dense({ units: 1, activation: "sigmoid" })
-    ]
-  });
+  const split = Math.floor(samples.length * (1 - cfg.testSplit));
+  const train = samples.slice(0, split);
+  const test = samples.slice(split);
 
-  model.compile({
-    optimizer: tf.train.adam(0.001),
-    loss: "binaryCrossentropy",
-    metrics: ["accuracy"]
-  });
+  let model = loadJSON(MODEL_FILE, null);
+  if (!model || model.dim !== train[0].x.length) model = initModel(train[0].x.length);
 
-  console.log("🆕 New ML model created");
-  return model;
-}
-
-// ===========================
-// 📊 Train on Cached Market Data (1-day)
-// ===========================
-export async function trainModelFromData(marketData) {
-  if (!marketData || marketData.length < 50) return;
-  if (!model) await initMLModel();
-
-  const features = [];
-  const labels = [];
-
-  for (let i = 20; i < marketData.length - 1; i++) {
-    const prev = marketData.slice(i - 20, i);
-    const next = marketData[i + 1];
-    const closeChange = (next.close - marketData[i].close) / marketData[i].close;
-
-    const feat = extractFeatures(prev);
-    features.push(feat);
-    labels.push(closeChange > 0 ? 1 : 0);
+  for (let e = 0; e < cfg.epochs; e++) {
+    for (const s of train) updateSGD(model, s.x, s.y, cfg.lr);
   }
 
-  const xs = tf.tensor2d(features);
-  const ys = tf.tensor2d(labels, [labels.length, 1]);
-
-  console.log(`📈 Training model on ${features.length} samples...`);
-  await model.fit(xs, ys, { epochs: 10, batchSize: 32, verbose: 0 });
-  await model.save(`file://${MODEL_PATH}`);
-
-  console.log("💾 Model retrained & saved");
-}
-
-// ===========================
-// 🤖 Predict + Learn from Outcome
-// ===========================
-export async function runMLPrediction(featureArray, actualChange = null) {
-  if (!model) await initMLModel(featureArray.length);
-
-  const input = tf.tensor2d([featureArray]);
-  const output = model.predict(input);
-  const prob = (await output.data())[0];
-  tf.dispose([input, output]);
-
-  let label = "Neutral";
-  if (prob > 0.55) label = "Bullish";
-  else if (prob < 0.45) label = "Bearish";
-
-  // ✅ Learn from actual result if provided
-  if (actualChange !== null) updateAccuracy(prob, actualChange);
-
-  return { prob, label, accuracy: metrics.accuracy };
-}
-
-// ===========================
-// 🧠 Feature Extractor (RSI + MACD + Volume Trend + Random Regularizer)
-// ===========================
-function extractFeatures(data) {
-  const closeChange = (data[data.length - 1].close - data[0].close) / data[0].close;
-  const volChange = (data[data.length - 1].vol - data[0].vol) / (data[0].vol || 1);
-  const rsi = calcRSI(data, 14);
-  const macd = calcMACD(data, 12, 26, 9);
-
-  return [
-    closeChange * 10,
-    (rsi - 50) / 50,
-    macd.hist / (data[data.length - 1].close || 1),
-    volChange,
-    Math.random() * 0.2
-  ];
-}
-
-// ===========================
-// 📊 Accuracy Tracker + Save Metrics
-// ===========================
-function updateAccuracy(prob, actualChange) {
-  const predictedUp = prob > 0.5;
-  const actualUp = actualChange > 0;
-
-  metrics.total++;
-  if (predictedUp === actualUp) metrics.correct++;
-
-  metrics.accuracy = ((metrics.correct / metrics.total) * 100).toFixed(2);
-
-  fs.writeFileSync(METRICS_PATH, JSON.stringify(metrics, null, 2));
-  console.log(`🎯 ML Accuracy: ${metrics.accuracy}% (${metrics.correct}/${metrics.total})`);
-}
-
-// ===========================
-// 🔢 RSI + MACD mini functions
-// ===========================
-function calcRSI(data, period = 14) {
-  if (data.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  for (let i = data.length - period; i < data.length; i++) {
-    const diff = data[i].close - data[i - 1].close;
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
+  // Evaluate
+  let correct = 0, total = test.length, avgProb = 0;
+  for (const s of test) {
+    const p = predictRaw(model, s.x);
+    const pred = p >= 0.5 ? 1 : 0;
+    if (pred === s.y) correct++;
+    avgProb += p;
   }
-  const rs = gains / (losses || 1);
-  return 100 - (100 / (1 + rs));
-}
-
-function calcMACD(data, shortP = 12, longP = 26, signalP = 9) {
-  if (data.length < longP + signalP) return { hist: 0 };
-  const ema = (arr, p) => {
-    const k = 2 / (p + 1);
-    return arr.reduce((acc, v, i) => {
-      if (i === 0) return [v.close];
-      acc.push(v.close * k + acc[i - 1] * (1 - k));
-      return acc;
-    }, []);
+  const acc = total ? (correct / total) * 100 : 0;
+  const metrics = {
+    samples: samples.length,
+    train: train.length,
+    test: test.length,
+    accuracy: Math.round(acc * 100) / 100,
+    avgProb: Math.round((avgProb / (total || 1)) * 10000) / 10000,
+    trainedAt: nowISO()
   };
-  const emaShort = ema(data, shortP);
-  const emaLong = ema(data, longP);
-  const macdLine = emaShort.slice(-signalP).map((v, i) => v - emaLong[i]);
-  const signal = ema(macdLine.map(v => ({ close: v })), signalP).pop();
-  const hist = macdLine.pop() - signal;
-  return { hist };
+
+  saveJSON(MODEL_FILE, model);
+  const hist = loadJSON(METRICS_FILE, { trains: [] });
+  hist.trains.push(metrics);
+  saveJSON(METRICS_FILE, hist);
+
+  return { ok: true, model, metrics };
 }
+
+// ---------------- Prediction ----------------
+export function runMLPrediction(window) {
+  const model = loadJSON(MODEL_FILE, null);
+  if (!model) return { error: "model_not_found" };
+  const feat = extractFeatures(window);
+  if (!feat || feat.length !== model.dim) return { error: "invalid_features" };
+
+  const p = predictRaw(model, feat);
+  const label = p >= 0.5 ? "Bullish" : "Bearish";
+  return { prob: Math.round(p * 10000) / 100, label, features: feat };
+}
+
+// ---------------- Metrics + Feedback ----------------
+export function getModelInfo() {
+  const model = loadJSON(MODEL_FILE, null);
+  const metrics = loadJSON(METRICS_FILE, { trains: [] });
+  return { model, metrics };
+}
+
+export function reportPredictionOutcome(correct) {
+  const file = loadJSON(METRICS_FILE, { trains: [], feedback: [] });
+  file.feedback.push({ time: nowISO(), correct });
+  saveJSON(METRICS_FILE, file);
+  return { ok: true };
+}
+
+// ---------------- Default Export ----------------
+export default {
+  trainModelFromData,
+  runMLPrediction,
+  getModelInfo,
+  reportPredictionOutcome
+};
