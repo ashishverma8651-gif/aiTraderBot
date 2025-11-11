@@ -1,4 +1,4 @@
-// utils.js — AI Trader v9.6 (Stable)
+// utils.js — AI Trader v9.6 (Final Stable)
 import axios from "axios";
 import fs from "fs";
 import CONFIG from "./config.js";
@@ -21,7 +21,7 @@ export async function keepAlive(selfPingUrl = CONFIG.SELF_PING_URL) {
 }
 
 // ===========================
-// 💾 Cache System (1-day retention)
+// 💾 Cache System
 // ===========================
 function saveCache(symbol, data) {
   try {
@@ -44,7 +44,7 @@ function readCache() {
 }
 
 // ===========================
-// 🌍 Multi-Source Market Data Fetcher
+// 🌍 Safe Fetch Utility
 // ===========================
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -57,6 +57,7 @@ async function safeFetch(url, label, transform) {
         Accept: "application/json,text/plain,*/*"
       }
     });
+
     if (res.status === 200) {
       const data = transform(res.data);
       if (Array.isArray(data) && data.length > 0) {
@@ -72,23 +73,26 @@ async function safeFetch(url, label, transform) {
 }
 
 // ===========================
-// 🟢 Crypto (Binance + alt + fallback)
+// 🟢 Crypto (Binance + Vision + Fallbacks)
 // ===========================
 async function fetchCrypto(symbol, interval = "15m", limit = 500) {
+  // Try all Binance sources
   for (const base of CONFIG.BINANCE_SOURCES) {
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const res = await safeFetch(url, `Binance(${base.split("/")[2]})`, (raw) =>
-      raw.map(k => ({
-        t: k[0],
-        open: +k[1],
-        high: +k[2],
-        low: +k[3],
-        close: +k[4],
-        vol: +k[5],
-      }))
+      Array.isArray(raw)
+        ? raw.map(k => ({
+            t: k[0],
+            open: +k[1],
+            high: +k[2],
+            low: +k[3],
+            close: +k[4],
+            vol: +k[5],
+          }))
+        : []
     );
     if (res.ok) return res;
-    await delay(1500);
+    await delay(1200);
   }
 
   // CoinGecko fallback
@@ -96,14 +100,16 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
     `${CONFIG.FALLBACK_SOURCES.COINGECKO}/coins/bitcoin/market_chart?vs_currency=usd&days=1`,
     "CoinGecko",
     (raw) =>
-      raw.prices.map(p => ({
-        t: p[0],
-        open: p[1],
-        high: p[1],
-        low: p[1],
-        close: p[1],
-        vol: 0
-      }))
+      Array.isArray(raw?.prices)
+        ? raw.prices.map(p => ({
+            t: p[0],
+            open: p[1],
+            high: p[1],
+            low: p[1],
+            close: p[1],
+            vol: 0
+          }))
+        : []
   );
   if (cg.ok) return cg;
 
@@ -112,36 +118,39 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
     `${CONFIG.FALLBACK_SOURCES.KUCOIN}/api/v1/market/candles?symbol=${symbol}&type=15min`,
     "KuCoin",
     (raw) =>
-      raw.data.map(k => ({
-        t: +k[0] * 1000,
-        open: +k[1],
-        high: +k[2],
-        low: +k[3],
-        close: +k[4],
-        vol: +k[5],
-      }))
+      Array.isArray(raw?.data)
+        ? raw.data.map(k => ({
+            t: +k[0] * 1000,
+            open: +k[1],
+            high: +k[2],
+            low: +k[3],
+            close: +k[4],
+            vol: +k[5],
+          }))
+        : []
   );
   if (ku.ok) return ku;
 
+  console.warn("⚠️ All crypto sources failed, switching to cache...");
   return { ok: false };
 }
 
 // ===========================
-// 🇮🇳 Indian Market (NSE + Yahoo)
+// 🇮🇳 Indian Market
 // ===========================
 async function fetchIndian(symbol) {
   const nseUrl = `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`;
   const yahooUrl = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
 
   const nse = await safeFetch(nseUrl, "NSE India", (raw) => {
-    const price = raw.priceInfo?.lastPrice;
+    const price = raw?.priceInfo?.lastPrice;
     if (!price) return [];
     return [{ t: Date.now(), open: price, high: price, low: price, close: price, vol: 0 }];
   });
   if (nse.ok) return nse;
 
   const yahoo = await safeFetch(yahooUrl, "Yahoo Finance (IN)", (raw) => {
-    const res = raw.chart?.result?.[0];
+    const res = raw?.chart?.result?.[0];
     if (!res) return [];
     return res.timestamp.map((t, i) => ({
       t: t * 1000,
@@ -164,7 +173,7 @@ async function fetchMetals(symbol) {
   const tick = symbol === "GOLD" ? "GC=F" : "SI=F";
   const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${tick}?interval=15m&range=1d`;
   const yahoo = await safeFetch(url, `Yahoo ${symbol}`, (raw) => {
-    const res = raw.chart?.result?.[0];
+    const res = raw?.chart?.result?.[0];
     if (!res) return [];
     return res.timestamp.map((t, i) => ({
       t: t * 1000,
@@ -181,7 +190,7 @@ async function fetchMetals(symbol) {
 }
 
 // ===========================
-// 🌍 Unified Market Fetch Entry
+// 🌍 Unified Fetch Entry
 // ===========================
 export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
   let result = { ok: false };
