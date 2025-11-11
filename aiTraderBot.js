@@ -8,7 +8,8 @@ dotenv.config();
 // ===== Internal Modules (Exact Repo Names) =====
 import CONFIG from "./config.js";
 import { calculateRSI, calculateMACD } from "./core_indicators.js";
-import { analyzeElliott } from "./elliott_module.js";
+import elliott from './elliott_module.js';
+const { analyzeElliott } = elliott;
 import { mergeSignals } from "./merge_signals.js";
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { fetchNews } from "./news_social.js";
