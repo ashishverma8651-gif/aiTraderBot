@@ -107,7 +107,14 @@ export const CONFIG = {
     (parseInt(process.env.REPORT_INTERVAL_MIN || "15") || 15) * 60 * 1000,
   CACHE_RETENTION_MS: 24 * 60 * 60 * 1000, // 1 day
 
-  
+  // =========================
+// 📡 Telegram Bot
+// =========================
+TELEGRAM: {
+  BOT_TOKEN: process.env.BOT_TOKEN || null,
+  CHAT_ID: process.env.CHAT_ID || null,
+},
+
 };
 
 export default CONFIG;
