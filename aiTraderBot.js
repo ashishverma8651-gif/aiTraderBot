@@ -173,3 +173,5 @@ async function autoUpdateLoop() {
     console.error("Init err:", e.message);
   }
 })();
+
+export { buildReport };
