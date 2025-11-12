@@ -111,8 +111,9 @@ export const CONFIG = {
   // 📡 Telegram Bot
   // =========================
   TELEGRAM: {
-    BOT_TOKEN: process.env.BOT_TOKEN || "",
-    CHAT_ID: process.env.CHAT_ID || ""
+    BOT_TOKEN: process.env.BOT_TOKEN ||
+ "8531819191:AAGPF0fM8qjrQhtylbzTrfhWATAOTEWD_Pk",
+    CHAT_ID: process.env.CHAT_ID || "1371160692"
   }
 };
 
