@@ -1,6 +1,6 @@
 // aiTraderBot.js — FINAL STABLE VERSION
 import CONFIG from "./config.js";
-import { fetchMarketData, calculateIndicators } from "./core_indicator.js";
+import { fetchMarketData, calculateIndicators } from "./core_indicators.js";
 import { generateMergedSignal } from "./merge_signals.js";
 import { analyzeWithElliott } from "./elliott_module.js";
 import { analyzeWithML, getMLConfidence } from "./ml_model.js";
