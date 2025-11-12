@@ -397,6 +397,41 @@ async function generateReportLoop() {
   setInterval(generateReportLoop, CONFIG.REPORT_INTERVAL_MS || ((parseInt(process.env.REPORT_INTERVAL_MIN||"15")||15) * 60 * 1000));
 })();
 
+
+// ===============================
+// ⏱️ Auto 15-Minute Market Updates
+// ===============================
+async function autoUpdateLoop() {
+  try {
+    const symbol = CONFIG.SYMBOL || "BTCUSDT";
+    const signal = await generateMergedSignal(symbol, "15m");
+
+    const msg = `
+📊 <b>${symbol}</b> — 15m Auto Update
+━━━━━━━━━━━━━━━
+📈 <b>Signal:</b> ${signal.summary}
+💹 <b>ML Confidence:</b> ${(signal.ml_confidence * 100).toFixed(1)}%
+📊 <b>RSI:</b> ${signal.indicators?.RSI || "N/A"}
+📉 <b>MACD:</b> ${signal.indicators?.MACD || "N/A"}
+💰 <b>Volume:</b> ${signal.indicators?.VOLUME || "N/A"}
+🕒 <b>Next Update:</b> 15m later
+━━━━━━━━━━━━━━━
+`;
+
+    await sendTelegramMessage(msg);
+    console.log("✅ Auto 15m update sent to Telegram");
+  } catch (err) {
+    console.error("⚠️ Auto update error:", err.message);
+  }
+}
+
+// Run immediately on start
+autoUpdateLoop();
+
+// Schedule every 15 minutes
+setInterval(autoUpdateLoop, 15 * 60 * 1000);
+
+
 // ---------------------------
 // Exports (optional)
 export { computeHybridTargets, buildReport, reversalWatcher };
