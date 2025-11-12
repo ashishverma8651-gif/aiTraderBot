@@ -56,18 +56,36 @@ async function buildMultiTimeframeIndicators(symbol) {
       }
 
       const price = valid.at(-1)?.close ?? 0;
-      const rsi = calculateRSI(valid, 14);
-      const macd = calculateMACD(valid, 12, 26, 9);
-      const atr =
-        valid.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
-        Math.max(1, valid.slice(-14).length - 1);
 
-      result[tf] = {
-        price: price.toFixed(2),
-        rsi: rsi ? +rsi.toFixed(2) : "N/A",
-        macd: macd?.macd ? +macd.macd.toFixed(2) : "N/A",
-        atr: atr ? +atr.toFixed(2) : "N/A",
-      };
+// --- Normalize RSI safely ---
+let rsiRaw = calculateRSI(valid, 14);
+if (Array.isArray(rsiRaw)) rsiRaw = rsiRaw.at(-1);
+if (typeof rsiRaw === "object" && rsiRaw !== null)
+  rsiRaw = rsiRaw.value ?? Object.values(rsiRaw).at(-1);
+const rsi = typeof rsiRaw === "number" && !isNaN(rsiRaw) ? rsiRaw : NaN;
+
+// --- Normalize MACD safely ---
+let macdRaw = calculateMACD(valid, 12, 26, 9);
+let macdVal =
+  typeof macdRaw === "number"
+    ? macdRaw
+    : macdRaw?.macd ??
+      (Array.isArray(macdRaw) ? macdRaw.at(-1) : NaN) ??
+      (Array.isArray(macdRaw?.macd) ? macdRaw.macd.at(-1) : NaN);
+
+// --- Compute ATR ---
+const atr =
+  valid.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
+  Math.max(1, valid.slice(-14).length - 1);
+
+// --- Save results safely ---
+result[tf] = {
+  price: price.toFixed(2),
+  rsi: !isNaN(rsi) ? rsi.toFixed(2) : "N/A",
+  macd: !isNaN(macdVal) ? macdVal.toFixed(2) : "N/A",
+  atr: !isNaN(atr) ? atr.toFixed(2) : "N/A",
+};
+
     } catch (err) {
       console.warn(`❌ ${tf} failed:`, err.message);
       result[tf] = { rsi: "N/A", macd: "N/A", atr: "N/A", price: "N/A" };
