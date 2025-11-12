@@ -64,14 +64,23 @@ if (typeof rsiRaw === "object" && rsiRaw !== null)
   rsiRaw = rsiRaw.value ?? Object.values(rsiRaw).at(-1);
 const rsi = typeof rsiRaw === "number" && !isNaN(rsiRaw) ? rsiRaw : NaN;
 
+
 // --- Normalize MACD safely ---
 let macdRaw = calculateMACD(valid, 12, 26, 9);
-let macdVal =
-  typeof macdRaw === "number"
-    ? macdRaw
-    : macdRaw?.macd ??
-      (Array.isArray(macdRaw) ? macdRaw.at(-1) : NaN) ??
-      (Array.isArray(macdRaw?.macd) ? macdRaw.macd.at(-1) : NaN);
+let macdVal = NaN;
+
+if (macdRaw) {
+  if (typeof macdRaw === "number") {
+    macdVal = macdRaw;
+  } else if (Array.isArray(macdRaw)) {
+    const last = macdRaw.at(-1);
+    macdVal = typeof last === "object" ? last.macd ?? NaN : last ?? NaN;
+  } else if (typeof macdRaw === "object") {
+    if (Array.isArray(macdRaw.macd)) macdVal = macdRaw.macd.at(-1) ?? NaN;
+    else if (typeof macdRaw.macd === "number") macdVal = macdRaw.macd;
+  }
+}
+
 
 // --- Compute ATR ---
 const atr =
