@@ -199,23 +199,54 @@ async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
   const TP1 = Math.round(last.close + biasSign * atr * 4);
   const TP2 = Math.round(last.close + biasSign * atr * 6);
 
-  let text = `🚀 <b>${symbol} — AI Trader</b>\n${nowLocal()}\nSource: ${resp.source || "multi-source"}\nPrice: ${last.close}\n\n`;
-  text += `📊 <b>Elliott Wave (${interval})</b>\n${ell?.summary ?? ell.structure ?? "N/A"} | Wave: ${ell?.wave ?? "N/A"} | Confidence: ${ell?.confidence ?? 0}%\n\n`;
-  text += `⚠️ <b>Possible Wave 5 Reversal</b> — watch for breakout confirmation.\n\n`;
 
-  for (let tf of Object.keys(multiTF)) {
-    const tfData = multiTF[tf];
-    text += `📈 ${tf} | Price: ${tfData.price} | RSI: ${tfData.rsi} | MACD: ${tfData.macd} | ATR: ${tfData.atr} | ML: ${ml?.prob ?? 0}%\n`;
-  }
+  // 🧠 Build Telegram Report (Professional Dashboard Style)
+let text = `━━━━━━━━━━━━━━━━━━━
+🚀 <b>${symbol}</b> — <b>AI Trader Report</b>
+🕒 ${nowLocal()}
+📡 Source: ${resp.source || "multi-source"}
+💰 <b>Price:</b> ${last.close.toFixed(2)}
+━━━━━━━━━━━━━━━━━━━\n`;
 
-  text += `\nBias: ${merged.bias} | Strength: ${merged.strength}% | ML Prob: ${merged.mlProb}%\n\n`;
-  text += `TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}\nBreakout zone (est): ${Math.round(last.close - atr * 3)} - ${Math.round(last.close + atr * 3)}\n\n`;
+for (const tf of Object.keys(multiTF)) {
+  const r = multiTF[tf];
+  const rsi = r.rsi ?? "N/A";
+  const macd = r.macd ?? "N/A";
+  const atr = r.atr ?? "N/A";
 
-  text += `📰 News Impact: ${news.impact ?? "N/A"} (score ${news.score ?? 0})\n`;
-  if (news.headlines && news.headlines.length) {
-    text += "News headlines:\n• " + news.headlines.join("\n• ") + "\n";
-  }
-  text += `\nSources: Binance, CoinGecko, KuCoin\n`;
+  // Dynamic bias estimation
+  let bias = "Sideways";
+  if (Number(rsi) > 60 && Number(macd) > 0) bias = "Bullish";
+  else if (Number(rsi) < 40 && Number(macd) < 0) bias = "Bearish";
+
+  const emoji =
+    bias === "Bullish" ? "🟢" :
+    bias === "Bearish" ? "🔴" :
+    "⚪";
+
+  text += `📈 <b>${tf}</b> | <b>${bias}</b> ${emoji}
+💵 Price: ${r.price} | 📊 Vol: ${r.vol ?? "—"}
+📊 RSI: ${rsi} | MACD: ${macd} | ATR: ${atr} | 🤖 ML: ${ml?.prob ?? 0}%
+━━━━━━━━━━━━━━━━━━━\n`;
+}
+
+text += `🧭 <b>Overall Bias:</b> ${merged.bias}
+💪 Strength: ${merged.strength}% | 🤖 ML Prob: ${merged.mlProb}% | 📈 Accuracy(10): ${ml?.accuracy ?? "N/A"}%
+
+🎯 <b>Targets</b>
+TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}
+💥 Breakout Zone: ${Math.round(last.close - atr * 3)} – ${Math.round(last.close + atr * 3)}
+
+📰 <b>News Impact:</b> ${news.impact ?? "N/A"} (score ${news.score ?? 0})
+`;
+
+if (news.headlines && news.headlines.length) {
+  text += "🗞️ <b>Top Headlines:</b>\n• " + news.headlines.slice(0, 5).join("\n• ") + "\n";
+}
+
+text += `\n📊 <i>Sources:</i> Binance, CoinGecko, KuCoin
+━━━━━━━━━━━━━━━━━━━`;
+
 
   return { text, summary: { rsi, macd, ell, ml, merged, TP1, TP2, SL } };
 }
