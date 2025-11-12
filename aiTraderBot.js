@@ -15,11 +15,12 @@ app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running"));
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🌍 KeepAlive server running on port ${PORT}`);
-  setInterval(() => keepAlive(), 5 * 60 * 1000);
+  setInterval(() => keepAlive(), 10 * 60 * 1000);
 });
 
 console.log("🤖 AI Trader Bot Starting...");
-if (CONFIG.SELF_PING_URL) keepAlive(CONFIG.SELF_PING_URL);
+await keepAlive(CONFIG.SELF_PING_URL);
+setInterval(async () => await keepAlive(CONFIG.SELF_PING_URL), 10 * 60 * 1000);
 await setupTelegramBot();
 
 // ----------------------
