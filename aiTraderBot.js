@@ -3,7 +3,7 @@ import CONFIG from "./config.js";
 import { fetchMarketData, calculateIndicators } from "./core_indicators.js";
 import { generateMergedSignal } from "./merge_signals.js";
 import { analyzeWithElliott } from "./elliott_module.js";
-import { analyzeWithML, getMLConfidence } from "./ml_model.js";
+import MLModule, { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeNewsImpact } from "./background_utils.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
 import { recordFeedback } from "./merge_signals.js";
