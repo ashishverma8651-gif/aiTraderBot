@@ -190,43 +190,108 @@ async function fetchMetals(symbol) {
   return { ok: false };
 }
 
-// ===========================
+// =====================================================
+// 🕯️ Candle Normalizer (handles arrays and objects)
+// =====================================================
+function ensureCandles(raw) {
+  if (!raw) return [];
+
+  const normalizeOne = (k) => {
+    if (!k) return null;
+    if (Array.isArray(k)) {
+      // Binance / generic OHLC array [t, o, h, l, c, v]
+      return {
+        t: Number(k[0]),
+        open: Number(k[1]),
+        high: Number(k[2]),
+        low: Number(k[3]),
+        close: Number(k[4]),
+        vol: Number(k[5] ?? 0),
+      };
+    } else if (typeof k === "object") {
+      // Object format { open, high, low, close, volume, time }
+      return {
+        t: Number(k.t ?? k.time ?? k.timestamp ?? 0),
+        open: Number(k.open ?? k.o ?? 0),
+        high: Number(k.high ?? k.h ?? 0),
+        low: Number(k.low ?? k.l ?? 0),
+        close: Number(k.close ?? k.c ?? 0),
+        vol: Number(k.vol ?? k.v ?? k.volume ?? 0),
+      };
+    }
+    return null;
+  };
+
+  if (Array.isArray(raw)) {
+    return raw
+      .map(normalizeOne)
+      .filter(Boolean)
+      .sort((a, b) => a.t - b.t);
+  }
+
+  if (typeof raw === "object") {
+    const out = {};
+    for (const [tf, arr] of Object.entries(raw)) {
+      if (Array.isArray(arr)) {
+        out[tf] = arr
+          .map(normalizeOne)
+          .filter(Boolean)
+          .sort((a, b) => a.t - b.t);
+      }
+    }
+    return out;
+  }
+
+  return [];
+}
+
+// =====================================================
 // 🌍 Unified Fetch Entry
-// ===========================
+// =====================================================
 export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
   let result = { ok: false };
   console.log(`\n⏳ Fetching data for ${symbol}...`);
 
-  if (CONFIG.MARKETS.CRYPTO.includes(symbol)) {
-    result = await fetchCrypto(symbol);
-  } else if (CONFIG.MARKETS.INDIAN.includes(symbol)) {
-    result = await fetchIndian(symbol);
-  } else if (CONFIG.MARKETS.METALS.includes(symbol)) {
-    result = await fetchMetals(symbol);
-  }
-
-  if (result.ok && result.data) {
-  let normalized;
   try {
-    normalized = ensureCandles(result.data);
-  } catch (e) {
-    console.warn("⚠️ Candle normalization failed:", e.message);
-    normalized = result.data;
-  }
+    // Select market source dynamically
+    if (CONFIG.MARKETS.CRYPTO.includes(symbol)) {
+      result = await fetchCrypto(symbol);
+    } else if (CONFIG.MARKETS.INDIAN.includes(symbol)) {
+      result = await fetchIndian(symbol);
+    } else if (CONFIG.MARKETS.METALS.includes(symbol)) {
+      result = await fetchMetals(symbol);
+    }
 
-  if (Array.isArray(normalized) && normalized.length === 0) {
-    console.warn("⚠️ No valid candle data for", symbol);
-  }
+    // Validate and normalize response
+    if (result.ok && result.data) {
+      let normalized;
+      try {
+        normalized = ensureCandles(result.data);
+      } catch (e) {
+        console.warn("⚠️ Candle normalization failed:", e.message);
+        normalized = result.data;
+      }
 
-  saveCache(symbol, normalized);
-  return { data: normalized, source: result.source };
-}
-  const cache = readCache();
-  if (cache[symbol] && Date.now() - cache[symbol].ts < CONFIG.CACHE_RETENTION_MS) {
-    console.log("♻️ Using cached data for", symbol);
-    return { data: cache[symbol].data, source: "cache" };
-  }
+      if (Array.isArray(normalized) && normalized.length === 0) {
+        console.warn("⚠️ No valid candle data for", symbol);
+      }
 
-  console.error("🚫 No market data available for", symbol);
-  return { data: [], source: "none" };
+      saveCache(symbol, normalized);
+      return { data: normalized, source: result.source };
+    }
+
+    // Try cached data fallback
+    const cache = readCache();
+    if (cache[symbol] && Date.now() - cache[symbol].ts < CONFIG.CACHE_RETENTION_MS) {
+      console.log("♻️ Using cached data for", symbol);
+      return { data: cache[symbol].data, source: "cache" };
+    }
+
+    // If nothing works
+    console.error("⛔ No market data available for", symbol);
+    return { data: [], source: "none" };
+  } catch (err) {
+    console.error("❌ fetchMarketData error:", err.message);
+    return { data: [], source: "error" };
+  }
 }
