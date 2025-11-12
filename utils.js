@@ -10,19 +10,34 @@ import CONFIG from "./config.js";
 export const nowLocal = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
-// ===============================
-// 🌍 KeepAlive (Render prevention)
-// ===============================
+// 🌍 KeepAlive (Render + Fallback system)
 export async function keepAlive(url = CONFIG.SELF_PING_URL) {
-  if (!url) return;
-  try {
-    const res = await fetch(url);
-    if (res.ok) console.log("🌐 KeepAlive OK");
-    else console.warn("⚠️ KeepAlive non-200:", res.status);
-  } catch (e) {
-    console.warn("KeepAlive failed:", e.message);
+  const urls = [
+    url,
+    "https://aitraderbot.onrender.com",
+    "https://web-production-f70a.up.railway.app/ping?url=https://aitraderbot.onrender.com",
+    "https://api.render.com/v1/ping"
+  ];
+
+  for (const u of urls) {
+    if (!u) continue;
+    try {
+      const res = await fetch(u, { method: "GET", timeout: 10000 });
+      if (res.ok) {
+        console.log(`🌍 KeepAlive OK → ${u}`);
+        return true;
+      } else {
+        console.warn(`⚠️ KeepAlive non-200: ${res.status} → ${u}`);
+      }
+    } catch (e) {
+      console.warn(`⛔ KeepAlive failed → ${u}:`, e.message);
+    }
   }
+
+  console.warn("🚨 All KeepAlive URLs failed — instance may sleep!");
+  return false;
 }
+
 
 // ===============================
 // 💾 Cache Handling
