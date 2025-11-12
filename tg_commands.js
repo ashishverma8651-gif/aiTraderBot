@@ -41,13 +41,14 @@ function buildTimeframeMenu(symbol) {
 // 🤖 Command Setup
 // ----------------------
 export async function setupTelegramBot() {
-  if (!CONFIG.TG_TOKEN) {
+  if (!CONFIG.TELEGRAM?.BOT_TOKEN) {
     console.error("❌ No Telegram token found in config.js");
     return;
   }
 
-  bot = new TelegramBot(CONFIG.TG_TOKEN, { polling: true });
+  const bot = new TelegramBot(CONFIG.TELEGRAM.BOT_TOKEN, { polling: true });
   console.log("📱 Telegram Bot connected");
+  
 
   bot.onText(/\/start/, (msg) => {
     bot.sendMessage(
