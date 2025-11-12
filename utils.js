@@ -205,11 +205,22 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
     result = await fetchMetals(symbol);
   }
 
-  if (result.ok && result.data?.length) {
-    saveCache(symbol, result.data);
-    return { data: result.data, source: result.source };
+  if (result.ok && result.data) {
+  let normalized;
+  try {
+    normalized = ensureCandles(result.data);
+  } catch (e) {
+    console.warn("⚠️ Candle normalization failed:", e.message);
+    normalized = result.data;
   }
 
+  if (Array.isArray(normalized) && normalized.length === 0) {
+    console.warn("⚠️ No valid candle data for", symbol);
+  }
+
+  saveCache(symbol, normalized);
+  return { data: normalized, source: result.source };
+}
   const cache = readCache();
   if (cache[symbol] && Date.now() - cache[symbol].ts < CONFIG.CACHE_RETENTION_MS) {
     console.log("♻️ Using cached data for", symbol);
