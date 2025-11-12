@@ -1,4 +1,4 @@
-// aiTraderBot.js — hardened main (paste over your existing file)
+// aiTraderBot.js — hardened + extended main
 import CONFIG from "./config.js";
 import { calculateRSI, calculateMACD } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
@@ -31,6 +31,53 @@ function isValidCandle(c) {
 }
 
 // ----------------------
+// Extended Multi-Timeframe Builder
+// ----------------------
+async function buildMultiTimeframeIndicators(symbol) {
+  const timeframes = CONFIG.INTERVALS || ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
+  const result = {};
+
+  for (const tf of timeframes) {
+    try {
+      const resp = await fetchMarketData(symbol, tf, 200);
+      const candles = Array.isArray(resp.data) ? resp.data : [];
+      const valid = candles
+        .map((c) => ({
+          open: +c.o || +c.open,
+          high: +c.h || +c.high,
+          low: +c.l || +c.low,
+          close: +c.c || +c.close,
+        }))
+        .filter((x) => !isNaN(x.close));
+
+      if (!valid.length) {
+        result[tf] = { rsi: "N/A", macd: "N/A", atr: "N/A", price: "N/A" };
+        continue;
+      }
+
+      const price = valid.at(-1)?.close ?? 0;
+      const rsi = calculateRSI(valid, 14);
+      const macd = calculateMACD(valid, 12, 26, 9);
+      const atr =
+        valid.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
+        Math.max(1, valid.slice(-14).length - 1);
+
+      result[tf] = {
+        price: price.toFixed(2),
+        rsi: rsi ? +rsi.toFixed(2) : "N/A",
+        macd: macd?.macd ? +macd.macd.toFixed(2) : "N/A",
+        atr: atr ? +atr.toFixed(2) : "N/A",
+      };
+    } catch (err) {
+      console.warn(`❌ ${tf} failed:`, err.message);
+      result[tf] = { rsi: "N/A", macd: "N/A", atr: "N/A", price: "N/A" };
+    }
+  }
+
+  return result;
+}
+
+// ----------------------
 // Build report (safe)
 // ----------------------
 async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
@@ -38,7 +85,6 @@ async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
   const resp = await fetchMarketData(symbol, interval, 500);
   const data = Array.isArray(resp.data) ? resp.data : [];
 
-  // Normalize: ensure numeric close/high/low/open/vol
   const valid = data
     .map((c) => {
       if (!c) return null;
@@ -51,7 +97,7 @@ async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
       return { t: Number(c.t ?? c.time ?? Date.now()), open, high, low, close, vol };
     })
     .filter(Boolean)
-    .sort((a,b) => a.t - b.t);
+    .sort((a, b) => a.t - b.t);
 
   if (!valid.length) {
     console.warn("⚠️ No valid candles after normalization for", symbol);
@@ -64,7 +110,7 @@ async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
   // Safe ATR
   let atr = 0;
   for (let i = 1; i < recent.length; i++) {
-    const prev = recent[i-1];
+    const prev = recent[i - 1];
     const k = recent[i];
     atr += Math.max(
       k.high - k.low,
@@ -74,62 +120,69 @@ async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
   }
   atr = atr / Math.max(1, recent.length - 1);
 
-  // indicators - wrap in try/catch so any indicator error doesn't crash the loop
-  let rsi = null, macd = null, ell = { structure: "N/A", wave: "N/A", confidence: 0 }, ml = { prob: 50 }, merged = { bias: "Neutral", strength: 0, mlProb: 50 }, news = { impact: "N/A", score: 0, headlines: [] };
+  // indicators
+  let rsi = null,
+    macd = null,
+    ell = { structure: "N/A", wave: "N/A", confidence: 0 },
+    ml = { prob: 50 },
+    merged = { bias: "Neutral", strength: 0, mlProb: 50 },
+    news = { impact: "N/A", score: 0, headlines: [] };
+
   try {
     rsi = calculateRSI(valid, 14);
   } catch (e) {
-    console.warn("RSI calc failed:", e.message || e);
+    console.warn("RSI calc failed:", e.message);
   }
+
   try {
     macd = calculateMACD(valid, 12, 26, 9);
   } catch (e) {
-    console.warn("MACD calc failed:", e.message || e);
+    console.warn("MACD calc failed:", e.message);
   }
+
   try {
-    ell = await analyzeElliott(valid, { /* pass interval if needed */ });
+    ell = await analyzeElliott(valid);
   } catch (e) {
-    console.warn("Elliott analysis failed:", e.message || e);
+    console.warn("Elliott analysis failed:", e.message);
   }
+
   try {
-    ml = await runMLPrediction(valid) || ml;
+    ml = await runMLPrediction(valid);
   } catch (e) {
-    console.warn("ML prediction failed:", e.message || e);
+    console.warn("ML prediction failed:", e.message);
   }
 
   try {
     merged = mergeSignals({ rsi, macd }, ell, ml);
   } catch (e) {
-    console.warn("mergeSignals error:", e.message || e);
-    merged = { bias: "Neutral", strength: 0, mlProb: ml?.prob || 50 };
+    console.warn("mergeSignals error:", e.message);
   }
 
   try {
     news = await fetchNews(symbol.startsWith("BTC") ? "BTC" : symbol);
   } catch (e) {
-    console.warn("fetchNews failed:", e.message || e);
+    console.warn("fetchNews failed:", e.message);
   }
 
+  const multiTF = await buildMultiTimeframeIndicators(symbol);
+
   // Safe TP/SL
-  const biasSign = merged?.bias === "Buy" ? 1 : (merged?.bias === "Sell" ? -1 : 1);
+  const biasSign = merged?.bias === "Buy" ? 1 : merged?.bias === "Sell" ? -1 : 1;
   const SL = Math.round(last.close - Math.sign(biasSign) * atr * 2);
   const TP1 = Math.round(last.close + biasSign * atr * 4);
   const TP2 = Math.round(last.close + biasSign * atr * 6);
 
-  // Compose telegram message safely (use fallback values)
-  const rsiVal = (rsi && (typeof rsi === "object" ? (rsi.value ?? rsiValue) : rsi)) ?? "N/A";
-  const macdSummary = macd ? (Array.isArray(macd.macd) ? macd.macd[macd.macd.length-1] : macd.macd) : "N/A";
-
-  let text = `🚀 <b>${symbol} — AI Trader</b>\n${nowLocal()}\nSource: ${resp.source || "unknown"}\nPrice: ${last.close}\n\n`;
+  let text = `🚀 <b>${symbol} — AI Trader</b>\n${nowLocal()}\nSource: ${resp.source || "multi-source"}\nPrice: ${last.close}\n\n`;
   text += `📊 <b>Elliott Wave (${interval})</b>\n${ell?.summary ?? ell.structure ?? "N/A"} | Wave: ${ell?.wave ?? "N/A"} | Confidence: ${ell?.confidence ?? 0}%\n\n`;
   text += `⚠️ <b>Possible Wave 5 Reversal</b> — watch for breakout confirmation.\n\n`;
 
-  for (let tf of CONFIG.INTERVALS) {
-    text += `📈 ${tf} | Price: ${last.close} | RSI: ${rsiVal} | MACD: ${typeof macdSummary === "number" ? macdSummary.toFixed(2) : macdSummary} | ATR: ${Math.round(atr)} | ML: ${ml?.prob ?? 0}%\n`;
+  for (let tf of Object.keys(multiTF)) {
+    const tfData = multiTF[tf];
+    text += `📈 ${tf} | Price: ${tfData.price} | RSI: ${tfData.rsi} | MACD: ${tfData.macd} | ATR: ${tfData.atr} | ML: ${ml?.prob ?? 0}%\n`;
   }
 
   text += `\nBias: ${merged.bias} | Strength: ${merged.strength}% | ML Prob: ${merged.mlProb}%\n\n`;
-  text += `TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}\nBreakout zone (est): ${Math.round(last.close - atr*3)} - ${Math.round(last.close + atr*3)}\n\n`;
+  text += `TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}\nBreakout zone (est): ${Math.round(last.close - atr * 3)} - ${Math.round(last.close + atr * 3)}\n\n`;
 
   text += `📰 News Impact: ${news.impact ?? "N/A"} (score ${news.score ?? 0})\n`;
   if (news.headlines && news.headlines.length) {
@@ -147,17 +200,16 @@ async function generateReportLoop() {
   try {
     const out = await buildReport(CONFIG.SYMBOL, "15m");
     if (!out) {
-      console.warn("generateReportLoop: no report produced (no data)");
       await sendTelegramMessage(`⚠️ ${CONFIG.SYMBOL} — No data available at ${nowLocal()}`);
       return;
     }
     await sendTelegramMessage(out.text);
   } catch (e) {
-    console.error("Report error:", e.message || e);
+    console.error("Report error:", e.message);
     try {
-      await sendTelegramMessage(`❌ Error generating report: ${e.message || e}`);
+      await sendTelegramMessage(`❌ Error generating report: ${e.message}`);
     } catch (e2) {
-      console.warn("Failed to send error to Telegram:", e2.message || e2);
+      console.warn("Failed to send error to Telegram:", e2.message);
     }
   }
 }
@@ -165,5 +217,4 @@ async function generateReportLoop() {
 // start
 generateReportLoop();
 setInterval(generateReportLoop, CONFIG.REPORT_INTERVAL_MS);
-
 console.log("Main loop started. Reports every", CONFIG.REPORT_INTERVAL_MS / 60000, "minutes");
