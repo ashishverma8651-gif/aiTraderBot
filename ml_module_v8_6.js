@@ -1,7 +1,6 @@
-// ml_module_v8_6.js
-// Machine Learning Engine (v9 logic merged into v8.6)
+// ml_module_v8_6.js — AI Trader v9.6 Final Stable
+// Machine Learning Engine (Self-Learning Logistic Model)
 // Provides: training, prediction, accuracy tracking & persistence
-// Works directly with Elliott + core_indicators + telegram modules
 
 import fs from "fs";
 import path from "path";
@@ -12,29 +11,29 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 const MODEL_FILE = path.join(CACHE_DIR, "ml_model.json");
 const METRICS_FILE = path.join(CACHE_DIR, "ml_metrics.json");
 
-// ---------------- Utils ----------------
+// ========== Utilities ==========
 const sigmoid = x => 1 / (1 + Math.exp(-x));
 const nowISO = () => new Date().toISOString();
 
 function saveJSON(file, obj) {
   try { fs.writeFileSync(file, JSON.stringify(obj, null, 2)); }
-  catch (e) { console.warn("ML save error", e.message); }
+  catch (e) { console.warn("ML save error:", e.message); }
 }
 function loadJSON(file, def = null) {
-  try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { /* ignore */ }
+  try {
+    if (fs.existsSync(file))
+      return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) { console.warn("ML load error:", e.message); }
   return def;
 }
 
-// ---------------- Feature Extraction ----------------
-// candles = array of {t, open, high, low, close, vol}
-// window → recent N candles for features
+// ========== Feature Extraction ==========
 function extractFeatures(window) {
   const n = window.length;
-  if (n < 2) return null;
+  if (n < 2 || !window.every(c => c && typeof c.close === "number")) return null;
 
-  const closes = window.map(c => Number(c.close));
-  const vols = window.map(c => Number(c.vol) || 0);
+  const closes = window.map(c => +c.close);
+  const vols = window.map(c => +c.vol || 0);
 
   const rets = [];
   for (let i = 1; i < n; i++) rets.push((closes[i] - closes[i - 1]) / closes[i - 1]);
@@ -42,7 +41,7 @@ function extractFeatures(window) {
   const avgRet = rets.reduce((a, b) => a + b, 0) / rets.length;
   const sma = closes.reduce((a, b) => a + b, 0) / n;
   const smaDiff = (closes[n - 1] - sma) / sma;
-  const volAvg = vols.slice(0, -1).reduce((a, b) => a + b, 0) / (n - 1);
+  const volAvg = vols.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(1, n - 1);
   const volChange = volAvg ? (vols[n - 1] - volAvg) / volAvg : 0;
   const lastRet = rets[rets.length - 1];
   const sumRet = rets.reduce((a, b) => a + b, 0);
@@ -50,7 +49,7 @@ function extractFeatures(window) {
   return [avgRet, lastRet, sumRet, smaDiff, volChange];
 }
 
-// ---------------- Model Core ----------------
+// ========== Model Core ==========
 function initModel(dim = 5) {
   const w = new Array(dim).fill(0).map(() => (Math.random() - 0.5) * 0.1);
   return { w, b: 0, dim, trainedAt: nowISO() };
@@ -69,21 +68,28 @@ function updateSGD(model, x, y, lr = 0.01) {
   model.b -= lr * e;
 }
 
-// ---------------- Training Data Prep ----------------
+// ========== Training Sample Builder ==========
 function buildSamples(candles, windowSize = 8) {
   const samples = [];
+  if (!Array.isArray(candles) || candles.length < windowSize + 1) return samples;
+
   for (let i = 0; i + windowSize < candles.length; i++) {
     const win = candles.slice(i, i + windowSize);
     const next = candles[i + windowSize];
+    if (!win.length || !next || next.close == null || win[win.length - 1].close == null)
+      continue;
+
     const feat = extractFeatures(win);
-    if (!feat) continue;
+    if (!feat || feat.some(isNaN)) continue;
+
     const label = Number(next.close) > Number(win[win.length - 1].close) ? 1 : 0;
     samples.push({ x: feat, y: label });
   }
+
   return samples;
 }
 
-// ---------------- Main Training ----------------
+// ========== Training ==========
 export async function trainModelFromData(candles, opts = {}) {
   const cfg = { windowSize: 8, epochs: 25, lr: 0.02, testSplit: 0.2, ...opts };
   if (!Array.isArray(candles) || candles.length < cfg.windowSize + 2)
@@ -103,20 +109,20 @@ export async function trainModelFromData(candles, opts = {}) {
   const test = samples.slice(split);
 
   let model = loadJSON(MODEL_FILE, null);
-  if (!model || model.dim !== train[0].x.length) model = initModel(train[0].x.length);
+  if (!model || model.dim !== train[0].x.length)
+    model = initModel(train[0].x.length);
 
-  for (let e = 0; e < cfg.epochs; e++) {
+  for (let e = 0; e < cfg.epochs; e++)
     for (const s of train) updateSGD(model, s.x, s.y, cfg.lr);
-  }
 
   // Evaluate
   let correct = 0, total = test.length, avgProb = 0;
   for (const s of test) {
     const p = predictRaw(model, s.x);
-    const pred = p >= 0.5 ? 1 : 0;
-    if (pred === s.y) correct++;
+    if ((p >= 0.5 ? 1 : 0) === s.y) correct++;
     avgProb += p;
   }
+
   const acc = total ? (correct / total) * 100 : 0;
   const metrics = {
     samples: samples.length,
@@ -135,10 +141,11 @@ export async function trainModelFromData(candles, opts = {}) {
   return { ok: true, model, metrics };
 }
 
-// ---------------- Prediction ----------------
+// ========== Prediction ==========
 export function runMLPrediction(window) {
   const model = loadJSON(MODEL_FILE, null);
   if (!model) return { error: "model_not_found" };
+
   const feat = extractFeatures(window);
   if (!feat || feat.length !== model.dim) return { error: "invalid_features" };
 
@@ -147,7 +154,7 @@ export function runMLPrediction(window) {
   return { prob: Math.round(p * 10000) / 100, label, features: feat };
 }
 
-// ---------------- Metrics + Feedback ----------------
+// ========== Metrics & Feedback ==========
 export function getModelInfo() {
   const model = loadJSON(MODEL_FILE, null);
   const metrics = loadJSON(METRICS_FILE, { trains: [] });
@@ -161,7 +168,7 @@ export function reportPredictionOutcome(correct) {
   return { ok: true };
 }
 
-// ---------------- Default Export ----------------
+// ========== Default Export ==========
 export default {
   trainModelFromData,
   runMLPrediction,
