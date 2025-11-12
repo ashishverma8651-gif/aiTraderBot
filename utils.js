@@ -1,232 +1,219 @@
-// utils.js — robust fetch + normalizer (drop-in)
+// ===============================
+// ⚙️ utils.js — AI Trader v10.0
+// Unified Multi-Market Data Fetcher + Cache + KeepAlive
+// ===============================
+
 import axios from "axios";
 import fs from "fs";
-import path from "path";
 import CONFIG from "./config.js";
-
-const CACHE_DIR = path.resolve("./cache");
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 export const nowLocal = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
+// ===============================
+// 🌍 KeepAlive (Render prevention)
+// ===============================
 export async function keepAlive(url = CONFIG.SELF_PING_URL) {
   if (!url) return;
   try {
-    // use fetch if available; axios otherwise
-    const res = await fetch ? await fetch(url) : await axios.get(url);
-    const ok = res?.ok ?? (res?.status === 200);
-    if (ok) console.log("🌐 KeepAlive OK");
-    else console.warn("⚠️ KeepAlive non-200:", res?.status);
+    const res = await fetch(url);
+    if (res.ok) console.log("🌐 KeepAlive OK");
+    else console.warn("⚠️ KeepAlive non-200:", res.status);
   } catch (e) {
-    console.warn("KeepAlive failed:", e?.message || e);
+    console.warn("KeepAlive failed:", e.message);
   }
 }
 
-/* ---------------- Cache ---------------- */
-export function saveCache(symbol, data) {
+// ===============================
+// 💾 Cache Handling
+// ===============================
+function saveCache(symbol, data) {
   try {
     let cache = {};
-    if (fs.existsSync(CONFIG.CACHE_FILE)) {
-      const txt = fs.readFileSync(CONFIG.CACHE_FILE, "utf8");
-      cache = txt ? JSON.parse(txt) : {};
-    }
+    if (fs.existsSync(CONFIG.CACHE_FILE))
+      cache = JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
     cache[symbol] = { ts: Date.now(), data };
     fs.writeFileSync(CONFIG.CACHE_FILE, JSON.stringify(cache, null, 2));
   } catch (e) {
-    console.warn("Cache save failed:", e?.message || e);
+    console.warn("Cache save failed:", e.message);
   }
 }
-export function readCache() {
+
+function readCache() {
   try {
-    if (fs.existsSync(CONFIG.CACHE_FILE)) {
-      const txt = fs.readFileSync(CONFIG.CACHE_FILE, "utf8");
-      return txt ? JSON.parse(txt) : {};
-    }
+    if (fs.existsSync(CONFIG.CACHE_FILE))
+      return JSON.parse(fs.readFileSync(CONFIG.CACHE_FILE, "utf8"));
   } catch {}
   return {};
 }
 
-/* ---------------- safeFetch ---------------- */
+// ===============================
+// 🔄 Generic Fetch Wrapper
+// ===============================
 async function safeFetch(url, label, transform) {
   try {
-    const res = await axios.get(url, {
-      timeout: 9000,
-      headers: {
-        "User-Agent": "AI-TraderBot/1.0 (+https://example)",
-        Accept: "application/json, text/plain, */*"
-      }
-    });
-    if (res.status !== 200) throw new Error("HTTP " + res.status);
-    const out = transform(res.data);
-    if (Array.isArray(out) && out.length > 0) {
-      console.log(`✅ ${label} OK (${out.length} candles)`);
-      return { ok: true, data: out, source: label };
-    }
-    // if transform returned an object map (multi-tf), accept if any array present
-    if (out && typeof out === "object") {
-      const any = Object.values(out).some(v => Array.isArray(v) && v.length > 0);
-      if (any) {
-        console.log(`✅ ${label} OK (multi)`);
-        return { ok: true, data: out, source: label };
-      }
-    }
-    throw new Error("No usable data");
+    const res = await axios.get(url, { timeout: 8000 });
+    if (res.status !== 200) throw new Error(res.status);
+    const data = transform(res.data);
+    if (Array.isArray(data) && data.length > 0)
+      return { ok: true, data, source: label };
+    throw new Error("No valid data");
   } catch (e) {
-    console.warn(`❌ ${label} failed: ${e?.message || e}`);
+    console.warn(`❌ ${label} failed:`, e.message);
     return { ok: false };
   }
 }
 
-/* ---------------- Crypto (Binance + mirrors) ---------------- */
+// ===============================
+// 💱 Market Data Fetchers
+// ===============================
+
+// ---- Crypto ----
 async function fetchCrypto(symbol, interval = "15m", limit = 500) {
-  for (const base of CONFIG.BINANCE_SOURCES) {
+  for (const base of CONFIG.CRYPTO_SOURCES.PRIMARY) {
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    const res = await safeFetch(url, `Binance(${new URL(base).hostname})`, raw =>
+    const out = await safeFetch(url, `Binance(${base})`, (raw) =>
       Array.isArray(raw)
-        ? raw.map(k => ({
-            t: Number(k?.[0] ?? 0),
-            open: Number(k?.[1] ?? 0),
-            high: Number(k?.[2] ?? 0),
-            low: Number(k?.[3] ?? 0),
-            close: Number(k?.[4] ?? 0),
-            vol: Number(k?.[5] ?? 0),
+        ? raw.map((k) => ({
+            t: +k[0],
+            open: +k[1],
+            high: +k[2],
+            low: +k[3],
+            close: +k[4],
+            vol: +k[5],
           }))
         : []
     );
-    if (res.ok) return res;
-    await new Promise(r => setTimeout(r, 900));
+    if (out.ok) return out;
   }
 
-  // fallback minimal: coinGecko or KuCoin not implemented here (already in your config)
+  // fallback
+  for (const [label, url] of Object.entries(CONFIG.CRYPTO_SOURCES.FALLBACKS)) {
+    console.log(`🔁 Trying fallback: ${label}`);
+    const fb = await safeFetch(url, label, () => []);
+    if (fb.ok) return fb;
+  }
   return { ok: false };
 }
 
-/* ---------------- Indian (Yahoo) ---------------- */
+// ---- Indian ----
 async function fetchIndian(symbol) {
-  const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
-  return safeFetch(url, "Yahoo.IN", raw => {
-    const r = raw?.chart?.result?.[0];
-    if (!r) return [];
-    return (r.timestamp || []).map((t, i) => {
-      const q = r.indicators?.quote?.[0];
-      return {
-        t: Number(t) * 1000,
-        open: Number(q?.open?.[i] ?? 0),
-        high: Number(q?.high?.[i] ?? 0),
-        low: Number(q?.low?.[i] ?? 0),
-        close: Number(q?.close?.[i] ?? 0),
-        vol: Number(q?.volume?.[i] ?? 0),
-      };
+  for (const base of CONFIG.INDIAN_SOURCES.PRIMARY) {
+    const url = `${base}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
+    const out = await safeFetch(url, `Indian(${base})`, (raw) => {
+      const r = raw?.chart?.result?.[0];
+      if (!r) return [];
+      return r.timestamp.map((t, i) => ({
+        t: t * 1000,
+        open: +r.indicators.quote[0].open[i],
+        high: +r.indicators.quote[0].high[i],
+        low: +r.indicators.quote[0].low[i],
+        close: +r.indicators.quote[0].close[i],
+        vol: +r.indicators.quote[0].volume[i],
+      }));
     });
-  });
+    if (out.ok) return out;
+  }
+
+  // fallback
+  for (const [label, url] of Object.entries(CONFIG.INDIAN_SOURCES.FALLBACKS)) {
+    console.log(`🔁 Trying fallback: ${label}`);
+    const fb = await safeFetch(url, label, () => []);
+    if (fb.ok) return fb;
+  }
+  return { ok: false };
 }
 
-/* ---------------- Metals (Yahoo) ---------------- */
+// ---- Metals ----
 async function fetchMetals(symbol) {
   const tick = symbol === "GOLD" ? "GC=F" : "SI=F";
-  const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${tick}?interval=15m&range=1d`;
-  return safeFetch(url, `Yahoo.${symbol}`, raw => {
-    const r = raw?.chart?.result?.[0];
-    if (!r) return [];
-    return (r.timestamp || []).map((t, i) => {
-      const q = r.indicators?.quote?.[0];
-      return {
-        t: Number(t) * 1000,
-        open: Number(q?.open?.[i] ?? 0),
-        high: Number(q?.high?.[i] ?? 0),
-        low: Number(q?.low?.[i] ?? 0),
-        close: Number(q?.close?.[i] ?? 0),
-        vol: Number(q?.volume?.[i] ?? 0),
-      };
+  for (const base of CONFIG.METAL_SOURCES.PRIMARY) {
+    const url = `${base}/v8/finance/chart/${tick}?interval=15m&range=1d`;
+    const out = await safeFetch(url, `Metal(${base})`, (raw) => {
+      const r = raw?.chart?.result?.[0];
+      if (!r) return [];
+      return r.timestamp.map((t, i) => ({
+        t: t * 1000,
+        open: +r.indicators.quote[0].open[i],
+        high: +r.indicators.quote[0].high[i],
+        low: +r.indicators.quote[0].low[i],
+        close: +r.indicators.quote[0].close[i],
+        vol: +r.indicators.quote[0].volume[i],
+      }));
     });
-  });
+    if (out.ok) return out;
+  }
+
+  // fallback
+  for (const [label, url] of Object.entries(CONFIG.METAL_SOURCES.FALLBACKS)) {
+    console.log(`🔁 Trying fallback: ${label}`);
+    const fb = await safeFetch(url, label, () => []);
+    if (fb.ok) return fb;
+  }
+  return { ok: false };
 }
 
-/* ---------------- Normalizer: ensures close exists + adds 'volume' key for older code ---------------- */
+// ===============================
+// 🧮 Normalization Helper
+// ===============================
 function ensureCandles(raw) {
   if (!raw) return [];
-
-  const normOne = (k) => {
+  const norm = (k) => {
     if (!k) return null;
-    if (Array.isArray(k)) {
+    if (Array.isArray(k))
       return {
-        t: Number(k[0] ?? 0),
-        open: Number(k[1] ?? 0),
-        high: Number(k[2] ?? 0),
-        low: Number(k[3] ?? 0),
-        close: Number(k[4] ?? 0),
-        vol: Number(k[5] ?? 0),
-        volume: Number(k[5] ?? 0),
+        t: +k[0],
+        open: +k[1] || 0,
+        high: +k[2] || 0,
+        low: +k[3] || 0,
+        close: +k[4] || 0,
+        vol: +k[5] || 0,
       };
-    }
-    if (typeof k === "object") {
-      const t = Number(k.t ?? k.time ?? k.timestamp ?? 0);
-      const close = Number(k.close ?? k.c ?? k.last ?? 0);
-      const vol = Number(k.vol ?? k.v ?? k.volume ?? 0);
+    if (typeof k === "object")
       return {
-        t,
-        open: Number(k.open ?? k.o ?? 0),
-        high: Number(k.high ?? k.h ?? 0),
-        low: Number(k.low ?? k.l ?? 0),
-        close,
-        vol,
-        volume: vol,
+        t: +(k.t ?? k.time ?? 0),
+        open: +k.open || +k.o || 0,
+        high: +k.high || +k.h || 0,
+        low: +k.low || +k.l || 0,
+        close: +k.close || +k.c || 0,
+        vol: +k.vol || +k.v || 0,
       };
-    }
     return null;
   };
-
-  // if raw is object with timeframes -> flatten to array (keep timestamps)
   const arr = Array.isArray(raw) ? raw : Object.values(raw).flat();
-
-  const cleaned = arr
-    .map(normOne)
-    .filter(x => x && Number.isFinite(x.close))
-    .sort((a,b) => a.t - b.t);
-
-  return cleaned;
+  return arr.map(norm).filter((x) => x && !isNaN(x.close));
 }
 
-/* ---------------- Unified Fetch Entry ---------------- */
-export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", limit = 500) {
-  console.log(`\n⏳ Fetching data for ${symbol} (${interval})...`);
+// ===============================
+// 🧠 Unified Market Data Fetcher
+// ===============================
+export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m") {
+  console.log(`⏳ Fetching data for ${symbol} (${interval})...`);
+  let res = { ok: false };
+
   try {
-    let res = { ok: false };
+    if (CONFIG.MARKETS.CRYPTO.includes(symbol)) res = await fetchCrypto(symbol, interval);
+    else if (CONFIG.MARKETS.INDIAN.includes(symbol)) res = await fetchIndian(symbol);
+    else if (CONFIG.MARKETS.METALS.includes(symbol)) res = await fetchMetals(symbol);
 
-    if (CONFIG.MARKETS.CRYPTO.includes(symbol)) {
-      res = await fetchCrypto(symbol, interval, limit);
-    } else if (CONFIG.MARKETS.INDIAN.includes(symbol)) {
-      res = await fetchIndian(symbol);
-    } else if (CONFIG.MARKETS.METALS.includes(symbol)) {
-      res = await fetchMetals(symbol);
-    } else {
-      console.warn("Unknown market for symbol:", symbol);
+    if (res.ok && res.data?.length) {
+      const clean = ensureCandles(res.data);
+      if (clean.length === 0) throw new Error("No valid candles");
+      saveCache(symbol, clean);
+      console.log(`✅ Market data fetched from ${res.source} (${clean.length} candles)`);
+      return { data: clean, source: res.source };
     }
 
-    // If we have response data, normalize and validate
-    if (res.ok && res.data) {
-      const cleaned = ensureCandles(res.data);
-      if (!cleaned || cleaned.length === 0) {
-        console.warn("⚠️ Candle normalization returned 0 candles");
-      } else {
-        saveCache(symbol, cleaned);
-        return { data: cleaned, source: res.source || "remote" };
-      }
-    }
-
-    // try cache fallback
+    // fallback to cache
     const cache = readCache();
-    if (cache[symbol] && Array.isArray(cache[symbol].data) && cache[symbol].data.length) {
-      const age = Date.now() - (cache[symbol].ts || 0);
-      console.log("♻️ Using cached data for", symbol, "age_ms:", age);
+    if (cache[symbol]) {
+      console.log(`♻️ Using cached data for ${symbol}`);
       return { data: cache[symbol].data, source: "cache" };
     }
 
-    console.error("⛔ No market data available for", symbol);
-    return { data: [], source: "none" };
+    throw new Error("No valid data available");
   } catch (e) {
-    console.error("❌ fetchMarketData error:", e?.message || e);
+    console.error("❌ fetchMarketData error:", e.message);
     return { data: [], source: "error" };
   }
 }
