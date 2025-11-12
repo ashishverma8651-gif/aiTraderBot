@@ -108,13 +108,12 @@ export const CONFIG = {
   CACHE_RETENTION_MS: 24 * 60 * 60 * 1000, // 1 day
 
   // =========================
-  // 📡 Telegram Bot
-  // =========================
-  TELEGRAM: {
-  BOT_TOKEN: process.env.BOT_TOKEN,
-  CHAT_ID: process.env.CHAT_ID
-
-  }
+// 📡 Telegram Bot
+// =========================
+TELEGRAM: {
+  BOT_TOKEN: process.env.BOT_TOKEN || null,
+  CHAT_ID: process.env.CHAT_ID || null,
+},
 };
 
 export default CONFIG;
