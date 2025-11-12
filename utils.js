@@ -1,19 +1,17 @@
-// utils.js — AI Trader v9.7 (Stable + Debug Safe)
+// utils.js — AI Trader v9.6 FINAL PATCH
+
 import axios from "axios";
 import fs from "fs";
 import CONFIG from "./config.js";
 
-// ===========================
-// 🕒 Time + KeepAlive
-// ===========================
-export function nowLocal() {
-  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-}
+export const nowLocal = () =>
+  new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
-export async function keepAlive(selfPingUrl = CONFIG.SELF_PING_URL) {
-  if (!selfPingUrl) return;
+// KeepAlive
+export async function keepAlive(url = CONFIG.SELF_PING_URL) {
+  if (!url) return;
   try {
-    const res = await fetch(selfPingUrl);
+    const res = await fetch(url);
     if (res.ok) console.log("🌐 KeepAlive OK");
     else console.warn("⚠️ KeepAlive non-200:", res.status);
   } catch (e) {
@@ -21,9 +19,7 @@ export async function keepAlive(selfPingUrl = CONFIG.SELF_PING_URL) {
   }
 }
 
-// ===========================
-// 💾 Cache System
-// ===========================
+// Cache
 function saveCache(symbol, data) {
   try {
     let cache = {};
@@ -35,7 +31,6 @@ function saveCache(symbol, data) {
     console.warn("Cache save failed:", e.message);
   }
 }
-
 function readCache() {
   try {
     if (fs.existsSync(CONFIG.CACHE_FILE))
@@ -44,246 +39,119 @@ function readCache() {
   return {};
 }
 
-// ===========================
-// 🌍 Safe Fetch Utility
-// ===========================
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
+// Generic fetch wrapper
 async function safeFetch(url, label, transform) {
   try {
-    const res = await axios.get(url, {
-      timeout: 8000,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (AI-TraderBot-v9.7)",
-        Accept: "application/json,text/plain,*/*"
-      }
-    });
-
-    if (res.status === 200) {
-      const data = transform(res.data);
-      if (Array.isArray(data) && data.length > 0) {
-        console.log(`✅ ${label} OK (${data.length} candles)`);
-        return { ok: true, data, source: label };
-      }
-    }
-    throw new Error(`Bad response ${res.status}`);
+    const res = await axios.get(url, { timeout: 8000 });
+    if (res.status !== 200) throw new Error(res.status);
+    const data = transform(res.data);
+    if (Array.isArray(data) && data.length > 0)
+      return { ok: true, data, source: label };
+    throw new Error("No data");
   } catch (e) {
-    console.warn(`❌ ${label} failed: ${e.message}`);
+    console.warn(`❌ ${label} failed:`, e.message);
     return { ok: false };
   }
 }
 
-// ===========================
-// 🟢 Crypto (Binance + Fallbacks)
-// ===========================
+// ---- Market sources ----
 async function fetchCrypto(symbol, interval = "15m", limit = 500) {
   for (const base of CONFIG.BINANCE_SOURCES) {
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    const res = await safeFetch(url, `Binance(${base.split("/")[2]})`, (raw) =>
+    const out = await safeFetch(url, `Binance(${base})`, raw =>
       Array.isArray(raw)
         ? raw.map(k => ({
-            t: k?.[0],
-            open: +k?.[1],
-            high: +k?.[2],
-            low: +k?.[3],
-            close: +k?.[4],
-            vol: +k?.[5],
-          })).filter(k => !isNaN(k.close))
+            t: +k[0], open: +k[1], high: +k[2],
+            low: +k[3], close: +k[4], vol: +k[5]
+          }))
         : []
     );
-    if (res.ok) return res;
-    await delay(1200);
+    if (out.ok) return out;
   }
-
-  const cg = await safeFetch(
-    `${CONFIG.FALLBACK_SOURCES.COINGECKO}/coins/bitcoin/market_chart?vs_currency=usd&days=1`,
-    "CoinGecko",
-    (raw) =>
-      Array.isArray(raw?.prices)
-        ? raw.prices.map(p => ({
-            t: p?.[0],
-            open: p?.[1],
-            high: p?.[1],
-            low: p?.[1],
-            close: p?.[1],
-            vol: 0
-          })).filter(k => !isNaN(k.close))
-        : []
-  );
-  if (cg.ok) return cg;
-
-  const ku = await safeFetch(
-    `${CONFIG.FALLBACK_SOURCES.KUCOIN}/api/v1/market/candles?symbol=${symbol}&type=15min`,
-    "KuCoin",
-    (raw) =>
-      Array.isArray(raw?.data)
-        ? raw.data.map(k => ({
-            t: +k?.[0] * 1000,
-            open: +k?.[1],
-            high: +k?.[2],
-            low: +k?.[3],
-            close: +k?.[4],
-            vol: +k?.[5],
-          })).filter(k => !isNaN(k.close))
-        : []
-  );
-  if (ku.ok) return ku;
-
-  console.warn("⚠️ All crypto sources failed, switching to cache...");
   return { ok: false };
 }
-
-// ===========================
-// 🇮🇳 Indian Market
-// ===========================
 async function fetchIndian(symbol) {
-  const nseUrl = `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`;
-  const yahooUrl = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
-
-  const nse = await safeFetch(nseUrl, "NSE India", (raw) => {
-    const price = raw?.priceInfo?.lastPrice;
-    if (!price) return [];
-    return [{ t: Date.now(), open: price, high: price, low: price, close: price, vol: 0 }];
-  });
-  if (nse.ok) return nse;
-
-  const yahoo = await safeFetch(yahooUrl, "Yahoo Finance (IN)", (raw) => {
-    const res = raw?.chart?.result?.[0];
-    if (!res) return [];
-    return res.timestamp.map((t, i) => ({
+  const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${symbol}?region=IN&interval=15m&range=1d`;
+  return safeFetch(url, "Yahoo(IN)", raw => {
+    const r = raw?.chart?.result?.[0];
+    if (!r) return [];
+    return r.timestamp.map((t, i) => ({
       t: t * 1000,
-      open: res.indicators.quote[0].open[i],
-      high: res.indicators.quote[0].high[i],
-      low: res.indicators.quote[0].low[i],
-      close: res.indicators.quote[0].close[i],
-      vol: res.indicators.quote[0].volume[i],
-    })).filter(k => !isNaN(k.close));
+      open: +r.indicators.quote[0].open[i],
+      high: +r.indicators.quote[0].high[i],
+      low: +r.indicators.quote[0].low[i],
+      close: +r.indicators.quote[0].close[i],
+      vol: +r.indicators.quote[0].volume[i]
+    }));
   });
-  if (yahoo.ok) return yahoo;
-
-  return { ok: false };
 }
-
-// ===========================
-// 🟡 Metals (Gold, Silver)
-// ===========================
 async function fetchMetals(symbol) {
   const tick = symbol === "GOLD" ? "GC=F" : "SI=F";
   const url = `${CONFIG.FALLBACK_SOURCES.YAHOO}/v8/finance/chart/${tick}?interval=15m&range=1d`;
-  const yahoo = await safeFetch(url, `Yahoo ${symbol}`, (raw) => {
-    const res = raw?.chart?.result?.[0];
-    if (!res) return [];
-    return res.timestamp.map((t, i) => ({
+  return safeFetch(url, `Yahoo ${symbol}`, raw => {
+    const r = raw?.chart?.result?.[0];
+    if (!r) return [];
+    return r.timestamp.map((t, i) => ({
       t: t * 1000,
-      open: res.indicators.quote[0].open[i],
-      high: res.indicators.quote[0].high[i],
-      low: res.indicators.quote[0].low[i],
-      close: res.indicators.quote[0].close[i],
-      vol: res.indicators.quote[0].volume[i],
-    })).filter(k => !isNaN(k.close));
+      open: +r.indicators.quote[0].open[i],
+      high: +r.indicators.quote[0].high[i],
+      low: +r.indicators.quote[0].low[i],
+      close: +r.indicators.quote[0].close[i],
+      vol: +r.indicators.quote[0].volume[i]
+    }));
   });
-  if (yahoo.ok) return yahoo;
-
-  return { ok: false };
 }
 
-// =====================================================
-// 🧩 Candle Normalizer (Error-Proof Version)
-// =====================================================
+// ---- Normalizer ----
 function ensureCandles(raw) {
   if (!raw) return [];
-
-  const normalizeOne = (k) => {
-    if (!k || (Array.isArray(k) && k.length < 5)) return null;
-
-    if (Array.isArray(k)) {
-      const [t, o, h, l, c, v] = k.map(Number);
-      if (isNaN(c)) return null;
-      return { t, open: o, high: h, low: l, close: c, vol: v ?? 0 };
-    }
-
-    if (typeof k === "object") {
-      const c = Number(k.close ?? k.c);
-      if (isNaN(c)) return null;
+  const norm = k => {
+    if (!k) return null;
+    if (Array.isArray(k))
       return {
-        t: Number(k.t ?? k.time ?? k.timestamp ?? Date.now()),
-        open: Number(k.open ?? k.o ?? c),
-        high: Number(k.high ?? k.h ?? c),
-        low: Number(k.low ?? k.l ?? c),
-        close: c,
-        vol: Number(k.vol ?? k.v ?? k.volume ?? 0),
+        t: +k[0], open: +k[1] || 0, high: +k[2] || 0,
+        low: +k[3] || 0, close: +k[4] || 0, vol: +k[5] || 0
       };
-    }
-
+    if (typeof k === "object")
+      return {
+        t: +(k.t ?? k.time ?? 0),
+        open: +k.open || +k.c || 0,
+        high: +k.high || +k.c || 0,
+        low: +k.low || +k.c || 0,
+        close: +k.close || +k.c || 0,
+        vol: +k.vol || +k.v || 0
+      };
     return null;
   };
-
-  if (Array.isArray(raw)) {
-    const clean = raw.map(normalizeOne).filter(Boolean);
-    if (clean.length === 0)
-      console.warn("⚠️ ensureCandles: No valid candles found in array input.");
-    return clean.sort((a, b) => a.t - b.t);
-  }
-
-  if (typeof raw === "object") {
-    const out = {};
-    for (const [tf, arr] of Object.entries(raw)) {
-      if (Array.isArray(arr)) {
-        const clean = arr.map(normalizeOne).filter(Boolean);
-        if (clean.length === 0)
-          console.warn(`⚠️ ensureCandles: No valid candles for timeframe ${tf}`);
-        out[tf] = clean.sort((a, b) => a.t - b.t);
-      }
-    }
-    return out;
-  }
-
-  return [];
+  const arr = Array.isArray(raw) ? raw : Object.values(raw).flat();
+  return arr.map(norm).filter(x => x && !isNaN(x.close));
 }
 
-// =====================================================
-// 🌍 Unified Fetch Entry
-// =====================================================
+// ---- Unified Entry ----
 export async function fetchMarketData(symbol = CONFIG.SYMBOL) {
-  let result = { ok: false };
-  console.log(`\n⏳ Fetching data for ${symbol}...`);
-
+  console.log(`⏳ Fetching ${symbol}...`);
+  let res = { ok: false };
   try {
-    if (CONFIG.MARKETS.CRYPTO.includes(symbol)) {
-      result = await fetchCrypto(symbol);
-    } else if (CONFIG.MARKETS.INDIAN.includes(symbol)) {
-      result = await fetchIndian(symbol);
-    } else if (CONFIG.MARKETS.METALS.includes(symbol)) {
-      result = await fetchMetals(symbol);
-    }
+    if (CONFIG.MARKETS.CRYPTO.includes(symbol)) res = await fetchCrypto(symbol);
+    else if (CONFIG.MARKETS.INDIAN.includes(symbol)) res = await fetchIndian(symbol);
+    else if (CONFIG.MARKETS.METALS.includes(symbol)) res = await fetchMetals(symbol);
 
-    if (result.ok && result.data) {
-      let normalized;
-      try {
-        normalized = ensureCandles(result.data);
-      } catch (e) {
-        console.warn("⚠️ Candle normalization failed:", e.message);
-        normalized = result.data;
-      }
-
-      if (!Array.isArray(normalized) || normalized.length === 0) {
-        console.warn(`🚨 No valid candle data for ${symbol}`);
-      }
-
-      saveCache(symbol, normalized);
-      return { data: normalized, source: result.source };
+    if (res.ok && res.data?.length) {
+      const clean = ensureCandles(res.data);
+      if (clean.length === 0) throw new Error("No valid candles");
+      saveCache(symbol, clean);
+      return { data: clean, source: res.source };
     }
 
     const cache = readCache();
-    if (cache[symbol] && Date.now() - cache[symbol].ts < CONFIG.CACHE_RETENTION_MS) {
-      console.log("♻️ Using cached data for", symbol);
+    if (cache[symbol]) {
+      console.log("♻️ Using cache for", symbol);
       return { data: cache[symbol].data, source: "cache" };
     }
 
-    console.error("⛔ No market data available for", symbol);
-    return { data: [], source: "none" };
-  } catch (err) {
-    console.error("❌ fetchMarketData error:", err.message);
+    throw new Error("No market data available");
+  } catch (e) {
+    console.error("❌ fetchMarketData:", e.message);
     return { data: [], source: "error" };
   }
 }
