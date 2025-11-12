@@ -1,84 +1,145 @@
-// aiTraderBot.js — FINAL STABLE VERSION
+// ===========================================================
+// aiTraderBot.js — Unified AI Trader Core (Final Render-Safe v10.5)
+// ===========================================================
+
+import express from "express";
 import CONFIG from "./config.js";
-import { fetchMarketData, calculateIndicators } from "./core_indicators.js";
-import { generateMergedSignal } from "./merge_signals.js";
-import { analyzeWithElliott } from "./elliott_module.js";
+import { nowLocal, fetchMarketData, keepAlive } from "./utils.js";
+import { calculateRSI, calculateMACD } from "./core_indicators.js";
+import { analyzeElliott } from "./elliott_module.js";
 import MLModule, { runMLPrediction } from "./ml_module_v8_6.js";
-import { analyzeNewsImpact } from "./background_utils.js";
+import { mergeSignals } from "./merge_signals.js";
+import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
-import { recordFeedback } from "./merge_signals.js";
-import { nowLocal } from "./utils.js";
 
-global.botInstance = null;
+// ===========================================================
+// ⚙️ Server KeepAlive
+// ===========================================================
+const app = express();
+app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running"));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🌍 KeepAlive server running on port ${PORT}`);
+});
 
-// 📊 Build full AI report
-export async function buildReport(symbol = "BTCUSDT", tf = "15m") {
+// Keep pinging itself
+(async () => {
   try {
-    const marketData = await fetchMarketData(symbol, tf);
-    const indicators = await calculateIndicators(marketData);
-    const merged = await generateMergedSignal(symbol, indicators);
-    const elliott = await analyzeWithElliott(symbol, marketData);
-    const ml = await analyzeWithML(symbol, indicators);
-    const news = await analyzeNewsImpact(symbol);
+    await keepAlive(CONFIG.SELF_PING_URL);
+  } catch (e) {
+    console.warn("keepAlive init:", e.message);
+  }
+  setInterval(() => keepAlive(CONFIG.SELF_PING_URL), 5 * 60 * 1000);
+})();
 
-    const bias = merged.bias || "Neutral";
-    const tp1 = merged.tp1 || ml.tp1 || elliott.tp1 || 0;
-    const tp2 = merged.tp2 || ml.tp2 || elliott.tp2 || 0;
-    const sl = merged.sl || ml.sl || elliott.sl || 0;
-    const price = marketData?.currentPrice || 0;
+// ===========================================================
+// 🧮 Helper Utilities
+// ===========================================================
+function safeNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+function lastOf(arr) {
+  return Array.isArray(arr) && arr.length ? arr[arr.length - 1] : null;
+}
+function ensureArray(a) {
+  return Array.isArray(a) ? a : [];
+}
 
-    // final formatted message
-    const text = `
-🚀 <b>${symbol}</b> — AI Trader Report
-🕒 ${nowLocal()}
-🔗 Source: ${CONFIG.SOURCE}
+// ===========================================================
+// 📈 Core Data Aggregation
+// ===========================================================
+async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
+  try {
+    // --- Fetch recent market data ---
+    const resp = await fetchMarketData(symbol, interval, 300);
+    const candles = resp?.data || [];
+    if (!candles.length) throw new Error("No candle data found");
 
-💰 <b>Price:</b> ${price.toFixed(2)}
-━━━━━━━━━━━━━━━
-📈 <b>${tf} | ${bias}</b> ${bias === "Bullish" ? "🟢" : bias === "Bearish" ? "🔴" : "⚪"}
-💵 Price: ${price.toFixed(2)} | Vol: ${indicators.volumeLevel}
-📊 RSI: ${indicators.rsi} | MACD: ${indicators.macd.toFixed(2)} | ATR: ${indicators.atr.toFixed(2)}
+    const last = lastOf(candles);
+    const closePrice = safeNum(last.close);
 
-━━━━━━━━━━━━━━━
-🧭 <b>Overall Bias:</b> ${bias}
-💪 Strength: ${merged.strength || 0}% | 🤖 ML Prob: ${getMLConfidence(ml)}
-🎯 TP1: ${tp1} | TP2: ${tp2} | SL: ${sl}
+    // --- Calculate Indicators ---
+    const rsi = calculateRSI(candles, 14);
+    const macd = calculateMACD(candles, 12, 26, 9);
+    const ell = await analyzeElliott({ [interval]: candles });
+    const ml = await runMLPrediction(candles);
+    const merged = mergeSignals({ rsi, macd }, ell, ml);
+    const news = await fetchNews(symbol);
 
-━━━━━━━━━━━━━━━
-📰 <b>News Impact:</b> ${news.sentimentText} (score ${news.score})
-📚 Sources: Binance, CoinGecko, KuCoin, AI Feeds
-━━━━━━━━━━━━━━━
-`;
-    return { text, bias };
+    // --- ATR Calculation ---
+    const atr = candles.slice(-14).reduce((s, c) => s + (c.high - c.low), 0) / 14;
+
+    // --- Build Text Output ---
+    let text = "━━━━━━━━━━━━━━━━━━━\n";
+    text += `🚀 <b>${symbol}</b> — <b>AI Trader Report</b>\n`;
+    text += `🕒 ${nowLocal()}\n`;
+    text += `🔗 Source: ${resp.source || "Binance"}\n`;
+    text += `💰 <b>Price:</b> ${closePrice}\n`;
+    text += `━━━━━━━━━━━━━━━━━━━\n`;
+
+    const tfList = CONFIG.INTERVALS || ["1m", "5m", "15m", "30m", "1h"];
+    for (const tf of tfList) {
+      try {
+        const tfData = await fetchMarketData(symbol, tf, 150);
+        const c = tfData.data || [];
+        const l = lastOf(c);
+        const rsiVal = calculateRSI(c, 14);
+        const macdVal = calculateMACD(c, 12, 26, 9);
+        text += `\n📊 <b>${tf}</b> | ${rsiVal > 60 ? "Bullish 🟢" : rsiVal < 40 ? "Bearish 🔴" : "Sideways ⚪"}\n`;
+        text += `💵 Price: ${l?.close ?? "-"} | Vol: ${l?.vol ?? "-"}\n📈 RSI: ${rsiVal?.toFixed?.(2) ?? "-"} | MACD: ${macdVal?.macd?.toFixed?.(2) ?? "-"} | ATR: ${atr.toFixed(2)}\n━━━━━━━━━━━━━━━━━━━\n`;
+      } catch (err) {
+        text += `\n📊 <b>${tf}</b> | Data N/A\n━━━━━━━━━━━━━━━━━━━\n`;
+      }
+    }
+
+    text += `\n🧭 <b>Overall Bias:</b> ${merged.bias}\n`;
+    text += `💪 Strength: ${merged.strength}% | 🤖 ML Prob: ${ml?.prob ?? 50}%\n`;
+    text += `🎯 TP1: ${(closePrice * 1.01).toFixed(2)} | TP2: ${(closePrice * 1.02).toFixed(2)} | SL: ${(closePrice * 0.99).toFixed(2)}\n`;
+    text += `📰 News Impact: ${news?.impact ?? "Low"} (score ${news?.score ?? 0})\n`;
+    text += `━━━━━━━━━━━━━━━━━━━\n📊 Sources: Binance, CoinGecko, KuCoin`;
+
+    return { text, data: { rsi, macd, ell, ml, merged, news } };
   } catch (err) {
-    console.error("❌ buildReport error:", err.message);
-    return { text: `❌ Error generating report for ${symbol}: ${err.message}` };
+    console.error("buildReport error:", err.message);
+    return { text: `❌ Failed to build report for ${symbol}: ${err.message}` };
   }
 }
 
-// 🕒 Periodic Auto Updates
+// ===========================================================
+// 🕒 Auto 15-Minute Telegram Update
+// ===========================================================
 async function autoUpdateLoop() {
   try {
-    const { text } = await buildReport(CONFIG.DEFAULT_SYMBOL || "BTCUSDT", "15m");
+    const symbol = CONFIG.SYMBOL || "BTCUSDT";
+    const { text } = await buildReport(symbol, "15m");
     await sendTelegramMessage(text);
-    console.log("✅ Auto 15m update sent to Telegram");
+    console.log(`✅ Auto 15m update sent to Telegram for ${symbol}`);
   } catch (err) {
     console.error("⚠️ Auto update error:", err.message);
   }
 }
 
-// 🧠 Initialize Bot + Loops
+// ===========================================================
+// 🤖 Initialize Telegram Bot & Loops
+// ===========================================================
 (async () => {
   try {
-    if (!global.botInstance) {
-      global.botInstance = await setupTelegramBot();
-      console.log("🤖 Telegram bot initialized.");
-    }
+    await setupTelegramBot();
+    console.log("🤖 Telegram bot initialized.");
   } catch (e) {
-    console.warn("⚠️ setupTelegramBot error:", e.message);
+    console.warn("setupTelegramBot error:", e.message);
   }
 
-  // periodic update
+  // Initial send
   await autoUpdateLoop();
-  setInterval(autoUpdateLoop, 15 * 60 * 1000); // every 15m
+
+  // Schedule every 15m
+  setInterval(autoUpdateLoop, CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
 })();
+
+// ===========================================================
+// ✅ Export for other modules
+// ===========================================================
+export { buildReport, autoUpdateLoop };
+export default { buildReport, autoUpdateLoop };
