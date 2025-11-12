@@ -1,4 +1,3 @@
-// aiTraderBot.js — v10.3 (Enhanced Dashboard + Smart Volume + Reversal Watcher)
 import CONFIG from "./config.js";
 import { calculateRSI, calculateMACD } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
@@ -7,10 +6,11 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
 import { nowLocal, fetchMarketData, keepAlive } from "./utils.js";
-
 import express from "express";
 
+// ===============================
 // 🌍 KeepAlive Server
+// ===============================
 const app = express();
 app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running"));
 const PORT = process.env.PORT || 10000;
@@ -23,176 +23,148 @@ console.log("🤖 AI Trader Bot Starting...");
 await keepAlive(CONFIG.SELF_PING_URL);
 await setupTelegramBot();
 
-// 📊 Multi-Timeframe Indicator Builder
+// ===============================
+// 📊 Multi-Timeframe Indicators
+// ===============================
 async function buildMultiTimeframeIndicators(symbol) {
-  const timeframes = CONFIG.INTERVALS || ["1m", "5m", "15m", "30m", "1h"];
-  const result = {};
+  const tfs = CONFIG.INTERVALS || ["1m", "5m", "15m", "30m", "1h"];
+  const res = {};
 
-  for (const tf of timeframes) {
+  for (const tf of tfs) {
     try {
       const resp = await fetchMarketData(symbol, tf, 200);
-      const candles = Array.isArray(resp.data) ? resp.data : [];
-      const valid = candles
-        .map((c) => ({
-          open: +c.o || +c.open,
-          high: +c.h || +c.high,
-          low: +c.l || +c.low,
-          close: +c.c || +c.close,
-          vol: +c.v || +c.volume || 0,
-        }))
-        .filter((x) => !isNaN(x.close));
-
-      if (!valid.length) {
-        result[tf] = { price: "N/A", rsi: "N/A", macd: "N/A", atr: "N/A", vol: "N/A" };
+      const candles = resp.data || [];
+      if (!candles.length) {
+        res[tf] = { rsi: "N/A", macd: "N/A", atr: "N/A", vol: "N/A", bias: "N/A" };
         continue;
       }
 
-      const price = valid.at(-1)?.close ?? 0;
-      const latestVol = valid.at(-1)?.vol ?? 0;
-      const avgVol = valid.slice(-30).reduce((a, b) => a + (b.vol || 0), 0) / Math.max(1, valid.slice(-30).length);
+      const price = candles.at(-1)?.close ?? 0;
+      const vol = candles.at(-1)?.vol ?? 0;
+      const avgVol = candles.reduce((a, b) => a + (b.vol || 0), 0) / candles.length;
+      const volLabel = resp.volume?.label || (vol > avgVol * 1.5 ? "🔥 High Volume" : "Normal");
 
       // RSI
-      let rsiRaw = calculateRSI(valid, 14);
-      if (typeof rsiRaw === "object") rsiRaw = rsiRaw.value ?? Object.values(rsiRaw).at(-1);
-      const rsi = typeof rsiRaw === "number" && !isNaN(rsiRaw) ? rsiRaw : NaN;
+      let rsiVal = calculateRSI(candles, 14);
+      if (Array.isArray(rsiVal)) rsiVal = rsiVal.at(-1);
+      if (typeof rsiVal === "object") rsiVal = rsiVal.value ?? Object.values(rsiVal).at(-1);
 
       // MACD
-      const macdRaw = calculateMACD(valid, 12, 26, 9);
-      const macdVal = macdRaw?.macd?.at(-1) ?? (typeof macdRaw === "number" ? macdRaw : NaN);
+      let macdRaw = calculateMACD(candles, 12, 26, 9);
+      let macdVal = NaN;
+      if (macdRaw) {
+        if (typeof macdRaw === "number") macdVal = macdRaw;
+        else if (Array.isArray(macdRaw)) macdVal = macdRaw.at(-1)?.macd ?? macdRaw.at(-1);
+        else if (typeof macdRaw === "object")
+          macdVal = Array.isArray(macdRaw.macd)
+            ? macdRaw.macd.at(-1)
+            : macdRaw.macd ?? NaN;
+      }
 
       // ATR
       const atr =
-        valid.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
-        Math.max(1, valid.slice(-14).length - 1);
+        candles.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
+        Math.max(1, candles.slice(-14).length - 1);
 
       // Bias
       let bias = "Sideways";
-      if (rsi > 60 && macdVal > 0) bias = "Bullish";
-      else if (rsi < 40 && macdVal < 0) bias = "Bearish";
-
-      // RSI label
-      let rsiLabel = "Neutral";
-      if (rsi <= 25) rsiLabel = "Deep Oversold";
-      else if (rsi < 40) rsiLabel = "Oversold";
-      else if (rsi > 70) rsiLabel = "Overbought";
-
-      // Volume condition
-      let volLabel = "Normal";
-      if (latestVol > avgVol * 2) volLabel = "🔥 Spike";
-      else if (latestVol < avgVol * 0.5) volLabel = "🧊 Low";
+      if (rsiVal > 60 && macdVal > 0) bias = "Bullish";
+      else if (rsiVal < 40 && macdVal < 0) bias = "Bearish";
 
       const emoji =
         bias === "Bullish" ? "🟢" :
-        bias === "Bearish" ? "🔴" :
-        "⚪";
+        bias === "Bearish" ? "🔴" : "⚪";
 
-      result[tf] = {
+      // RSI Zone
+      let rsiZone = "Neutral";
+      if (rsiVal <= 25) rsiZone = "Deep Oversold";
+      else if (rsiVal < 40) rsiZone = "Oversold";
+      else if (rsiVal > 70) rsiZone = "Overbought";
+
+      res[tf] = {
         price: price.toFixed(2),
-        rsi: !isNaN(rsi) ? rsi.toFixed(2) : "N/A",
-        macd: !isNaN(macdVal) ? macdVal.toFixed(2) : "N/A",
-        atr: !isNaN(atr) ? atr.toFixed(2) : "N/A",
-        vol: `${latestVol.toFixed(0)} (${volLabel})`,
-        rsiLabel,
+        rsi: rsiVal.toFixed(2),
+        macd: macdVal.toFixed(2),
+        atr: atr.toFixed(2),
+        vol: vol.toFixed(0),
+        volLabel,
         bias,
         emoji,
+        rsiZone
       };
     } catch (err) {
       console.warn(`❌ ${tf} failed:`, err.message);
-      result[tf] = { price: "N/A", rsi: "N/A", macd: "N/A", atr: "N/A", vol: "N/A" };
+      res[tf] = { rsi: "N/A", macd: "N/A", atr: "N/A", vol: "N/A", bias: "N/A" };
     }
   }
 
-  return result;
+  return res;
 }
 
-// ⚡ Reversal Watcher
-function detectReversal(rsi, macdHist) {
-  if (!Array.isArray(macdHist) || macdHist.length < 3) return "—";
-  const last = macdHist.at(-1);
-  const prev = macdHist.at(-2);
-  if (rsi < 30 && last > prev) return "⚡ Possible Bullish Reversal";
-  if (rsi > 70 && last < prev) return "⚡ Possible Bearish Reversal";
-  return "—";
-}
-
-// 🧠 Build AI Report
+// ===============================
+// 🧠 Main Report Builder
+// ===============================
 async function buildReport(symbol = CONFIG.SYMBOL, interval = "15m") {
   const resp = await fetchMarketData(symbol, interval, 500);
-  const data = Array.isArray(resp.data) ? resp.data : [];
+  const candles = resp.data || [];
+  if (!candles.length) return null;
 
-  const valid = data
-    .map((c) => ({
-      t: +c.t || +c.time || Date.now(),
-      open: +c.o || +c.open,
-      high: +c.h || +c.high,
-      low: +c.l || +c.low,
-      close: +c.c || +c.close,
-      vol: +c.v || +c.volume || 0,
-    }))
-    .filter((x) => !isNaN(x.close))
-    .sort((a, b) => a.t - b.t);
+  const last = candles.at(-1);
+  const atr =
+    candles.slice(-14).reduce((a, b) => a + (b.high - b.low), 0) /
+    Math.max(1, candles.slice(-14).length - 1);
 
-  if (!valid.length) return null;
+  let rsi, macd, ell, ml, merged, news;
+  try { rsi = calculateRSI(candles, 14); } catch { rsi = "N/A"; }
+  try { macd = calculateMACD(candles, 12, 26, 9); } catch { macd = "N/A"; }
+  try { ell = await analyzeElliott(candles); } catch { ell = {}; }
+  try { ml = await runMLPrediction(candles); } catch { ml = { prob: 50 }; }
+  try { merged = mergeSignals({ rsi, macd }, ell, ml); } catch { merged = { bias: "Neutral" }; }
+  try { news = await fetchNews(symbol.startsWith("BTC") ? "BTC" : symbol); } catch { news = {}; }
 
-  const last = valid.at(-1);
-  const recent = valid.slice(-20);
-  let atr = 0;
-  for (let i = 1; i < recent.length; i++) {
-    const prev = recent[i - 1];
-    const k = recent[i];
-    atr += Math.max(k.high - k.low, Math.abs(k.high - prev.close), Math.abs(k.low - prev.close));
-  }
-  atr = atr / Math.max(1, recent.length - 1);
-
-  const rsiObj = calculateRSI(valid, 14);
-  const rsiVal = rsiObj?.value ?? rsiObj ?? 0;
-  const macdObj = calculateMACD(valid, 12, 26, 9);
-  const reversalAlert = detectReversal(rsiVal, macdObj?.histogram ?? []);
-
-  const ell = await analyzeElliott(valid);
-  const ml = await runMLPrediction(valid);
-  const merged = mergeSignals({ rsi: rsiVal, macd: macdObj }, ell, ml);
-  const news = await fetchNews(symbol.startsWith("BTC") ? "BTC" : symbol);
   const multiTF = await buildMultiTimeframeIndicators(symbol);
-
   const SL = Math.round(last.close - atr * 2);
   const TP1 = Math.round(last.close + atr * 4);
   const TP2 = Math.round(last.close + atr * 6);
 
-  // 🧠 Telegram Dashboard
+  // 🧠 REVERSAL WATCHER ALERT
+  let reversalMsg = "";
+  const rsiVal = typeof rsi === "number" ? rsi : (rsi?.value ?? 50);
+  if (rsiVal < 30 && merged.bias === "Buy") reversalMsg = "📈 Possible Oversold Reversal (Watch Long Entry)";
+  else if (rsiVal > 70 && merged.bias === "Sell") reversalMsg = "📉 Possible Overbought Reversal (Watch Short Entry)";
+
+  // Telegram Dashboard
   let text = `━━━━━━━━━━━━━━━━━━━
-🚀 <b>${symbol}</b> — <b>AI Trader v10.3</b>
+🚀 <b>${symbol}</b> — <b>AI Trader Report</b>
 🕒 ${nowLocal()}
-💰 <b>Price:</b> ${last.close.toFixed(2)}
-${reversalAlert !== "—" ? "⚡ " + reversalAlert + "\n" : ""}
+📡 Source: ${resp.source}
+💰 Price: ${last.close.toFixed(2)}
+📦 Volume: ${resp.volume?.label || "Normal"} (${resp.volume?.current}/${resp.volume?.avg})
 ━━━━━━━━━━━━━━━━━━━\n`;
 
   for (const tf of Object.keys(multiTF)) {
     const r = multiTF[tf];
-    text += `📈 <b>${tf}</b> | ${r.bias} ${r.emoji}
-💵 Price: ${r.price} | 📊 Vol: ${r.vol}
-RSI: ${r.rsi} (${r.rsiLabel}) | MACD: ${r.macd} | ATR: ${r.atr}
+    text += `📊 <b>${tf}</b> | ${r.bias} ${r.emoji}
+💵 Price: ${r.price} | Vol: ${r.vol} (${r.volLabel})
+📈 RSI: ${r.rsi} (${r.rsiZone}) | MACD: ${r.macd} | ATR: ${r.atr}
 ━━━━━━━━━━━━━━━━━━━\n`;
   }
 
   text += `🧭 <b>Overall Bias:</b> ${merged.bias}
-💪 Strength: ${merged.strength}% | 🤖 ML Prob: ${merged.mlProb ?? ml?.prob ?? 50}%
-🎯 <b>Targets</b>
-TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}
-💥 Breakout Zone: ${Math.round(last.close - atr * 3)} – ${Math.round(last.close + atr * 3)}
-`;
+💪 Strength: ${merged.strength}% | 🤖 ML Prob: ${merged.mlProb ?? ml.prob ?? 50}%
+🎯 TP1: ${TP1} | TP2: ${TP2} | SL: ${SL}
 
-  if (news.headlines?.length) {
-    text += "\n🗞️ <b>Top Headlines:</b>\n• " + news.headlines.slice(0, 3).join("\n• ") + "\n";
-  }
-
-  text += `\n📊 <i>Sources:</i> Binance, CoinGecko, KuCoin
+${reversalMsg ? "⚠️ <b>Reversal Alert:</b> " + reversalMsg + "\n\n" : ""}
+📰 News Impact: ${news.impact ?? "N/A"} (score ${news.score ?? 0})
+📊 Sources: Binance, CoinGecko, KuCoin
 ━━━━━━━━━━━━━━━━━━━`;
 
   return { text };
 }
 
-// 🔁 Report Loop
+// ===============================
+// 🔁 Loop Runner
+// ===============================
 async function generateReportLoop() {
   try {
     const out = await buildReport(CONFIG.SYMBOL, "15m");
