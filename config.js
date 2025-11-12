@@ -16,10 +16,10 @@ export const CONFIG = {
   SYMBOL: process.env.SYMBOL || "BTCUSDT",
   INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
 
-  // KeepAlive (prevents Render sleep)
   SELF_PING_URL:
-    process.env.SELF_PING_URL ||
-    "https://web-production-f70a.up.railway.app/ping?url=https://aitraderbot.onrender.com",
+  process.env.SELF_PING_URL ||
+  "https://aitraderbot.onrender.com/ping" || // direct self
+  "https://web-production-f70a.up.railway.app/ping?url=https://aitraderbot.onrender.com",
 
   // File Paths
   CACHE_FILE: path.join(CACHE_DIR, "marketData.json"),
