@@ -15,7 +15,9 @@ const AXIOS_TIMEOUT = 10000;
 export const nowLocal = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
-// ---------------- KEEP ALIVE ----------------
+// ---------------- KEEP ALIVE (Enhanced for Render) ----------------
+import axios from "axios";
+
 export async function keepAlive(url = CONFIG.SELF_PING_URL) {
   const urls = Array.from(
     new Set(
@@ -30,15 +32,16 @@ export async function keepAlive(url = CONFIG.SELF_PING_URL) {
 
   for (const u of urls) {
     try {
-      const res = await fetch(u, { method: "GET", timeout: AXIOS_TIMEOUT });
-      if (res.ok) {
-        console.log("🌐 KeepAlive OK ->", u);
+      const res = await axios.get(u, { timeout: AXIOS_TIMEOUT });
+      if (res.status === 200) {
+        console.log("🌐 KeepAlive OK →", u);
         return { ok: true };
       }
     } catch (e) {
-      console.warn("KeepAlive failed:", u, e.message);
+      console.warn("⚠️ KeepAlive failed →", u, e.message);
     }
   }
+
   return { ok: false };
 }
 
