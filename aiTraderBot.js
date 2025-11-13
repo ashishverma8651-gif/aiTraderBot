@@ -141,4 +141,21 @@ async function sendAutoReport() {
 setInterval(sendAutoReport, CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
 sendAutoReport();
 
+// ===============================================
+// ♻️ Auto Keep-Alive Ping (Render Safe)
+// ===============================================
+import { keepAlive } from "./utils.js";
+
+if (CONFIG.SERVER.KEEP_ALIVE) {
+  setInterval(async () => {
+    try {
+      const res = await keepAlive();
+      if (res.ok) console.log("✅ KeepAlive success ping");
+    } catch (err) {
+      console.warn("⚠️ KeepAlive ping failed:", err.message);
+    }
+  }, 5 * 60 * 1000); // every 5 min
+}
+
+
 export default { buildAIReport, sendAutoReport };
