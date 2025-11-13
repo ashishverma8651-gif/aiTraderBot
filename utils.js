@@ -1,4 +1,4 @@
-// utils.js — v11.1 (Stable + Named Exports Fix)
+// utils.js — v11.2 (Stable + computeFibLevels Export Added)
 import axios from "axios";
 import fs from "fs";
 import path from "path";
@@ -15,9 +15,7 @@ const AXIOS_TIMEOUT = 10000;
 export const nowLocal = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
-// ---------------- KEEP ALIVE (Enhanced for Render) ----------------
-
-
+// ---------------- KEEP ALIVE ----------------
 export async function keepAlive(url = CONFIG.SELF_PING_URL) {
   const urls = Array.from(
     new Set(
@@ -125,6 +123,24 @@ export function analyzeVolume(candles) {
   return { avg: avg.toFixed(2), current: current.toFixed(2), label, ratio: ratio.toFixed(2) };
 }
 
+// ---------------- Fibonacci Levels ----------------
+export function computeFibLevels(high, low) {
+  if (typeof high !== "number" || typeof low !== "number" || high <= low) {
+    return [];
+  }
+
+  const diff = high - low;
+  return [
+    { level: 0, value: low },
+    { level: 0.236, value: high - diff * 0.236 },
+    { level: 0.382, value: high - diff * 0.382 },
+    { level: 0.5, value: high - diff * 0.5 },
+    { level: 0.618, value: high - diff * 0.618 },
+    { level: 0.786, value: high - diff * 0.786 },
+    { level: 1, value: high },
+  ];
+}
+
 // ---------------- CONVERTER ----------------
 function ensureCandles(raw) {
   if (!raw) return [];
@@ -174,6 +190,7 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
       console.warn("fetchCrypto error:", e.message);
     }
   }
+
   const fb = cryptoCfg.FALLBACKS;
   if (fb.COINGECKO) {
     try {
@@ -314,5 +331,6 @@ export default {
   keepAlive,
   fetchMarketData,
   analyzeVolume,
+  computeFibLevels,
   LiveCryptoStream,
 };
