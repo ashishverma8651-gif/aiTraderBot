@@ -1,4 +1,4 @@
-// elliott_module.js — v3.1 (Enhanced + Safe + Chart Export)
+// elliott_module.js — v3.2 (Fixed Exports + Fibonacci helper)
 // Advanced Elliott + Fibonacci + Channel detection + visualization
 
 // ----------------------------
@@ -32,7 +32,23 @@ function safeNumber(x, fallback = NaN) {
 }
 
 // ----------------------------
-// analyzeElliott - main logic
+// 🔢 Fibonacci retracement calculator
+// ----------------------------
+export function computeFibLevels(high, low) {
+  high = Number(high);
+  low = Number(low);
+  if (!isFinite(high) || !isFinite(low) || high <= low) return [];
+
+  const diff = high - low;
+  const levels = [0.236, 0.382, 0.5, 0.618, 0.786];
+  return levels.map(level => ({
+    level,
+    price: Number((high - diff * level).toFixed(2)),
+  }));
+}
+
+// ----------------------------
+// 📊 Elliott Analysis (Main)
 // ----------------------------
 export async function analyzeElliott(candles = [], opts = {}) {
   try {
@@ -128,7 +144,7 @@ export async function analyzeElliott(candles = [], opts = {}) {
 }
 
 // ----------------------------
-// 🧩 Simple Visual Chart Export
+// 🧩 Visual Chart Export
 // ----------------------------
 export function drawElliottWaves(swings = []) {
   if (!Array.isArray(swings) || swings.length === 0) return "📉 No wave data";
@@ -141,3 +157,9 @@ export function drawElliottWaves(swings = []) {
   return chart.trim();
 }
 
+// ✅ Default export (optional)
+export default {
+  analyzeElliott,
+  drawElliottWaves,
+  computeFibLevels
+};
