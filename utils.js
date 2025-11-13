@@ -16,7 +16,7 @@ export const nowLocal = () =>
   new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
 // ---------------- KEEP ALIVE (Enhanced for Render) ----------------
-import axios from "axios";
+
 
 export async function keepAlive(url = CONFIG.SELF_PING_URL) {
   const urls = Array.from(
