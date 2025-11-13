@@ -1,6 +1,5 @@
 // =====================================================================
-// 🤖 aiTraderBot.js — Unified AI Trader Core (Render-Safe v11.2)
-// Includes: Live sync, multi-source data, Telegram auto 15m updates
+// 🚀 aiTraderBot.js — Unified AI Trader Core (Final Render-Safe v11.0)
 // =====================================================================
 
 import express from "express";
@@ -9,121 +8,107 @@ import { nowLocal, fetchMarketData, keepAlive } from "./utils.js";
 import { calculateRSI, calculateMACD } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 import MLModule, { runMLPrediction } from "./ml_module_v8_6.js";
-import { mergeSignals, generateMergedSignal, computeHybridTargets } from "./merge_signals.js";
+import { mergeSignals } from "./merge_signals.js";
 import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
 
 // =====================================================================
 // ⚙️ Server KeepAlive
 // =====================================================================
+
 const app = express();
-app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running."));
+app.get("/", (req, res) => res.send("✅ AI Trader Bot is alive and running!"));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 keepAlive();
 
 // =====================================================================
-// 📊 Core Report Generator (Main Function)
+// 📊 Core Report Builder
 // =====================================================================
-export async function buildReport(symbol = "BTCUSDT") {
+
+async function buildReport(symbol = "BTCUSDT") {
   try {
+    const time = nowLocal();
+    const source = CONFIG.DATA_SOURCES[0]; // from config.js (multi-source)
     const marketData = await fetchMarketData(symbol);
-    const price = marketData?.price || 0;
-    const volume = marketData?.volume || 0;
+    const price = marketData?.price || "N/A";
 
-    // Timeframes
-    const timeframes = ["1m", "5m", "15m", "30m", "1h"];
-    const tfReports = [];
+    // Indicators
+    const rsi = calculateRSI(marketData);
+    const macd = calculateMACD(marketData);
+    const elliott = analyzeElliott(marketData);
 
-    for (const tf of timeframes) {
-      const data = await fetchMarketData(symbol, tf);
-      const rsi = calculateRSI(data);
-      const macd = calculateMACD(data);
-      const atr = data.atr || 0;
-
-      const bias =
-        rsi > 70 ? "Bearish 🔴" :
-        rsi < 30 ? "Bullish 🟢" : "Sideways";
-
-      tfReports.push(`
-📊 ${tf.toUpperCase()} | ${bias}
-💰 Price: ${data.price.toFixed(2)} | Vol: ${data.volume.toFixed(2)}
-📈 RSI: ${rsi?.toFixed(1) || "N/A"} | MACD: ${macd?.toFixed(3) || "0.000"} | ATR: ${atr?.toFixed(3) || "0"}
-`);
-    }
-
-    // AI & Elliott + ML fusion
-    const elliott = await analyzeElliott(symbol);
+    // ML Prediction
     const mlResult = await runMLPrediction(symbol);
-    const merged = generateMergedSignal(elliott, mlResult);
-    const targets = computeHybridTargets(price, merged.bias);
 
-    // News
+    // News Fetch
     const news = await fetchNews(symbol);
 
-    // 🧩 Final Report (Telegram Format)
+    // Merge signals
+    const merged = mergeSignals({
+      rsi,
+      macd,
+      elliott,
+      mlResult,
+    });
+
+    // 🧠 Final structured message (Telegram UI)
     const report = `
-🚀 <b>${symbol}</b> — <b>AI Trader v11.2</b>
-🕒 ${nowLocal()}
-🔗 Source: ${marketData.source || "Multi-source (config)"}
-💵 Price: <b>${price.toFixed(2)}</b>
+🚀 ${symbol} — AI Trader v11.0
+🕒 ${time}
+🛰️ Source: ${source.name} (${source.url})
+💰 Price: ${price}
 
-━━━━━━━━━━━━━━━
-${tfReports.join("\n━━━━━━━━━━━━━━━\n")}
-━━━━━━━━━━━━━━━
+📊 1m | ${merged.trend1m}
+💵 RSI: ${rsi?.m1} | MACD: ${macd?.m1} | ATR: ${merged?.atr1m}
 
-🧭 Overall Bias: <b>${merged.bias}</b>
-💪 Strength: ${merged.confidence}% | 🤖 ML Prob: ${mlResult.confidence || 50}%
-🎯 TP1: ${targets.tp1} | TP2: ${targets.tp2} | SL: ${targets.sl}
+📊 5m | ${merged.trend5m}
+💵 RSI: ${rsi?.m5} | MACD: ${macd?.m5} | ATR: ${merged?.atr5m}
 
-🧠 Recommendation: <b>${merged.bias}</b> (Conf: ${merged.confidence}%)
+📊 15m | ${merged.trend15m}
+💵 RSI: ${rsi?.m15} | MACD: ${macd?.m15} | ATR: ${merged?.atr15m}
 
-🗞 News Impact: <b>${news.impact}</b> (score ${news.score})
-📰 Top headlines:
-${news.headlines?.slice(0, 5).map((n) => `• ${n.title || n}`).join("\n")}
+📊 30m | ${merged.trend30m}
+💵 RSI: ${rsi?.m30} | MACD: ${macd?.m30} | ATR: ${merged?.atr30m}
 
-Sources: ${marketData.sources?.join(", ") || "Config-based multisource"}
-`;
+📊 1h | ${merged.trend1h}
+💵 RSI: ${rsi?.h1} | MACD: ${macd?.h1} | ATR: ${merged?.atr1h}
 
-    return { text: report };
+⚙️ Overall Bias: ${merged.bias} | Strength: ${merged.strength}% | 🤖 ML Prob: ${mlResult?.probability || "N/A"}%
+
+🎯 TP1: ${merged.tp1} | TP2: ${merged.tp2} | TP3: ${merged.tp3} | SL: ${merged.sl}
+
+📰 News Impact: ${news?.impact || "Low"} (score ${news?.score || 0})
+🗞️ Headlines:
+${news?.headlines?.map(h => `• ${h}`).join("\n") || "N/A"}
+
+📡 Sources: Multi-source (config)
+────────────────────────────
+    `;
+    return report;
   } catch (err) {
-    console.error("❌ buildReport error:", err.message);
-    return { text: `⚠️ Error generating report: ${err.message}` };
+    console.error("❌ buildReport error:", err);
+    return "Error generating report.";
   }
 }
 
 // =====================================================================
-// 🔁 Auto 15-Minute Telegram Updates
+// 🤖 Telegram Auto-Sync
 // =====================================================================
-async function autoUpdateLoop() {
-  try {
-    const { text } = await buildReport("BTCUSDT");
-    await sendTelegramMessage(text);
-    console.log("✅ Auto 15m update sent to Telegram");
-  } catch (err) {
-    console.error("⚠️ Auto update error:", err.message);
-  }
-  setTimeout(autoUpdateLoop, 15 * 60 * 1000); // repeat every 15 min
-}
+
+setupTelegramBot();
+sendTelegramMessage("🚀 AI Trader Bot v11.0 initialized successfully!");
 
 // =====================================================================
-// 🚀 Initialize Bot & Start Loops
+// ✅ Exports (Cleaned — no duplicates)
 // =====================================================================
-(async () => {
-  try {
-    await setupTelegramBot();
-    console.log("📱 Telegram bot initialized.");
 
-    await autoUpdateLoop();
-    console.log("♻️ Auto-update loop started.");
+export { buildReport };
+export { mergeSignals as generateMergedSignal };
+export { runMLPrediction as computeHybridTargets };
 
-  } catch (err) {
-    console.error("❌ Initialization error:", err.message);
-  }
-})();
-
-// =====================================================================
-// ✅ Final Exports
-// =====================================================================
-export { buildReport, computeHybridTargets, generateMergedSignal };
-export default { buildReport, computeHybridTargets, generateMergedSignal };
+export default {
+  buildReport,
+  generateMergedSignal: mergeSignals,
+  computeHybridTargets: runMLPrediction,
+};
