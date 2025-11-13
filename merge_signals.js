@@ -1,18 +1,16 @@
-// merge_signals.js — v2 integrated (core indicators + Elliott + ML + volume + news)
-// Smart signal fusion + optional alert system
+// =====================================
+// merge_signals.js — v3.2 Enhanced
+// Merges: Core Indicators + Elliott + ML + Volume + News + Feedback
+// =====================================
 
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
-import { analyzeElliott, drawElliottWaves } from "./elliott_module.js";
-import { fetchMarketData } from "./utils.js";
-import indicators from "./core_indicators.js";
+import { fetchNews } from "./news_social.js"; // 🔥 New integration
 
 const FEEDBACK_FILE = path.resolve("./cache/merge_signals_feedback.json");
 
-// ------------------------------
-// Safe number helpers
-// ------------------------------
+// ---------- SAFE HELPERS ----------
 const safeNum = (v) => {
   if (v === null || v === undefined) return NaN;
   if (typeof v === "object") {
@@ -31,12 +29,11 @@ const safeNum = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : NaN;
 };
-const clamp = (val, min = 0, max = 100) =>
-  Number.isNaN(val) ? 0 : Math.max(min, Math.min(max, val));
 
-// ------------------------------
-// Feedback system (file cache)
-// ------------------------------
+const clamp = (val, min = -100, max = 100) =>
+  Math.max(min, Math.min(max, Number.isNaN(val) ? 0 : val));
+
+// ---------- FEEDBACK ----------
 function readFeedback() {
   try {
     if (!fs.existsSync(FEEDBACK_FILE)) return { entries: [], summary: {} };
@@ -45,6 +42,7 @@ function readFeedback() {
     return { entries: [], summary: {} };
   }
 }
+
 function saveFeedback(obj) {
   try {
     fs.mkdirSync(path.dirname(FEEDBACK_FILE), { recursive: true });
@@ -53,6 +51,7 @@ function saveFeedback(obj) {
     console.warn("merge_signals: feedback save failed", e?.message);
   }
 }
+
 export function recordFeedback(predictionId, correct = true) {
   try {
     const fb = readFeedback();
@@ -64,7 +63,7 @@ export function recordFeedback(predictionId, correct = true) {
       total,
       correct: correctCount,
       accuracy: total ? +(correctCount / total * 100).toFixed(2) : 0,
-      lastUpdated: Date.now()
+      lastUpdated: Date.now(),
     };
     saveFeedback(fb);
     return fb.summary;
@@ -74,103 +73,135 @@ export function recordFeedback(predictionId, correct = true) {
   }
 }
 
-// ------------------------------
-// 🌐 Full Integration Analyzer
-// ------------------------------
-export async function analyzeAndMerge(symbol = CONFIG.SYMBOL, interval = "15m") {
+// ---------- MAIN MERGER ----------
+export async function mergeSignals(indicators = {}, ell = {}, ml = {}, opts = {}) {
+  // Fetch and include news sentiment (topic from config or opts)
+  const topic = opts.topic || CONFIG?.symbol || "BTC";
+  let newsImpact = 0;
+  let newsPolarity = "Neutral";
   try {
-    console.log(`🧠 Fetching and analyzing ${symbol} (${interval})...`);
-
-    // 1️⃣ Fetch market candles
-    const { data: candles } = await fetchMarketData(symbol, interval, 500);
-    if (!candles?.length) throw new Error(`No candle data for ${symbol}`);
-
-    // 2️⃣ Run indicator analysis
-    const indRes = indicators.analyzeFromCandles(candles);
-
-    // 3️⃣ Run Elliott Wave analysis
-    const ellRes = await analyzeElliott(candles, { depth: 5 });
-    const ellChart = drawElliottWaves(ellRes.swings);
-
-    // 4️⃣ Merge everything into a unified signal
-    const merged = mergeSignals(indRes, ellRes, {}, {});
-
-    // 5️⃣ Enrich output summary
-    merged.symbol = symbol;
-    merged.interval = interval;
-    merged.elliott = ellRes;
-    merged.chart = ellChart;
-
-    merged.summary = `
-📊 *${symbol} Analysis (${interval})*
-━━━━━━━━━━━━━━━━━━
-📈 RSI: ${indRes?.rsi?.toFixed?.(2) ?? "N/A"}  
-💹 MACD: ${indRes?.macd?.toFixed?.(4) ?? "N/A"}  
-💥 ATR: ${indRes?.atr?.toFixed?.(2) ?? "N/A"}  
-📊 Elliott: *${ellRes.structure}* (${ellRes.summary})
-📉 Confidence: ${ellRes.confidence}%
-━━━━━━━━━━━━━━━━━━
-📍 Bias: *${merged.bias}* (${merged.strength}%)
-${merged.chart}
-`;
-
-    // 6️⃣ Optional alert on high-confidence reversal
-    if (ellRes.reversal && ellRes.confidence > 70) {
-      merged.alert = `⚠️ *High-Confidence Elliott Reversal* Detected in ${symbol} (${interval})`;
-      console.log(merged.alert);
-    }
-
-    return merged;
-  } catch (err) {
-    console.error("❌ analyzeAndMerge error:", err.message);
-    return { error: err.message, symbol };
+    const newsData = await fetchNews(topic);
+    newsImpact = newsData?.newsImpact ?? 0;
+    newsPolarity = newsData?.polarity ?? "Neutral";
+  } catch {
+    newsImpact = 0;
   }
-}
 
-// ------------------------------
-// Core merge logic (unchanged, but wrapped)
-// ------------------------------
-export function mergeSignals(indicators = {}, ell = {}, ml = {}, opts = {}) {
-  const weights = Object.assign({
-    rsi: 0.20, macd: 0.25, volume: 0.15, atr: 0.05, elliott: 0.15, news: 0.10, ml: 0.10
-  }, opts.weights || {});
+  const weights = Object.assign(
+    {
+      rsi: 0.20,
+      macd: 0.25,
+      volume: 0.15,
+      atr: 0.05,
+      elliott: 0.15,
+      news: 0.10,
+      ml: 0.10,
+    },
+    opts.weights || {}
+  );
 
+  // Extract indicator values
   const rsiVal = safeNum(indicators.rsi);
   const macdVal = safeNum(indicators.macd);
   const atrVal = safeNum(indicators.atr);
   const volVal = safeNum(indicators.vol);
-  const mlProb = ml?.prob ?? safeNum(ml?.prob);
-  const mlLabel = ml?.label ?? null;
-  const ellBias = ell?.structure?.toLowerCase?.() ?? ell?.bias ?? "neutral";
-  const ellConf = Number(ell?.confidence ?? 0);
 
+  // ML data
+  const mlProb = safeNum(ml?.prob ?? 0);
+  const mlLabel = (ml && ml.label) ? String(ml.label) : "Neutral";
+
+  // Elliott wave info
+  const ellBias = (ell?.structure || ell?.direction || ell?.bias || "").toLowerCase();
+  const ellConf = safeNum(ell?.confidence ?? 0);
+
+  // ---------- SCORE CALCULATIONS ----------
+
+  // RSI
   let rsiScore = 0;
   if (!Number.isNaN(rsiVal)) {
-    if (rsiVal <= 30) rsiScore = clamp((30 - rsiVal) / 30 * 100);
-    else if (rsiVal >= 70) rsiScore = clamp((rsiVal - 70) / 30 * -100);
+    if (rsiVal <= 30) rsiScore = ((30 - rsiVal) / 30) * 100; // buy
+    else if (rsiVal >= 70) rsiScore = -((rsiVal - 70) / 30) * 100; // sell
   }
-  let macdScore = !Number.isNaN(macdVal) ? clamp((macdVal / (atrVal || 1)) * 10, -100, 100) : 0;
-  let volumeScore = !Number.isNaN(volVal) ? clamp(volVal / 10, -100, 100) : 0;
-  let ellScore = /bull|up|impulse/.test(ellBias) ? ellConf : /bear|down|corrective/.test(ellBias) ? -ellConf : 0;
-  let mlScore = !Number.isNaN(mlProb) ? (mlLabel?.toLowerCase?.() === "buy" ? mlProb : -mlProb) * 0.5 : 0;
 
-  const weighted =
-    (rsiScore * weights.rsi) +
-    (macdScore * weights.macd) +
-    (volumeScore * weights.volume) +
-    (ellScore * weights.elliott) +
-    (mlScore * weights.ml);
+  // MACD
+  let macdScore = 0;
+  if (!Number.isNaN(macdVal)) {
+    const denom = Math.max(1, Math.abs(atrVal) || 1);
+    macdScore = clamp((macdVal / denom) * 10);
+  }
+
+  // Volume
+  let volumeScore = 0;
+  const avgVol = safeNum(indicators.avgVol);
+  if (!Number.isNaN(volVal) && avgVol > 0) {
+    if (volVal > avgVol * 1.5) volumeScore = 30;
+    else if (volVal > avgVol * 1.2) volumeScore = 15;
+    else if (volVal < avgVol * 0.5) volumeScore = -10;
+  }
+
+  // Elliott
+  let ellScore = 0;
+  if (ellBias.includes("up") || ellBias.includes("bull")) ellScore = ellConf;
+  else if (ellBias.includes("down") || ellBias.includes("bear")) ellScore = -ellConf;
+
+  // ML
+  let mlScore = 0;
+  if (!Number.isNaN(mlProb)) {
+    if (/buy/i.test(mlLabel)) mlScore = mlProb * 0.5;
+    else if (/sell/i.test(mlLabel)) mlScore = -mlProb * 0.5;
+  }
+
+  // News 🔥
+  let newsScore = clamp(newsImpact);
+  if (newsPolarity === "Positive") newsScore += 10;
+  else if (newsPolarity === "Negative") newsScore -= 10;
+
+  // ---------- WEIGHTED AVERAGE ----------
+  const numerator =
+    rsiScore * weights.rsi +
+    macdScore * weights.macd +
+    volumeScore * weights.volume +
+    ellScore * weights.elliott +
+    newsScore * weights.news +
+    mlScore * weights.ml;
 
   const denom = Object.values(weights).reduce((a, b) => a + b, 0);
-  const rawScore = denom ? weighted / denom : 0;
+  const rawScore = denom ? numerator / denom : 0;
 
   let bias = "Neutral";
   if (rawScore > 10) bias = "Buy";
   else if (rawScore < -10) bias = "Sell";
-
   const strength = clamp(Math.abs(rawScore), 0, 100);
 
-  return { bias, strength, score: rawScore, id: `pred_${Date.now()}`, timestamp: Date.now() };
+  // ---------- RATIONALE ----------
+  const rationale = [];
+  rationale.push(`RSI: ${rsiVal?.toFixed(2) ?? "n/a"}`);
+  rationale.push(`MACD: ${macdVal?.toFixed(2) ?? "n/a"}`);
+  rationale.push(`Elliott: ${ellBias || "n/a"} (${ellConf}%)`);
+  rationale.push(`News: ${newsPolarity} (${newsImpact})`);
+  rationale.push(`ML: ${mlLabel} (${mlProb}%)`);
+
+  // ---------- OUTPUT ----------
+  const id = `pred_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  return {
+    id,
+    bias,
+    strength,
+    score: rawScore,
+    mlProb,
+    newsImpact,
+    newsPolarity,
+    rationale,
+    signals: {
+      rsi: rsiVal,
+      macd: macdVal,
+      vol: volVal,
+      ellScore,
+      mlScore,
+      newsScore,
+    },
+    timestamp: Date.now(),
+  };
 }
 
-export default analyzeAndMerge;
+export default mergeSignals;
