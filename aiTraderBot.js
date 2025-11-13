@@ -399,8 +399,8 @@ async function generateReportLoop() {
   try { await generateReportLoop(); } catch(e){ console.warn("initial report fail", e && e.message); }
   setInterval(generateReportLoop, (CONFIG.REPORT_INTERVAL_MS || (15*60*1000)));
   console.log("Main loops started. Report interval (ms):", CONFIG.REPORT_INTERVAL_MS);
-})();
+})();  // 👈 ye bracket zarur hona chahiye!
 
 // --------------------------- exports
 export { computeHybridTargets, generateMergedSignal };
-export default { buildReport, computeHybridTargets, generateM
+export default { buildReport, computeHybridTargets, generateMergedSignal };ateM
