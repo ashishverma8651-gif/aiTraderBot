@@ -141,8 +141,3 @@ export function drawElliottWaves(swings = []) {
   return chart.trim();
 }
 
-// ----------------------------
-// Exports
-// ----------------------------
-export default analyzeElliott;
-export { analyzeElliott };
