@@ -226,4 +226,3 @@ ${headlines}
 }
 
 // Keep named exports exactly as expected
-export { buildAIReport, formatAIReport };
