@@ -1,4 +1,4 @@
-// utils.js — v11.0 (Live WebSocket + Multi-source + Cache + Volume Analyzer)
+// utils.js — v11.1 (Stable + Named Exports Fix)
 import axios from "axios";
 import fs from "fs";
 import path from "path";
@@ -106,7 +106,7 @@ function normCandle(k) {
 }
 
 // ---------------- Volume Strength Analyzer ----------------
-function analyzeVolume(candles) {
+export function analyzeVolume(candles) {
   if (!candles?.length) return { avg: 0, current: 0, label: "No Data" };
 
   const vols = candles.map((c) => c.vol || 0);
@@ -264,16 +264,20 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", 
 
     let res = { ok: false };
     if (isCrypto) res = await fetchCrypto(symbol, interval, limit);
-    else if (isIndian) res = await safeAxiosGet(
-      `${CONFIG.DATA_SOURCES.INDIAN.FALLBACKS.YAHOO}/v8/finance/chart/${symbol}?interval=15m&range=1d`,
-      "Yahoo(IN)",
-      (raw) => raw
-    );
-    else if (isMetal) res = await safeAxiosGet(
-      `${CONFIG.DATA_SOURCES.METALS.PRIMARY[0]}/v8/finance/chart/${symbol === "GOLD" ? "GC=F" : "SI=F"}?interval=15m&range=1d`,
-      `Yahoo(${symbol})`,
-      (raw) => raw
-    );
+    else if (isIndian)
+      res = await safeAxiosGet(
+        `${CONFIG.DATA_SOURCES.INDIAN.FALLBACKS.YAHOO}/v8/finance/chart/${symbol}?interval=15m&range=1d`,
+        "Yahoo(IN)",
+        (raw) => raw
+      );
+    else if (isMetal)
+      res = await safeAxiosGet(
+        `${CONFIG.DATA_SOURCES.METALS.PRIMARY[0]}/v8/finance/chart/${
+          symbol === "GOLD" ? "GC=F" : "SI=F"
+        }?interval=15m&range=1d`,
+        `Yahoo(${symbol})`,
+        (raw) => raw
+      );
 
     if (res.ok && res.data?.length) {
       const clean = ensureCandles(res.data);
@@ -301,4 +305,11 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", 
   }
 }
 
-export default { nowLocal, keepAlive, fetchMarketData, LiveCryptoStream };
+// ✅ Unified exports
+export default {
+  nowLocal,
+  keepAlive,
+  fetchMarketData,
+  analyzeVolume,
+  LiveCryptoStream,
+};
