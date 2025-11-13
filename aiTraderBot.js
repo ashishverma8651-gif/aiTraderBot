@@ -1,116 +1,172 @@
-// =====================================================================
-// 🚀 aiTraderBot.js — Unified AI Trader Full Core v11.5 (Render-Safe)
-// =====================================================================
+// ===============================================================
+// aiTraderBot.js — AI Trader v11.6 (Live Socket + Multi-Integration)
+// ===============================================================
 
 import express from "express";
+import WebSocket from "ws";
 import CONFIG from "./config.js";
 import { nowLocal, fetchMarketData, keepAlive } from "./utils.js";
-import { calculateRSI, calculateMACD, calculateATR } from "./core_indicators.js";
+import { calculateRSI, calculateMACD } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
-import MLModule, { runMLPrediction } from "./ml_module_v8_6.js";
+import { runMLPrediction } from "./ml_module_v8_6.js";
 import { mergeSignals } from "./merge_signals.js";
 import { fetchNews } from "./news_social.js";
 import { setupTelegramBot, sendTelegramMessage } from "./tg_commands.js";
 
-// =====================================================================
-// ⚙️ Express + KeepAlive
-// =====================================================================
-
+// ===============================================================
+// ⚙️ Core Setup
+// ===============================================================
 const app = express();
-app.get("/", (req, res) => res.send("✅ AI Trader Bot v11.5 is live and running!"));
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-keepAlive();
+let livePrice = null;
+let lastPushPrice = null;
 
-// =====================================================================
-// 📊 Data Fetch & Indicator Analysis
-// =====================================================================
+// ===============================================================
+// 📡 Live Binance Socket (btcusdt@ticker)
+// ===============================================================
+function startLiveSocket(symbol = "btcusdt") {
+  const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol}@ticker`);
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      livePrice = parseFloat(data.c).toFixed(2);
+    } catch (e) {
+      console.error("Socket parse error:", e.message);
+    }
+  });
 
-async function analyzeSymbol(symbol = "BTCUSDT") {
-  const data = await fetchMarketData(symbol);
-  const price = data?.price || 0;
-
-  const rsi = calculateRSI(data);
-  const macd = calculateMACD(data);
-  const atr = calculateATR(data);
-  const elliott = analyzeElliott(data);
-  const ml = await runMLPrediction(symbol);
-
-  return { price, rsi, macd, atr, elliott, ml };
+  ws.on("open", () => console.log(`📡 Live socket connected (${symbol})`));
+  ws.on("close", () => {
+    console.warn("⚠️ Socket closed, reconnecting...");
+    setTimeout(() => startLiveSocket(symbol), 4000);
+  });
+  ws.on("error", (err) => console.error("Socket error:", err.message));
 }
 
-// =====================================================================
-// 🧠 Build Telegram Report UI
-// =====================================================================
+// ===============================================================
+// 🧠 Build Full Report (Telegram Format)
+// ===============================================================
+export async function buildReport(symbol = "BTCUSDT") {
+  const intervals = ["1m", "5m", "15m", "30m", "1h"];
+  const source = "Binance (Live WebSocket + Multi-source)";
+  const marketData = {};
 
-async function buildReport(symbol = "BTCUSDT") {
-  try {
-    const time = nowLocal();
-    const source = CONFIG.DATA_SOURCES[0];
-    const market = await analyzeSymbol(symbol);
-    const news = await fetchNews(symbol);
+  // Historical analysis
+  for (const tf of intervals) {
+    try {
+      const candles = await fetchMarketData(symbol, tf);
+      const closes = candles.map(c => parseFloat(c.close));
+      const price = closes[closes.length - 1].toFixed(2);
+      const vol = candles[candles.length - 1].volume;
+      const rsi = calculateRSI(closes);
+      const macd = calculateMACD(closes);
+      const atr = (Math.max(...closes) - Math.min(...closes)) / 20;
 
-    // Merge signal logic
-    const merged = mergeSignals({
-      rsi: market.rsi,
-      macd: market.macd,
-      elliott: market.elliott,
-      ml: market.ml,
-    });
+      let bias = "Sideways";
+      if (rsi > 60) bias = "Bullish";
+      else if (rsi < 40) bias = "Bearish";
 
-    const report = `
-🚀 ${symbol} — AI Trader v11.5
-🕒 ${time}
-🛰️ Source: ${source.name} (${source.url})
-💰 Price: ${market.price}
+      marketData[tf] = {
+        bias, price, vol, rsi: rsi.toFixed(1), macd: macd.signal.toFixed(3), atr: atr.toFixed(3)
+      };
+    } catch (err) {
+      console.warn(`⚠️ ${tf} fetch failed: ${err.message}`);
+    }
+  }
 
-📊 1m | ${merged.trend1m || "Sideways"} | Vol: ${merged.vol1m || "N/A"}
-💵 RSI: ${market.rsi.m1} | MACD: ${market.macd.m1} | ATR: ${market.atr.m1}
+  // AI modules
+  const elliott = analyzeElliott(symbol);
+  const ml = runMLPrediction(symbol);
+  const merged = mergeSignals(symbol);
+  const overallBias = merged.bias || "Neutral";
+  const strength = merged.strength || 0;
+  const mlProb = ml.prob || 50;
 
-📊 5m | ${merged.trend5m || "Sideways"} | Vol: ${merged.vol5m || "N/A"}
-💵 RSI: ${market.rsi.m5} | MACD: ${market.macd.m5} | ATR: ${market.atr.m5}
+  // Live price fallback
+  const currentPrice = livePrice || marketData["1m"]?.price || "N/A";
 
-📊 15m | ${merged.trend15m || "Sideways"} | Vol: ${merged.vol15m || "N/A"}
-💵 RSI: ${market.rsi.m15} | MACD: ${market.macd.m15} | ATR: ${market.atr.m15}
+  // Targets
+  const TP1 = (currentPrice * 1.03).toFixed(2);
+  const TP2 = (currentPrice * 1.05).toFixed(2);
+  const TP3 = (currentPrice * 1.08).toFixed(2);
+  const SL = (currentPrice * 0.95).toFixed(2);
 
-📊 30m | ${merged.trend30m || "Sideways"} | Vol: ${merged.vol30m || "N/A"}
-💵 RSI: ${market.rsi.m30} | MACD: ${market.macd.m30} | ATR: ${market.atr.m30}
+  // News
+  const news = await fetchNews(symbol);
+  const score = news?.score || 0;
+  const impact = score > 3 ? "High" : score > 0 ? "Medium" : "Low";
+  const headlines = Array.isArray(news?.headlines)
+    ? news.headlines.slice(0, 5).map(h => `• ${h.title || h}`).join("\n")
+    : "No major headlines found.";
 
-📊 1h | ${merged.trend1h || "Sideways"} | Vol: ${merged.vol1h || "N/A"}
-💵 RSI: ${market.rsi.h1} | MACD: ${market.macd.h1} | ATR: ${market.atr.h1}
-
-───────────────────────────────
-⚙️ Overall Bias: ${merged.bias}
-💪 Strength: ${merged.strength}% | 🤖 ML Prob: ${market.ml?.probability || "N/A"}%
-🎯 TP1: ${merged.tp1} | TP2: ${merged.tp2} | TP3: ${merged.tp3} | SL: ${merged.sl}
-
-📰 News Impact: ${news?.impact || "Low"} (score: ${news?.score || 0})
-🗞️ Headlines:
-${news?.headlines?.map((h) => `• ${h}`).join("\n") || "N/A"}
-
-📡 Sources: Multi-market (config)
-───────────────────────────────
+  // 🧾 Format Telegram message (same as v11.0 style)
+  const msg = `
+🚀 <b>${symbol}</b> — AI Trader v11.6 (Live)
+🕒 ${nowLocal()}
+🛰 Source: ${source}
+💰 Price: ${currentPrice}
+━━━━━━━━━━━━━━━━━━
+${intervals.map(tf => {
+    const d = marketData[tf];
+    if (!d) return "";
+    return `📊 ${tf} | ${d.bias}\n💵 Price: ${d.price} | Vol: ${d.vol}\n📈 RSI: ${d.rsi} | MACD: ${d.macd} | ATR: ${d.atr}`;
+  }).join("\n━━━━━━━━━━━━━━━━━━\n")}
+━━━━━━━━━━━━━━━━━━
+🎯 Overall Bias: ${overallBias} | 💪 Strength: ${strength}% | 🤖 ML Prob: ${mlProb}%
+🎯 TP1: ${TP1} | TP2: ${TP2} | TP3: ${TP3} | SL: ${SL}
+🔍 Recommendation: <b>${overallBias}</b> (Conf: ${(strength + mlProb) / 2}%)
+━━━━━━━━━━━━━━━━━━
+📰 News Impact: ${impact} (score ${score})
+🗞 Top headlines:
+${headlines}
+━━━━━━━━━━━━━━━━━━
+📚 Sources: Multi-source (Live Socket + Config)
 `;
 
-    return report;
+  return msg;
+}
+
+// ===============================================================
+// 🔄 Auto-Broadcast Every 15m + Live Spike Alerts
+// ===============================================================
+async function autoBroadcast() {
+  try {
+    const report = await buildReport("BTCUSDT");
+    await sendTelegramMessage(report);
+    console.log("✅ AI Report sent successfully.");
   } catch (err) {
-    console.error("❌ buildReport error:", err);
-    return "Error while generating AI report.";
+    console.error("❌ Broadcast failed:", err.message);
   }
 }
 
-// =====================================================================
-// 🤖 Telegram Integration (Auto + Command Mode)
-// =====================================================================
+// 15 min interval loop
+setInterval(autoBroadcast, 15 * 60 * 1000);
 
-setupTelegramBot(async (msg, symbol) => {
-  const report = await buildReport(symbol || "BTCUSDT");
-  sendTelegramMessage(report);
+// Instant alert on >1% price change
+setInterval(async () => {
+  if (!livePrice || !lastPushPrice) {
+    lastPushPrice = livePrice;
+    return;
+  }
+  const change = Math.abs((livePrice - lastPushPrice) / lastPushPrice) * 100;
+  if (change >= 1) {
+    await sendTelegramMessage(`⚡ Live Price Alert: ${livePrice} (Δ ${change.toFixed(2)}%)`);
+    lastPushPrice = livePrice;
+  }
+}, 20000);
+
+// ===============================================================
+// 🌐 Server KeepAlive + Start
+// ===============================================================
+app.get("/", (req, res) => {
+  res.send(`✅ AI Trader Bot Live v11.6 | Price: ${livePrice || "Loading..."} | Source: Binance WS`);
 });
 
-// =====================================================================
-// ✅ Exports
-// =====================================================================
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  keepAlive();
+  setupTelegramBot();
+  startLiveSocket("btcusdt");
+});
 
-export { buildReport, analyzeSymbol };
-export default { buildReport, analyzeSymbol };
+export default { buildReport };
