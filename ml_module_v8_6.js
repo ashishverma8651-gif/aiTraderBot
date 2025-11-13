@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 import { calculateRSI, calculateMACD } from "./core_indicators.js";
-import analyzeElliott from "./elliott_module.js";
+import { analyzeElliott } from "./elliott_module.js";
 import { fetchMarketData, nowLocal } from "./utils.js";
 import { fetchNews } from "./news_social.js";
 
