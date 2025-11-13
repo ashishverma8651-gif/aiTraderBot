@@ -36,11 +36,14 @@ function computeFibLevels(lo, hi) {
       "0.382": hi - 0.382 * range,
       "0.5": hi - 0.5 * range,
       "0.618": hi - 0.618 * range,
+      "0.786": hi - 0.786 * range
     },
     extensions: {
       "1.272": hi + 0.272 * range,
       "1.618": hi + 0.618 * range,
     },
+    hi,
+    lo
   };
 }
 function biasFromIndicators(rsi, macd) {
