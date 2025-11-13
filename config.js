@@ -33,11 +33,7 @@ export const CONFIG = {
   // ===============================
   // 🌐 Ping & Keep-Alive URLs
   // ===============================
-  SELF_PING_URL:
-    process.env.SELF_PING_URL ||
-    "https://aitraderbot.onrender.com/ping" ||
-    "https://web-production-f70a.up.railway.app/ping?url=https://aitraderbot.onrender.com",
-
+  
 
 SERVER: {
   PORT: process.env.PORT || 10000,
