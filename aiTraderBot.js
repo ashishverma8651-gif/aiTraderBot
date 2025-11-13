@@ -7,7 +7,7 @@ import CONFIG from "./config.js";
 import express from "express";
 import axios from "axios";
 import WebSocket from "ws";
-import { runMLPrediction } from "./ml_module_v15.js";
+import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNews } from "./news_social.js";
 import { sendTelegramMessage } from "./tg_commands.js";
