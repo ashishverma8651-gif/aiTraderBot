@@ -1,7 +1,9 @@
-// utils.js — v10.3 (Multi-source + Cache + Volume Strength Analyzer)
+// utils.js — v11.0 (Live WebSocket + Multi-source + Cache + Volume Analyzer)
 import axios from "axios";
 import fs from "fs";
 import path from "path";
+import WebSocket from "ws";
+import EventEmitter from "events";
 import CONFIG from "./config.js";
 
 const CACHE_DIR = path.resolve("./cache");
@@ -20,7 +22,7 @@ export async function keepAlive(url = CONFIG.SELF_PING_URL) {
       [
         url,
         CONFIG.SELF_PING_URL,
-        ...(CONFIG.KEEP_ALIVE_URLS || []),
+        ...(CONFIG.SERVER?.KEEP_ALIVE_URLS || []),
         "https://aitraderbot.onrender.com",
       ].filter(Boolean)
     )
@@ -113,8 +115,8 @@ function analyzeVolume(candles) {
   const ratio = avg ? current / avg : 1;
 
   let label = "Normal Volume";
-  if (ratio > 1.5) label = "🔥 High Volume Spike";
-  else if (ratio > 2.5) label = "🚀 Ultra High Volume";
+  if (ratio > 2.5) label = "🚀 Ultra High Volume";
+  else if (ratio > 1.5) label = "🔥 High Volume Spike";
   else if (ratio < 0.5) label = "🧊 Low Volume";
 
   return { avg: avg.toFixed(2), current: current.toFixed(2), label, ratio: ratio.toFixed(2) };
@@ -123,8 +125,6 @@ function analyzeVolume(candles) {
 // ---------------- CONVERTER ----------------
 function ensureCandles(raw) {
   if (!raw) return [];
-
-  // Yahoo / NSE / Metals
   if (raw?.chart?.result?.[0]) {
     const r = raw.chart.result[0];
     const ts = r.timestamp || [];
@@ -142,26 +142,19 @@ function ensureCandles(raw) {
       )
       .filter((c) => c && !isNaN(c.close));
   }
-
-  // Binance
   if (Array.isArray(raw))
     return raw.map(normCandle).filter((c) => c && !isNaN(c.close)).sort((a, b) => a.t - b.t);
-
-  // fallback
   if (typeof raw === "object") {
     const arr = Object.values(raw).flat(Infinity);
     return arr.map(normCandle).filter((c) => c && !isNaN(c.close)).sort((a, b) => a.t - b.t);
   }
-
   return [];
 }
 
 // ---------------- FETCHERS ----------------
 async function fetchCrypto(symbol, interval = "15m", limit = 500) {
-  const primaries = CONFIG.CRYPTO_SOURCES?.PRIMARY || [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-  ];
+  const cryptoCfg = CONFIG.DATA_SOURCES.CRYPTO;
+  const primaries = cryptoCfg.PRIMARY;
 
   for (const base of primaries) {
     try {
@@ -178,9 +171,7 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
       console.warn("fetchCrypto error:", e.message);
     }
   }
-
-  // CoinGecko Fallback (with volume)
-  const fb = CONFIG.CRYPTO_SOURCES?.FALLBACKS || {};
+  const fb = cryptoCfg.FALLBACKS;
   if (fb.COINGECKO) {
     try {
       const url = `${fb.COINGECKO}/coins/${symbol.replace(
@@ -207,24 +198,60 @@ async function fetchCrypto(symbol, interval = "15m", limit = 500) {
       console.warn("CoinGecko fallback failed:", e.message);
     }
   }
-
   return { ok: false };
 }
 
-async function fetchIndian(symbol) {
-  const yahoo = CONFIG.FALLBACK_SOURCES?.YAHOO || "https://query1.finance.yahoo.com";
-  const url = `${yahoo}/v8/finance/chart/${symbol}?interval=15m&range=1d`;
-  return safeAxiosGet(url, "Yahoo(IN)", (raw) => raw);
-}
+// ---------------- LIVE STREAMER ----------------
+export class LiveCryptoStream extends EventEmitter {
+  constructor(symbols = ["BTCUSDT"]) {
+    super();
+    this.symbols = symbols.map((s) => s.toLowerCase());
+    this.ws = null;
+    this.reconnectTimer = null;
+    this.init();
+  }
 
-async function fetchMetals(symbol) {
-  const yahoo =
-    CONFIG.METAL_SOURCES?.PRIMARY?.[0] ||
-    CONFIG.FALLBACK_SOURCES?.YAHOO ||
-    "https://query1.finance.yahoo.com";
-  const tick = symbol === "GOLD" ? "GC=F" : "SI=F";
-  const url = `${yahoo}/v8/finance/chart/${tick}?interval=15m&range=1d`;
-  return safeAxiosGet(url, `Yahoo(${symbol})`, (raw) => raw);
+  init() {
+    const url =
+      CONFIG.DATA_SOURCES.CRYPTO.SOCKETS.MAIN +
+      "/" +
+      this.symbols.map((s) => `${s}@miniTicker`).join("/");
+    console.log("🔌 Connecting WebSocket:", url);
+    this.ws = new WebSocket(url);
+
+    this.ws.on("open", () => console.log("✅ WS Connected"));
+    this.ws.on("message", (msg) => {
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.s && data.c) {
+          const symbol = data.s.toUpperCase();
+          const price = Number(data.c);
+          this.emit("tick", { symbol, price, t: Date.now() });
+        }
+      } catch {}
+    });
+
+    this.ws.on("close", () => this.reconnect());
+    this.ws.on("error", (err) => {
+      console.warn("WS Error:", err.message);
+      this.ws.terminate();
+      this.reconnect();
+    });
+  }
+
+  reconnect() {
+    if (this.reconnectTimer) return;
+    console.warn("🔁 Reconnecting WebSocket in 10s...");
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.init();
+    }, CONFIG.DATA_SOURCES.CRYPTO.SOCKETS.RECONNECT_DELAY_MS || 10000);
+  }
+
+  close() {
+    if (this.ws) this.ws.close();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+  }
 }
 
 // ---------------- Unified Entry ----------------
@@ -237,9 +264,16 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", 
 
     let res = { ok: false };
     if (isCrypto) res = await fetchCrypto(symbol, interval, limit);
-    else if (isIndian) res = await fetchIndian(symbol);
-    else if (isMetal) res = await fetchMetals(symbol);
-    else res = await fetchCrypto(symbol, interval, limit);
+    else if (isIndian) res = await safeAxiosGet(
+      `${CONFIG.DATA_SOURCES.INDIAN.FALLBACKS.YAHOO}/v8/finance/chart/${symbol}?interval=15m&range=1d`,
+      "Yahoo(IN)",
+      (raw) => raw
+    );
+    else if (isMetal) res = await safeAxiosGet(
+      `${CONFIG.DATA_SOURCES.METALS.PRIMARY[0]}/v8/finance/chart/${symbol === "GOLD" ? "GC=F" : "SI=F"}?interval=15m&range=1d`,
+      `Yahoo(${symbol})`,
+      (raw) => raw
+    );
 
     if (res.ok && res.data?.length) {
       const clean = ensureCandles(res.data);
@@ -267,4 +301,4 @@ export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", 
   }
 }
 
-export default { nowLocal, keepAlive, fetchMarketData };
+export default { nowLocal, keepAlive, fetchMarketData, LiveCryptoStream };
