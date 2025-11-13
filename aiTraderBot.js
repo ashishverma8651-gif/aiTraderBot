@@ -1,6 +1,6 @@
 // ===============================================
-// 🤖 aiTraderBot.js — AI Trader v10.1 (Hardened & Integrated)
-// Multi-source | WebSocket Mirror | ML + Elliott + News | Auto 15m Report
+// 🤖 aiTraderBot.js — AI Trader v10.2 (Synced with tg_commands.js)
+// Multi-source | Mirror | ML + Elliott + News | Auto 15m Report
 // ===============================================
 
 import CONFIG from "./config.js";
@@ -11,17 +11,16 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNews } from "./news_social.js";
 
-// IMPORTANT: tg_commands.js must export these two functions:
-//   - buildTelegramUIReport(symbol, data)  -> returns formatted string (HTML) or object accepted by sendTelegramMessage
-//   - sendTelegramMessage(messageOrObject, chatId?) -> sends to Telegram
-import { buildTelegramUIReport, sendTelegramMessage } from "./tg_commands.js";
+// ✅ Correct imports as per your tg_commands.js exports
+// Make sure tg_commands.js has: export { buildAIReport, formatAIReport };
+import { buildAIReport, formatAIReport } from "./tg_commands.js";
 
 // ===============================================
 // 🌐 Express Keep-Alive Server
 // ===============================================
 const app = express();
-const PORT = (CONFIG?.SERVER?.PORT) || process.env.PORT || 10000;
-app.get("/", (_, res) => res.send("✅ AI Trader v10.1 running fine!"));
+const PORT = CONFIG?.SERVER?.PORT || process.env.PORT || 10000;
+app.get("/", (_, res) => res.send("✅ AI Trader v10.2 running fine!"));
 app.listen(PORT, () => console.log(`✅ Server live on port ${PORT}`));
 
 // ===============================================
@@ -31,7 +30,7 @@ let lastPrice = null;
 let ws = null;
 let socketAlive = false;
 
-const BINANCE_WS_MIRRORS = Array.isArray(CONFIG?.BINANCE_WS_MIRRORS) && CONFIG.BINANCE_WS_MIRRORS.length
+const BINANCE_WS_MIRRORS = CONFIG?.BINANCE_WS_MIRRORS?.length
   ? CONFIG.BINANCE_WS_MIRRORS
   : [
       "wss://stream.binance.com:9443/ws/",
@@ -42,7 +41,7 @@ const BINANCE_WS_MIRRORS = Array.isArray(CONFIG?.BINANCE_WS_MIRRORS) && CONFIG.B
 let wsMirrorIndex = 0;
 let wsReconnectTimer = null;
 
-function connectLiveSocket(symbol = (CONFIG?.SYMBOL || "BTCUSDT")) {
+function connectLiveSocket(symbol = CONFIG?.SYMBOL || "BTCUSDT") {
   const stream = `${symbol.toLowerCase()}@ticker`;
 
   const connect = () => {
@@ -51,10 +50,8 @@ function connectLiveSocket(symbol = (CONFIG?.SYMBOL || "BTCUSDT")) {
       const url = base.endsWith("/") ? base + stream : base + "/" + stream;
       console.log(`🔄 Connecting WebSocket: ${url}`);
 
-      // clear previous socket if exists
       if (ws) {
-        try { ws.removeAllListeners?.(); } catch (_) {}
-        try { ws.close?.(); } catch (_) {}
+        try { ws.removeAllListeners?.(); ws.close?.(); } catch (_) {}
         ws = null;
       }
 
@@ -62,83 +59,67 @@ function connectLiveSocket(symbol = (CONFIG?.SYMBOL || "BTCUSDT")) {
 
       ws.on("open", () => {
         socketAlive = true;
-        console.log(`✅ Live WebSocket connected (${url})`);
+        console.log(`✅ WebSocket connected (${url})`);
       });
 
       ws.on("message", (data) => {
         try {
-          const json = typeof data === "string" ? JSON.parse(data) : JSON.parse(data.toString());
-          // Binance ticker payload uses 'c' as last price in many streams
-          if (json && (json.c || json.price)) {
-            lastPrice = parseFloat(json.c ?? json.price);
-          }
-        } catch (err) {
-          // non-fatal parse error
-          // console.debug("WS parse error:", err.message);
-        }
+          const json = JSON.parse(data.toString());
+          if (json?.c || json?.price) lastPrice = parseFloat(json.c ?? json.price);
+        } catch {}
       });
 
       ws.on("close", (code, reason) => {
         socketAlive = false;
         console.warn(`🔴 WS closed — code=${code} reason=${String(reason).slice(0,120)}`);
-        // rotate mirror and reconnect after short delay
         wsMirrorIndex = (wsMirrorIndex + 1) % BINANCE_WS_MIRRORS.length;
-        if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
         wsReconnectTimer = setTimeout(connect, 8000);
       });
 
       ws.on("error", (err) => {
         socketAlive = false;
-        console.warn("⚠️ WS error:", err && err.message ? err.message : String(err));
+        console.warn("⚠️ WS error:", err?.message);
         try { ws.close(); } catch (_) {}
       });
     } catch (err) {
       socketAlive = false;
-      console.error("❌ connectLiveSocket fatal:", err.message || err);
-      // try again with next mirror
+      console.error("❌ connectLiveSocket fatal:", err.message);
       wsMirrorIndex = (wsMirrorIndex + 1) % BINANCE_WS_MIRRORS.length;
       setTimeout(connect, 8000);
     }
-  }; // connect
+  };
 
   connect();
 }
 
-// start WS
+// connect WS initially
 try {
   connectLiveSocket(CONFIG?.SYMBOL || "BTCUSDT");
 } catch (err) {
-  console.warn("⚠️ WebSocket startup failed:", err.message || err);
-  socketAlive = false;
+  console.warn("⚠️ WS startup failed:", err.message);
 }
 
-// periodically ensure WS is alive, else try reconnect
+// ensure WS stays alive
 setInterval(() => {
   if (!socketAlive) {
-    console.log("♻️ WS not alive — attempting reconnect...");
-    try {
-      connectLiveSocket(CONFIG?.SYMBOL || "BTCUSDT");
-    } catch (e) {
-      console.warn("♻️ Reconnect attempt failed:", e.message || e);
-    }
+    console.log("♻️ Reconnecting WebSocket...");
+    try { connectLiveSocket(CONFIG?.SYMBOL || "BTCUSDT"); } catch (e) {}
   }
-}, 60 * 1000);
+}, 60000);
 
 // ===============================================
-// 📊 Build Data Context (for tg_commands.js)
+// 📊 Market Data Context
 // ===============================================
-async function getDataContext(symbol = (CONFIG?.SYMBOL || "BTCUSDT")) {
-  // Attempt fetch from fetchMarketData (utils) - utils should implement mirror/proxy internally if needed
+async function getDataContext(symbol = CONFIG?.SYMBOL || "BTCUSDT") {
   let candlesResp = null;
   try {
     candlesResp = await fetchMarketData(symbol, "15m", 200);
   } catch (err) {
-    console.warn("⚠️ fetchMarketData error:", err.message || err);
+    console.warn("⚠️ fetchMarketData error:", err.message);
   }
 
-  const cleanCandles = (candlesResp && (candlesResp.data || candlesResp)) || [];
+  const cleanCandles = candlesResp?.data || candlesResp || [];
   if (!Array.isArray(cleanCandles) || !cleanCandles.length) {
-    // Do not throw — return partial context so UI can show an error message gracefully
     return {
       price: lastPrice || 0,
       candles: [],
@@ -151,91 +132,63 @@ async function getDataContext(symbol = (CONFIG?.SYMBOL || "BTCUSDT")) {
   }
 
   const last = cleanCandles.at(-1);
-  const price = (typeof lastPrice === "number" && !Number.isNaN(lastPrice)) ? lastPrice : (parseFloat(last.close) || 0);
+  const price = lastPrice || parseFloat(last.close) || 0;
 
-  // run ML, Elliott, News in parallel where possible
-  const tasks = {
-    ml: runMLPrediction(symbol).catch((e) => { console.warn("ML error:", e?.message || e); return null; }),
-    ell: analyzeElliott(cleanCandles).catch((e) => { console.warn("Elliott error:", e?.message || e); return null; }),
-    news: fetchNews(symbol.replace("USDT", "")).catch((e) => { console.warn("News error:", e?.message || e); return null; }),
-  };
+  const [ml, ell, news] = await Promise.all([
+    runMLPrediction(symbol).catch((e) => (console.warn("ML error:", e.message), null)),
+    analyzeElliott(cleanCandles).catch((e) => (console.warn("Elliott error:", e.message), null)),
+    fetchNews(symbol.replace("USDT", "")).catch((e) => (console.warn("News error:", e.message), null)),
+  ]);
 
-  const results = await Promise.all([tasks.ml, tasks.ell, tasks.news]);
-
-  const ml = results[0];
-  const ell = results[1];
-  const news = results[2];
-
-  return {
-    price,
-    candles: cleanCandles,
-    ml,
-    ell,
-    news,
-    socketAlive,
-  };
+  return { price, candles: cleanCandles, ml, ell, news, socketAlive };
 }
 
 // ===============================================
-// 🔁 Auto 15m Telegram Updates (uses tg_commands.js UI)
+// 🔁 Auto 15m Telegram Updates
 // ===============================================
 async function sendAutoReport() {
   try {
     const data = await getDataContext(CONFIG?.SYMBOL || "BTCUSDT");
 
-    // buildTelegramUIReport must be exported from tg_commands.js
-    // It should accept (symbol, data) and return final formatted message (string) or object.
-    if (typeof buildTelegramUIReport !== "function") {
-      throw new Error("buildTelegramUIReport() not found in tg_commands.js — ensure it is exported");
-    }
+    // ✅ buildAIReport must return a full formatted message for Telegram
+    if (typeof buildAIReport !== "function") throw new Error("buildAIReport() not found");
 
-    const report = await buildTelegramUIReport(CONFIG?.SYMBOL || "BTCUSDT", data);
+    const report = await buildAIReport(CONFIG?.SYMBOL || "BTCUSDT", data);
 
-    // sendTelegramMessage should handle either a string or object as per your tg_commands implementation
-    if (typeof sendTelegramMessage !== "function") {
-      throw new Error("sendTelegramMessage() not found in tg_commands.js — ensure it is exported");
-    }
+    // ✅ formatAIReport should handle Telegram message sending
+    if (typeof formatAIReport !== "function") throw new Error("formatAIReport() not found");
 
-    await sendTelegramMessage(report).catch((e) => {
-      // sendTelegramMessage may throw or reject
-      console.error("❌ sendTelegramMessage failed:", e?.message || e);
-    });
-
-    console.log(`✅ [${CONFIG?.SYMBOL || "BTCUSDT"}] Report sent at ${new Date().toLocaleTimeString()}`);
+    await formatAIReport(report);
+    console.log(`✅ Report sent for ${CONFIG?.SYMBOL || "BTCUSDT"} at ${new Date().toLocaleTimeString()}`);
   } catch (err) {
-    console.error("❌ Auto report error:", err?.message || err);
-    // do not crash — swallow and continue next interval
+    console.error("❌ Auto report error:", err.message);
   }
 }
 
-// schedule auto reports (15 minutes default)
-const intervalMs = CONFIG?.REPORT_INTERVAL_MS || (15 * 60 * 1000);
+// every 15 min (or CONFIG interval)
+const intervalMs = CONFIG?.REPORT_INTERVAL_MS || 15 * 60 * 1000;
 setInterval(sendAutoReport, intervalMs);
 
-// run immediately on start (wrapped)
+// first run immediately
 (async () => {
-  try {
-    await sendAutoReport();
-  } catch (e) {
-    console.warn("Initial auto report failed:", e?.message || e);
-  }
+  try { await sendAutoReport(); } catch (e) { console.warn("Initial report failed:", e.message); }
 })();
 
 // ===============================================
-// ♻️ Auto Keep-Alive Ping (Render Safe)
+// ♻️ Keep Alive Ping (Render Safe)
 // ===============================================
 if (CONFIG?.SERVER?.KEEP_ALIVE) {
   setInterval(async () => {
     try {
       const res = await keepAlive();
-      if (res && res.ok) console.log("✅ KeepAlive success ping");
+      if (res?.ok) console.log("✅ KeepAlive ping ok");
     } catch (err) {
-      console.warn("⚠️ KeepAlive ping failed:", err?.message || err);
+      console.warn("⚠️ KeepAlive failed:", err.message);
     }
   }, 5 * 60 * 1000);
 }
 
 // ===============================================
-// 🧠 Export for modular use
+// 🧠 Export for modular usage
 // ===============================================
 export default { sendAutoReport, getDataContext };
