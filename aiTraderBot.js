@@ -10,7 +10,7 @@ import { fetchMarketData, keepAlive } from "./utils.js";
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNews } from "./news_social.js";
-export { buildAIReport, formatAIReport }; from "./tg_commands.js";
+import { buildAIReport, formatAIReport }; from "./tg_commands.js";
 
 // ===============================================
 // 🌐 Express Keep-Alive Server
