@@ -14,8 +14,8 @@ import { fetchNews } from "./news_social.js";
 // ===============================================
 // 🔐 Telegram Bot Setup
 // ===============================================
-const bot = new TelegramBot(CONFIG.TG.BOT_TOKEN, { polling: true });
-const CHAT_ID = CONFIG.TG.CHAT_ID;
+const bot = new TelegramBot(CONFIG.TELEGRAM.BOT_TOKEN, { polling: true });
+const CHAT_ID = CONFIG.TELEGRAM.CHAT_ID;
 
 // ===============================================
 // ⚙️ Utility Functions
