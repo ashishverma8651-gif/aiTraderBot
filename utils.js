@@ -4,11 +4,20 @@ import path from "path";
 import { CONFIG } from "./config.js";
 
 // ==============================
-// SAFE AXIOS WRAPPER
+// SAFE AXIOS WRAPPER (with proxy + mirror)
 // ==============================
 async function safeAxiosGet(url, options = {}) {
+  const finalURL = url.replace(
+    "https://api.binance.com",
+    CONFIG.BINANCE_MIRROR || "https://api1.binance.com"
+  );
+
   try {
-    const res = await axios.get(url, { timeout: 10000, ...options });
+    const res = await axios.get(finalURL, {
+      timeout: 15000,
+      proxy: CONFIG.PROXY || false,
+      ...options,
+    });
     return res.data;
   } catch (e) {
     console.error("safeAxiosGet error:", e.message);
@@ -38,6 +47,7 @@ function loadCache(symbol, interval) {
     return [];
   }
 }
+
 function saveCache(symbol, interval, data) {
   const p = path.join(CACHE_DIR, `${symbol}_${interval}.json`);
   fs.writeFileSync(p, JSON.stringify(data, null, 2));
@@ -49,6 +59,7 @@ function saveCache(symbol, interval, data) {
 async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
   const url =
     `${CONFIG.BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+
   const out = await safeAxiosGet(url);
   if (!out) return [];
 
@@ -71,24 +82,26 @@ async function ensureCandles(symbol, interval = "15m", limit = 200) {
 
   if (!fresh.length) return old;
 
-  // replace cache with latest
   saveCache(symbol, interval, fresh);
   return fresh;
 }
 
 // ==============================
-// INDICATOR FUNCTIONS
+// INDICATORS
 // ==============================
-
-// -------- RSI ----------
 function computeRSI(candles, length = 14) {
-  let gains = 0, losses = 0;
+  if (candles.length < length + 2) return 50;
+
+  let gains = 0,
+    losses = 0;
 
   for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
     const diff = candles[i + 1].close - candles[i].close;
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
+
+  if (gains === 0 && losses === 0) return 50;
 
   const avgGain = gains / length;
   const avgLoss = losses / length || 0.00001;
@@ -99,8 +112,9 @@ function computeRSI(candles, length = 14) {
   return Number(rsi.toFixed(2));
 }
 
-// -------- ATR ----------
 function computeATR(candles, length = 14) {
+  if (candles.length < length + 1) return 0;
+
   let trs = [];
 
   for (let i = candles.length - length; i < candles.length; i++) {
@@ -120,7 +134,6 @@ function computeATR(candles, length = 14) {
   return Number((trs.reduce((a, b) => a + b, 0) / length).toFixed(2));
 }
 
-// -------- MACD ----------
 function ema(values, period) {
   const k = 2 / (period + 1);
   let emaPrev = values[0];
@@ -133,18 +146,19 @@ function ema(values, period) {
 }
 
 function computeMACD(candles) {
+  if (candles.length < 40) return 0;
+
   const closes = candles.map((c) => c.close);
 
   const ema12 = ema(closes, 12);
   const ema26 = ema(closes, 26);
 
   const macdLine = ema12.map((v, i) => v - ema26[i]);
-  const signalLine = ema(macdLine.slice(-50), 9); // last 50 candles
+  const signalLine = ema(macdLine, 9);
 
   return Number((macdLine.at(-1) - signalLine.at(-1)).toFixed(4));
 }
 
-// -------- PRICE TREND ----------
 function priceTrend(candles) {
   const last = candles.at(-1).close;
   const prev = candles.at(-2).close;
@@ -154,7 +168,6 @@ function priceTrend(candles) {
   return "FLAT";
 }
 
-// -------- VOLUME TREND ----------
 function volumeTrend(candles) {
   const last = candles.at(-1).volume;
   const prev = candles.at(-2).volume;
@@ -164,7 +177,13 @@ function volumeTrend(candles) {
   return "STABLE";
 }
 
-// -------- COMBINED SIGNAL ----------
+function analyzeVolume(candles) {
+  const vt = volumeTrend(candles);
+  if (vt === "INCREASING") return "Smart money activity possible";
+  if (vt === "DECREASING") return "Weak market interest";
+  return "Stable volume";
+}
+
 function getSignal(rsi, macd, priceT, volT) {
   let score = 0;
 
@@ -184,14 +203,12 @@ function getSignal(rsi, macd, priceT, volT) {
   return "NEUTRAL";
 }
 
-// -------- MASTER INDICATOR WRAPPER ----------
 function calculateIndicators(candles) {
   const rsi = computeRSI(candles);
   const macd = computeMACD(candles);
   const atr = computeATR(candles);
   const pt = priceTrend(candles);
   const vt = volumeTrend(candles);
-  const signal = getSignal(rsi, macd, pt, vt);
 
   return {
     rsi,
@@ -199,12 +216,13 @@ function calculateIndicators(candles) {
     atr,
     priceTrend: pt,
     volumeTrend: vt,
-    signal,
+    volumeNote: analyzeVolume(candles),
+    signal: getSignal(rsi, macd, pt, vt),
   };
 }
 
 // ==============================
-// FIBONACCI LEVELS
+// FIB LEVELS
 // ==============================
 function computeFibLevels(candles) {
   const high = Math.max(...candles.map((c) => c.high));
@@ -212,38 +230,35 @@ function computeFibLevels(candles) {
   const diff = high - low;
 
   return {
-    level_0: high,
+    high,
+    low,
     level_236: high - diff * 0.236,
     level_382: high - diff * 0.382,
     level_5: high - diff * 0.5,
     level_618: high - diff * 0.618,
     level_786: high - diff * 0.786,
-    level_1: low,
   };
 }
 
 // ==============================
-// MARKET FETCH WRAPPER (USED IN TG UI)
+// MASTER MARKET FETCH
 // ==============================
 async function fetchMarketData(symbol = "BTCUSDT") {
   const candles = await ensureCandles(symbol, "15m", 200);
   if (!candles.length) return null;
 
-  const ind = calculateIndicators(candles);
-  const fib = computeFibLevels(candles);
-
   return {
     symbol,
     price: candles.at(-1).close,
     volume: candles.at(-1).volume,
-    indicators: ind,
-    fib,
+    indicators: calculateIndicators(candles),
+    fib: computeFibLevels(candles),
     updated: nowLocal(),
   };
 }
 
 // ==============================
-// KEEP ALIVE (render.com)
+// KEEP ALIVE
 // ==============================
 async function keepAlive() {
   try {
@@ -252,22 +267,9 @@ async function keepAlive() {
 }
 
 // ==============================
-// WEBSOCKET (OPTIONAL)
-// ==============================
-class LiveCryptoStream {
-  constructor(symbol = "BTCUSDT") {
-    this.symbol = symbol;
-    this.ws = null;
-  }
-  start() {}
-  stop() {}
-}
-
-// ==============================
-// EXPORTS
+// EXPORT
 // ==============================
 export {
-  analyzeVolume,
   computeFibLevels,
   fetchCrypto,
   fetchMarketData,
@@ -277,14 +279,13 @@ export {
   computeATR,
   computeRSI,
   computeMACD,
+  analyzeVolume,
   safeAxiosGet,
-  LiveCryptoStream,
   nowLocal,
   keepAlive,
 };
 
 export default {
-  analyzeVolume,
   computeFibLevels,
   fetchCrypto,
   fetchMarketData,
@@ -294,7 +295,8 @@ export default {
   computeATR,
   computeRSI,
   computeMACD,
-  LiveCryptoStream,
+  analyzeVolume,
+  safeAxiosGet,
   nowLocal,
   keepAlive,
 };
