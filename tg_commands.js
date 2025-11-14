@@ -366,12 +366,34 @@ export async function formatAIReport(report) {
 
     // TP/SL — combine annotated targets (show top 3 longs and top 3 shorts by confidence)
     const targets = report.annotatedTargets || [];
-    // Partition longs vs shorts heuristically by comparing tp to current price
-    const longs = targets.filter(t => Number(t.tp || t.target || t.price || 0) > price).sort((a,b)=>b.confidence - a.confidence);
-    const shorts = targets.filter(t => Number(t.tp || t.target || t.price || 0) < price).sort((a,b)=>b.confidence - a.confidence);
 
-    const topLongs = longs.slice(0,3).map((t,i)=>`TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`).join(" | ") || "n/a";
-    const topShorts = shorts.slice(0,3).map((t,i)=>`TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`).join(" | ") || "n/a";
+    // Extract numeric TP cleanly
+function getTP(t) {
+  return Number(t.tp || t.target || t.price || 0);
+}
+
+// LONG = TP > price AND pattern bullish
+const longs = targets
+  .filter(t => {
+    const tp = getTP(t);
+    return tp > price;
+  })
+  .sort((a,b)=> b.confidence - a.confidence);
+
+// SHORT = TP < price OR Elliott pattern type is bearish
+const shorts = targets
+  .filter(t => {
+    const tp = getTP(t);
+    const type = (t.source || t.type || t.label || "").toLowerCase();
+
+    if (tp < price) return true;
+    if (type.includes("short") || type.includes("bear") || type.includes("down")) return true;
+
+    return false;
+  })
+  .sort((a,b)=> b.confidence - a.confidence);
+
+
 
     // Overall bias / strength
     const overallFusion = Number(report.overallFusion ?? 0);
