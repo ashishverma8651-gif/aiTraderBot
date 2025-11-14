@@ -393,6 +393,14 @@ const shorts = targets
   })
   .sort((a,b)=> b.confidence - a.confidence);
 
+// Build top display lists
+const topLongs = longs.slice(0,3).map((t,i)=>
+  `TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`
+).join(" | ") || "n/a";
+
+const topShorts = shorts.slice(0,3).map((t,i)=>
+  `TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`
+).join(" | ") || "n/a";
 
 
     // Overall bias / strength
