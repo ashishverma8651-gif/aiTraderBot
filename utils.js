@@ -416,11 +416,24 @@ export async function keepAlive() {
   }
 }
 
-// ---------- exports ----------//
-// ---------- exports ----------
-export {
-  
-  safeAxiosGet,
-  
-};
 
+
+export {
+  nowLocal,
+  safeAxiosGet,
+  fetchCrypto,
+  ensureCandles,
+  fetchMarketData,
+  fetchMultiTF,
+  computeRSI,
+  computeATR,
+  computeMACD,
+  computeFibLevels,
+  priceTrend,
+  volumeTrend,
+  analyzeVolume,
+  analyzeVolumeTrend,
+  calculateIndicators,
+  deriveSignalFromIndicators,
+  keepAlive
+};
