@@ -1,203 +1,233 @@
-// ml_module_v15.js — Upgraded Self-Learning AI Engine (v15.1)
-// Integrates: multi-market + indicators + Elliott + news + volume + feedback
-// Exports: trainModel, runMLPrediction, recordPrediction, recordOutcome, calculateAccuracy,
-//          buildSlidingDataset, evaluateModelOnSymbols, dailyRetrain, getMLDashboard
+// ml_module_v16.js — ML Engine v16 (Elliott-aware, tg_commands-friendly)
+// Exports:
+//   extractFeatures, buildSlidingDataset, trainModel, runMLPrediction,
+//   recordPrediction, recordOutcome, calculateAccuracy, evaluateModelOnSymbols,
+//   dailyRetrain, getMLDashboard
+//
+// Designed to work with:
+//  - core_indicators.js exports: computeRSI, computeMACD, computeATR, analyzeVolume, computeFibLevels
+//  - elliott_module.js export: analyzeElliott
+//  - utils.js exports: fetchMarketData, nowLocal
+//  - news_social.js (optional): fetchNews
 
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
-import { calculateRSI, calculateMACD } from "./core_indicators.js";
+import {
+  computeRSI,
+  computeMACD,
+  computeATR,
+  analyzeVolume,
+  computeFibLevels,
+} from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchMarketData, nowLocal } from "./utils.js";
 import { fetchNews } from "./news_social.js";
 
-const CACHE_DIR = path.resolve("./cache");
+const CACHE_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-const MODEL_FILE = path.join(CACHE_DIR, "ml_model_v15.json");
-const PREDICTIONS_FILE = path.join(CACHE_DIR, "ml_predictions_v15.json"); // store predictions before outcome
-const FEEDBACK_FILE = path.join(CACHE_DIR, "ml_feedback_v15.json"); // store outcomes (isCorrect)
-const HISTORY_FILE = path.join(CACHE_DIR, "ml_accuracy_v15.json");
+const MODEL_FILE = path.join(CACHE_DIR, "ml_model_v16.json");
+const PREDICTIONS_FILE = path.join(CACHE_DIR, "ml_predictions_v16.json");
+const FEEDBACK_FILE = path.join(CACHE_DIR, "ml_feedback_v16.json");
+const HISTORY_FILE = path.join(CACHE_DIR, "ml_accuracy_v16.json");
 
 const defaultOptions = {
-  epochs: CONFIG.ML?.EPOCHS ?? 25,
+  epochs: CONFIG.ML?.EPOCHS ?? 30,
   lr: CONFIG.ML?.LEARNING_RATE ?? 0.02,
-  lookback: CONFIG.ML?.LOOKBACK ?? 500,
-  horizon: 3 // prediction horizon in candles (for label generation when using sliding windows)
+  lookback: CONFIG.ML?.LOOKBACK ?? 300,
+  horizon: CONFIG.ML?.HORIZON ?? 3,
+  window: CONFIG.ML?.WINDOW ?? 60,
+  useSlidingDataset: true,
+  maxSamplesPerSymbol: 300,
 };
 
-// --------- Utilities ----------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const nowISO = () => new Date().toISOString();
-
-function safeJSONLoad(filePath, fallback = null) {
+// ------------------ Utility I/O ------------------
+function safeLoadJSON(p, fallback = null) {
   try {
-    if (!fs.existsSync(filePath)) return fallback;
-    const txt = fs.readFileSync(filePath, "utf8");
+    if (!fs.existsSync(p)) return fallback;
+    const txt = fs.readFileSync(p, "utf8");
     return txt ? JSON.parse(txt) : fallback;
   } catch (e) {
-    console.warn("ml_module_v15: safeJSONLoad err", e.message);
+    console.warn("ml_v16.safeLoadJSON:", e.message);
     return fallback;
   }
 }
-
-function safeJSONSave(filePath, data) {
+function safeSaveJSON(p, obj) {
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2));
     return true;
   } catch (e) {
-    console.warn("ml_module_v15: safeJSONSave err", e.message);
+    console.warn("ml_v16.safeSaveJSON:", e.message);
     return false;
   }
 }
+const nowISO = () => new Date().toISOString();
 
-// sigmoid / logistic helpers
+// ------------------ Math Helpers ------------------
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
-// --------- Feature Extraction (single window) ----------
-// Returns { features: Number[], close, vol, ell, news } or null
-export async function extractFeatures(symbol, interval = "1h", lookback = defaultOptions.lookback) {
+// ------------------ Feature Extraction ------------------
+/**
+ * extractFeatures(symbol, interval="1h", lookback=defaultOptions.lookback)
+ * Returns: { symbol, interval, features: Number[], close, vol, ell, news, meta }
+ */
+export async function extractFeatures(symbol = CONFIG.SYMBOL || "BTCUSDT", interval = "1h", lookback = defaultOptions.lookback) {
   try {
-    const resp = await fetchMarketData(symbol, interval, lookback);
-    const data = resp?.data;
+    const resp = await fetchMarketData(symbol, interval, Math.max(lookback, 50));
+    const data = resp?.data || resp || [];
     if (!Array.isArray(data) || data.length < 30) return null;
 
-    // basic arrays
-    const closes = data.map((c) => Number(c.close || c.c || 0));
-    const vols = data.map((c) => Number(c.vol || c.v || c.volume || 0));
+    // base arrays
+    const closes = data.map((c) => Number(c.close || 0));
+    const vols = data.map((c) => Number(c.vol || 0));
+    const n = closes.length;
 
-    // statistics
-    const avgClose = closes.reduce((a, b) => a + b, 0) / closes.length;
-    const avgVol = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
-    const volChange = (vols.at(-1) - avgVol) / (avgVol || 1);
-
-    // returns: use last window returns average
+    // basic stats
+    const lastClose = closes.at(-1);
+    const avgClose = closes.reduce((a, b) => a + b, 0) / Math.max(1, n);
     const returns = [];
     for (let i = 1; i < closes.length; i++) {
       const prev = closes[i - 1] || 1;
-      returns.push((closes[i] - prev) / prev);
+      returns.push((closes[i] - prev) / Math.max(1, Math.abs(prev)));
     }
-    const avgRet = returns.length ? returns.slice(-20).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(20, returns.length)) : 0;
+    const recentReturn = returns.slice(-10).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(10, returns.length));
+    const volAvg = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
+    const volChange = (vols.at(-1) - volAvg) / Math.max(1, volAvg);
 
-    // indicators
-    const rsiObj = calculateRSI(data, 14);
-    const rsiVal = typeof rsiObj === "number" ? rsiObj : (rsiObj?.value ?? null);
-    const macdObj = calculateMACD(data, 12, 26, 9);
-    const macdVal = macdObj?.latest?.macd ?? (Array.isArray(macdObj?.macd) ? macdObj.macd.at(-1) : null);
+    // indicators (use core_indicators)
+    const rsi = Number(computeRSI(data, 14) || 50); // 0..100
+    const macdObj = computeMACD(data); // expects {hist, line, signal}
+    const macdHist = Number(macdObj?.hist ?? 0);
+    const atr = Number(computeATR(data, 14) || 0);
 
-    // elliott
-    const ell = await analyzeElliott(data, { depth: 5 });
-    const waveBias = /[345]/.test(String(ell?.wave ?? "")) ? 1 : -1;
-    const waveConf = Number(ell?.confidence ?? 0) / 100;
+    // volume analysis
+    const volAnalysis = analyzeVolume(data);
 
-    // news
-    const news = await fetchNews(symbol.startsWith("BTC") ? "BTC" : symbol);
-    const sentiment = (news?.score ?? news?.newsImpact ?? 0) / 100; // -1..1
+    // elliott (get sentiment/confidence)
+    let ell = null;
+    try {
+      ell = await analyzeElliott(data);
+    } catch (e) {
+      ell = null;
+    }
+    const ellSent = typeof ell?.sentiment === "number" ? ell.sentiment : 0; // -1..1
+    const ellConf = Number(ell?.confidence ?? 0) / 100; // 0..1
 
-    // normalized feature vector (important: keep order and scale consistent)
+    // news (optional)
+    let news = null;
+    try {
+      news = await fetchNews ? await fetchNews(symbol.replace("USDT","")) : null;
+    } catch (e) {
+      news = null;
+    }
+    const newsScore = Number(news?.score ?? news?.newsImpact ?? 0) / 100; // normalized -1..1 or 0
+
+    // multi-tf heat features: quick fetch small tf to capture momentum (5m,15m)
+    let heat_rsi_5 = rsi, heat_rsi_15 = rsi;
+    try {
+      const r5 = await fetchMarketData(symbol, "5m", 50);
+      heat_rsi_5 = Number(computeRSI(r5?.data || [], 14) || rsi);
+      const r15 = await fetchMarketData(symbol, "15m", 100);
+      heat_rsi_15 = Number(computeRSI(r15?.data || [], 14) || rsi);
+    } catch (e) {}
+
+    // features vector (order matters)
     const features = [
-      avgRet || 0,                 // recent average return
-      volChange || 0,              // relative vol change
-      (rsiVal || 50) / 100,        // rsi normalized 0..1 (fallback 0.5)
-      (macdVal || 0) / Math.max(1, Math.abs(avgClose) || 1) / 0.01, // scaled macd (heuristic)
-      waveBias,                    // ±1
-      waveConf || 0,               // 0..1
-      sentiment || 0               // -1..1
+      recentReturn || 0,           // 0: recent return
+      volChange || 0,              // 1: relative vol change
+      (rsi || 50) / 100,           // 2: rsi normalized 0..1
+      (macdHist || 0) / Math.max(1, Math.abs(avgClose) || 1) / 0.01, // 3: scaled macd hist (heuristic)
+      (atr || 0) / Math.max(1, avgClose || 1), // 4: atr normalized to price
+      (ellSent || 0),              // 5: ell sentiment (-1..1)
+      (ellConf || 0),              // 6: ell confidence 0..1
+      (newsScore || 0),            // 7: news sentiment (-1..1)
+      (heat_rsi_5 || 50)/100,      // 8: short heat rsi
+      (heat_rsi_15 || 50)/100      // 9: 15m rsi heat
     ];
 
     return {
       symbol,
       interval,
       features,
-      close: closes.at(-1),
+      close: lastClose,
       vol: vols.at(-1),
       ell,
       news,
-      fetchedAt: nowISO()
+      meta: { fetchedAt: nowISO(), avgClose, atr }
     };
   } catch (e) {
-    console.warn("ml_module_v15.extractFeatures error:", e && e.message);
+    console.warn("ml_v16.extractFeatures err:", e?.message || e);
     return null;
   }
 }
 
-// --------- Sliding dataset builder (useful for training many samples) ---------
-// Builds labeled samples by sliding a window over historical candles.
-// horizon = number of candles ahead to compute label (e.g., 3)
-// label rule: if (future_return > threshold) label = 1 else 0
-export async function buildSlidingDataset(symbol, interval = "1h", window = 60, horizon = defaultOptions.horizon, maxSamples = 200) {
-  // Returns { X: [features...], Y: [0/1], meta: [...] }
+// ------------------ Sliding dataset builder ------------------
+/**
+ * buildSlidingDataset(symbol, interval="1h", window=60, horizon=3, maxSamples=200)
+ * Returns { X:[], Y:[], meta:[] }
+ */
+export async function buildSlidingDataset(symbol = CONFIG.SYMBOL || "BTCUSDT", interval = "1h", window = defaultOptions.window, horizon = defaultOptions.horizon, maxSamples = defaultOptions.maxSamplesPerSymbol) {
   try {
-    const resp = await fetchMarketData(symbol, interval, window + horizon + 10);
-    const data = resp?.data;
+    const resp = await fetchMarketData(symbol, interval, window + horizon + 20);
+    const data = resp?.data || [];
     if (!Array.isArray(data) || data.length < window + horizon) return null;
 
-    const X = [];
-    const Y = [];
-    const meta = [];
-
-    // For each slide position compute features and label using future horizon
+    const X = [], Y = [], meta = [];
     for (let start = 0; start + window + horizon <= data.length; start++) {
       const windowCandles = data.slice(start, start + window);
       const futureCandles = data.slice(start + window, start + window + horizon);
-      // features from windowCandles
-      const tmp = await (async () => {
-        // We call local extraction on this window by building a minimal fetch wrapper:
-        // reuse calculateRSI & calculateMACD on windowCandles directly
-        const closes = windowCandles.map((c) => Number(c.close || c.c || 0));
-        const vols = windowCandles.map((c) => Number(c.vol || c.v || c.volume || 0));
-        const avgClose = closes.reduce((a, b) => a + b, 0) / closes.length;
-        const avgVol = vols.reduce((a, b) => a + b, 0) / Math.max(1, vols.length);
-        const volChange = (vols.at(-1) - avgVol) / (avgVol || 1);
-        const returns = [];
-        for (let i = 1; i < closes.length; i++) returns.push((closes[i] - closes[i - 1]) / (closes[i - 1] || 1));
-        const avgRet = returns.length ? returns.slice(-20).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(20, returns.length)) : 0;
-        const rsiObj = calculateRSI(windowCandles, 14);
-        const rsiVal = typeof rsiObj === "number" ? rsiObj : (rsiObj?.value ?? 50);
-        const macdObj = calculateMACD(windowCandles, 12, 26, 9);
-        const macdVal = macdObj?.latest?.macd ?? (Array.isArray(macdObj?.macd) ? macdObj.macd.at(-1) : 0);
-        const ell = await analyzeElliott(windowCandles, { depth: 5 });
-        const waveBias = /[345]/.test(String(ell?.wave ?? "")) ? 1 : -1;
-        const waveConf = Number(ell?.confidence ?? 0) / 100;
-        // news (light) - don't await remote fetch per-sample to save time; set 0
-        const sentiment = 0;
-        const features = [
-          avgRet || 0,
-          volChange || 0,
-          (rsiVal || 50) / 100,
-          (macdVal || 0) / Math.max(1, Math.abs(avgClose) || 1) / 0.01,
-          waveBias,
-          waveConf || 0,
-          sentiment || 0
-        ];
-        return { features, lastClose: closes.at(-1) };
-      })();
-
-      // compute label from futureCandles
-      const futureClose = Number(futureCandles.at(-1)?.close || futureCandles.at(0)?.close || 0);
-      const lastClose = tmp.lastClose || 0;
-      const futureRet = lastClose ? (futureClose - lastClose) / lastClose : 0;
-      const label = futureRet > 0 ? 1 : 0; // simple label: future up or not
-      X.push(tmp.features);
+      // extract local features (avoid heavy network calls)
+      const closes = windowCandles.map(c => Number(c.close || 0));
+      const vols = windowCandles.map(c => Number(c.vol || 0));
+      const avgClose = closes.reduce((a,b)=>a+b,0)/Math.max(1, closes.length);
+      const returns = [];
+      for (let i=1;i<closes.length;i++) returns.push((closes[i]-closes[i-1]) / Math.max(1, Math.abs(closes[i-1])));
+      const recentReturn = returns.slice(-10).reduce((a,b)=>a+b,0)/Math.max(1, Math.min(10, returns.length));
+      const volAvg = vols.reduce((a,b)=>a+b,0)/Math.max(1, vols.length);
+      const volChange = (vols.at(-1)-volAvg)/Math.max(1, volAvg);
+      const rsiVal = Number(computeRSI(windowCandles, 14) || 50);
+      const macdObj = computeMACD(windowCandles);
+      const macdHist = Number(macdObj?.hist ?? 0);
+      const atr = Number(computeATR(windowCandles, 14) || 0);
+      // lightweight Elliott summary (sync-ish using analyzeElliott may be async heavy; call but catch)
+      let ell = null;
+      try { ell = await analyzeElliott(windowCandles); } catch (e) { ell = null; }
+      const ellSent = ell ? (ell.sentiment || 0) : 0;
+      const ellConf = ell ? (Number(ell.confidence || 0)/100) : 0;
+      // features
+      const features = [
+        recentReturn || 0,
+        volChange || 0,
+        (rsiVal || 50) / 100,
+        (macdHist || 0) / Math.max(1, Math.abs(avgClose) || 1) / 0.01,
+        (atr || 0) / Math.max(1, avgClose || 1),
+        ellSent,
+        ellConf
+      ];
+      // label from future close: up or not
+      const lastClose = closes.at(-1);
+      const futureClose = Number(futureCandles.at(-1)?.close || 0);
+      const futRet = lastClose ? (futureClose - lastClose) / Math.max(1, Math.abs(lastClose)) : 0;
+      const label = futRet > 0 ? 1 : 0;
+      X.push(features);
       Y.push(label);
-      meta.push({ symbol, interval, index: start, lastClose, futureClose, futureRet });
+      meta.push({ symbol, index: start, lastClose, futureClose, futRet });
       if (X.length >= maxSamples) break;
     }
 
     return { X, Y, meta };
   } catch (e) {
-    console.warn("ml_module_v15.buildSlidingDataset err:", e.message);
+    console.warn("ml_v16.buildSlidingDataset err:", e?.message || e);
     return null;
   }
 }
 
-// --------- Model helpers (logistic regression w/ SGD) ----------
+// ------------------ Model (logistic regression via SGD) ------------------
 function initModel(dim) {
-  const w = Array.from({ length: dim }, () => (Math.random() - 0.5) * 0.01);
-  const b = 0;
-  return { w, b, dim, trainedAt: nowISO() };
+  return { w: Array.from({ length: dim }, () => (Math.random() - 0.5) * 0.01), b: 0, dim, trainedAt: nowISO() };
 }
 function predictRaw(model, x) {
   let s = model.b || 0;
@@ -206,95 +236,82 @@ function predictRaw(model, x) {
 }
 function updateSGD(model, x, y, lr = 0.02) {
   const p = predictRaw(model, x);
-  const e = p - y; // prediction - label
-  for (let i = 0; i < model.w.length && i < x.length; i++) {
-    model.w[i] -= lr * e * (x[i] || 0);
-  }
+  const e = p - y;
+  for (let i = 0; i < model.w.length && i < x.length; i++) model.w[i] -= lr * e * (x[i] || 0);
   model.b -= lr * e;
 }
 
-// --------- Training ----------
+// ------------------ Training Entry ------------------
 /**
- * trainModel(symbols, options)
- * options: { epochs, lr, useSlidingDataset: true/false, window, horizon }
+ * trainModel(symbols = [CONFIG.SYMBOL], options = {})
+ * options: { epochs, lr, useSlidingDataset, window, horizon, interval }
  */
-export async function trainModel(symbols = [CONFIG.SYMBOL], options = {}) {
+export async function trainModel(symbols = [CONFIG.SYMBOL || "BTCUSDT"], options = {}) {
   const opts = Object.assign({}, defaultOptions, options);
-  const allX = [];
-  const allY = [];
-
-  // Build dataset: preferred method is sliding windows to increase samples
+  const allX = [], allY = [];
   for (const s of symbols) {
     try {
       if (opts.useSlidingDataset) {
-        const ds = await buildSlidingDataset(s, opts.interval || "1h", opts.window || 60, opts.horizon || opts.horizon || defaultOptions.horizon, opts.maxSamples || 200);
-        if (ds && ds.X && ds.X.length) {
-          allX.push(...ds.X);
-          allY.push(...ds.Y);
-        }
+        const ds = await buildSlidingDataset(s, opts.interval || "1h", opts.window, opts.horizon, opts.maxSamplesPerSymbol);
+        if (ds && ds.X && ds.X.length) { allX.push(...ds.X); allY.push(...ds.Y); }
       } else {
-        // fallback: single-window feature per symbol
         const f = await extractFeatures(s, opts.interval || "1h", opts.lookback);
         if (f && f.features) {
           allX.push(f.features);
-          // label: avg recent return positive?
           allY.push(f.features[0] > 0 ? 1 : 0);
         }
       }
     } catch (e) {
-      console.warn("ml_module_v15.trainModel sample build failed for", s, e.message);
+      console.warn("ml_v16.trainModel sample build failed for", s, e.message);
     }
   }
 
-  if (!allX.length) throw new Error("No training samples. Try enabling sliding dataset or add symbols.");
+  if (!allX.length) throw new Error("ml_v16.trainModel: no samples");
 
   const dim = allX[0].length;
-  let model = safeJSONLoad(MODEL_FILE, null);
+  let model = safeLoadJSON(MODEL_FILE, null);
   if (!model || model.dim !== dim) model = initModel(dim);
 
   const epochs = opts.epochs || defaultOptions.epochs;
   const lr = opts.lr || defaultOptions.lr;
 
-  // simple training loop
   for (let ep = 0; ep < epochs; ep++) {
-    // optional shuffle
     for (let i = 0; i < allX.length; i++) {
       const idx = Math.floor(Math.random() * allX.length);
-      const x = allX[idx], y = allY[idx];
-      updateSGD(model, x, y, lr);
+      updateSGD(model, allX[idx], allY[idx], lr);
     }
   }
 
   model.trainedAt = nowISO();
-  safeJSONSave(MODEL_FILE, model);
+  model.dim = dim;
+  safeSaveJSON(MODEL_FILE, model);
   return model;
 }
 
-// --------- Prediction API ----------
+// ------------------ Prediction API ------------------
 /**
  * runMLPrediction(symbol)
- * returns { symbol, prob(0..100), label, features, meta }
+ * returns { id?, symbol, label, prob, features, ell, newsImpact }
  */
-export async function runMLPrediction(symbol = CONFIG.SYMBOL) {
+export async function runMLPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT") {
   try {
-    const model = safeJSONLoad(MODEL_FILE, null);
+    const model = safeLoadJSON(MODEL_FILE, null);
     if (!model) return { error: "model_not_found" };
 
     const f = await extractFeatures(symbol, "1h", defaultOptions.lookback);
     if (!f) return { error: "no_features" };
 
     const p = predictRaw(model, f.features);
-    const pct = Math.round(p * 10000) / 100; // 0..100 with 2 decimals
+    const pct = Math.round(p * 10000) / 100; // 2 decimals
     const label = pct > 55 ? "Bullish" : pct < 45 ? "Bearish" : "Neutral";
 
-    // record prediction (so we can attach outcome later)
     const predId = await recordPrediction({
       symbol,
       predictedAt: nowISO(),
       label,
       prob: pct,
       features: f.features,
-      meta: { ell: f.ell, newsImpact: f.news?.score ?? f.news?.newsImpact }
+      meta: { ell: f.ell, newsImpact: f.news?.score ?? f.news?.newsImpact ?? 0 }
     });
 
     return {
@@ -304,45 +321,35 @@ export async function runMLPrediction(symbol = CONFIG.SYMBOL) {
       prob: pct,
       features: f.features,
       ell: f.ell,
-      newsImpact: f.news?.score ?? f.news?.newsImpact,
+      newsImpact: f.news?.score ?? f.news?.newsImpact ?? 0
     };
   } catch (e) {
-    return { error: e.message || String(e) };
+    return { error: e?.message || String(e) };
   }
 }
 
-// --------- Prediction storage & outcome recording ----------
-/**
- * recordPrediction(obj)
- * obj should contain at least: { symbol, label, prob, predictedAt, features, meta }
- * returns predictionId
- */
+// ------------------ Persistence ------------------
 export async function recordPrediction(obj = {}) {
   try {
-    const store = safeJSONLoad(PREDICTIONS_FILE, { preds: [] });
-    const id = `mlpred_${Date.now()}_${Math.floor(Math.random() * 9999)}`;
+    const store = safeLoadJSON(PREDICTIONS_FILE, { preds: [] });
+    const id = `mlpred_v16_${Date.now()}_${Math.floor(Math.random() * 9999)}`;
     const entry = Object.assign({ id, ts: Date.now() }, obj);
     store.preds = store.preds || [];
     store.preds.push(entry);
-    // keep size bounded
     if (store.preds.length > 2000) store.preds = store.preds.slice(-2000);
-    safeJSONSave(PREDICTIONS_FILE, store);
+    safeSaveJSON(PREDICTIONS_FILE, store);
     return id;
   } catch (e) {
-    console.warn("ml_module_v15.recordPrediction err:", e.message);
+    console.warn("ml_v16.recordPrediction err:", e.message);
     return null;
   }
 }
 
-/**
- * recordOutcome(predictionId, outcome)
- * outcome: { correct: boolean, realizedReturn?: number, realizedPrice?: number, note?: string }
- */
 export function recordOutcome(predictionId, outcome = {}) {
   try {
-    const preds = safeJSONLoad(PREDICTIONS_FILE, { preds: [] });
-    const p = (preds.preds || []).find((x) => x.id === predictionId);
-    const fb = safeJSONLoad(FEEDBACK_FILE, { outcomes: [] });
+    const preds = safeLoadJSON(PREDICTIONS_FILE, { preds: [] });
+    const p = (preds.preds || []).find(x => x.id === predictionId);
+    const fb = safeLoadJSON(FEEDBACK_FILE, { outcomes: [] });
     const rec = {
       predictionId,
       ts: Date.now(),
@@ -356,77 +363,73 @@ export function recordOutcome(predictionId, outcome = {}) {
     };
     fb.outcomes.push(rec);
     if (fb.outcomes.length > 5000) fb.outcomes = fb.outcomes.slice(-5000);
-    safeJSONSave(FEEDBACK_FILE, fb);
+    safeSaveJSON(FEEDBACK_FILE, fb);
     return { ok: true, rec };
   } catch (e) {
-    console.warn("ml_module_v15.recordOutcome err:", e.message);
+    console.warn("ml_v16.recordOutcome err:", e.message);
     return { ok: false, message: e.message };
   }
 }
 
-// --------- Accuracy / reporting ----------
+// ------------------ Accuracy & Eval ------------------
 export function calculateAccuracy() {
-  const fb = safeJSONLoad(FEEDBACK_FILE, { outcomes: [] });
-  if (!fb.outcomes.length) return { total: 0, accuracy: 0, lastUpdated: nowISO() };
+  const fb = safeLoadJSON(FEEDBACK_FILE, { outcomes: [] });
+  if (!fb || !fb.outcomes || !fb.outcomes.length) return { total: 0, accuracy: 0, lastUpdated: nowISO() };
   const total = fb.outcomes.length;
-  const correct = fb.outcomes.filter((o) => o.outcome?.correct).length;
+  const correct = fb.outcomes.filter(o => o.outcome?.correct).length;
   const accuracy = Math.round((correct / total) * 10000) / 100;
   const summary = { total, correct, accuracy, time: nowISO() };
-  safeJSONSave(HISTORY_FILE, summary);
+  safeSaveJSON(HISTORY_FILE, summary);
   return summary;
 }
 
-// --------- Evaluate model quickly on a set of symbols (report) ----------
-export async function evaluateModelOnSymbols(symbols = [CONFIG.SYMBOL], interval = "1h") {
-  const res = [];
-  const model = safeJSONLoad(MODEL_FILE, null);
+export async function evaluateModelOnSymbols(symbols = [CONFIG.SYMBOL || "BTCUSDT"], interval = "1h") {
+  const model = safeLoadJSON(MODEL_FILE, null);
   if (!model) return { error: "model_missing" };
+  const out = [];
   for (const s of symbols) {
     try {
       const f = await extractFeatures(s, interval);
-      if (!f) { res.push({ symbol: s, error: "no_features" }); continue; }
+      if (!f) { out.push({ symbol: s, error: "no_features" }); continue; }
       const p = predictRaw(model, f.features);
-      res.push({ symbol: s, prob: Math.round(p * 10000) / 100, features: f.features, ell: f.ell });
+      out.push({ symbol: s, prob: Math.round(p * 10000) / 100, features: f.features, ell: f.ell });
     } catch (e) {
-      res.push({ symbol: s, error: e.message });
+      out.push({ symbol: s, error: e.message });
     }
   }
-  return res;
+  return out;
 }
 
-// --------- Auto retrain job ----------
+// ------------------ Auto retrain ------------------
 export async function dailyRetrain() {
-  console.log("ml_module_v15: daily retrain started...");
-  const markets = [...(CONFIG.MARKETS?.CRYPTO || []), ...(CONFIG.MARKETS?.INDIAN || []), ...(CONFIG.MARKETS?.METALS || [])];
   try {
-    await trainModel(markets, { useSlidingDataset: true, epochs: CONFIG.ML?.EPOCHS || 25, lr: CONFIG.ML?.LEARNING_RATE || 0.02, window: 60, horizon: 3, maxSamples: 300 });
+    const symbols = CONFIG.MARKETS?.CRYPTO || [CONFIG.SYMBOL || "BTCUSDT"];
+    await trainModel(symbols, { useSlidingDataset: true, epochs: CONFIG.ML?.EPOCHS || 20, lr: CONFIG.ML?.LEARNING_RATE || 0.02, window: 60, horizon: defaultOptions.horizon, maxSamplesPerSymbol: 200 });
     const acc = calculateAccuracy();
-    console.log("ml_module_v15: retrain complete. accuracy:", acc);
     return acc;
   } catch (e) {
-    console.warn("ml_module_v15.dailyRetrain failed:", e.message);
-    return { error: e.message };
+    return { error: e.message || String(e) };
   }
 }
 
-// --------- dashboard ----------
+// ------------------ Dashboard ------------------
 export function getMLDashboard() {
-  const model = safeJSONLoad(MODEL_FILE, {});
-  const acc = safeJSONLoad(HISTORY_FILE, {});
-  const fb = safeJSONLoad(FEEDBACK_FILE, { outcomes: [] });
+  const model = safeLoadJSON(MODEL_FILE, { dim: 0, trainedAt: null });
+  const acc = safeLoadJSON(HISTORY_FILE, {});
+  const fb = safeLoadJSON(FEEDBACK_FILE, { outcomes: [] });
   return {
     modelAge: model.trainedAt || "never",
     modelDim: model.dim || 0,
     accuracy: acc.accuracy ?? acc.acc ?? 0,
-    feedbackSamples: fb.outcomes.length,
+    feedbackSamples: fb.outcomes?.length || 0,
     lastUpdated: acc.time || nowISO()
   };
 }
 
-// --------- default export ----------
+// default export
 export default {
-  buildSlidingDataset,
   extractFeatures,
+  buildSlidingDataset,
   trainModel,
   runMLPrediction,
   recordPrediction,
