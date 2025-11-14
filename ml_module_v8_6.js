@@ -18,7 +18,7 @@ import {
   computeMACD,
   computeATR,
   analyzeVolume,
-  computeFibLevels,
+  
 
 } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
