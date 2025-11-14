@@ -1,9 +1,12 @@
-// tg_commands.js — Option-B UI (per-TF compact blocks) + Elliott integration (Integrated: Fusion, TP confidence, Buy/Sell %)
+// tg_commands.js — Option-B UI (per-TF compact blocks) + Elliott + ML integration
 import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
 import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
+
+// ML imports (your ML module must implement these)
+import { runMLPrediction, getRecentMLAccuracy } from "./ml_module_v8_6.js";
 
 // Telegram init
 const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
@@ -254,6 +257,32 @@ export async function buildAIReport(symbol = "BTCUSDT", context = null) {
     const overallFusion = computeOverallFusion(mtf);
     const probs = computeBuySellProb(overallFusion, mtf);
 
+    // -------- ML Prediction using 15m candles --------
+    let ml = { bias: "N/A", probability: 0, confidence: 0, lastAccuracy: 0 };
+    try {
+      const tf15 = mtf.find(m => m.tf === "15m");
+      if (tf15 && Array.isArray(tf15.candles) && tf15.candles.length > 20) {
+        // runMLPrediction should accept (symbol, candles15m) — adapt inside ml_module_v8_6.js if needed
+        const mlRes = await runMLPrediction(symbol, tf15.candles).catch((e) => {
+          console.warn("runMLPrediction error:", e?.message || e);
+          return null;
+        });
+        if (mlRes) {
+          ml.bias = mlRes.bias ?? (mlRes.label ?? "N/A");
+          ml.probability = typeof mlRes.prob === "number" ? mlRes.prob : (typeof mlRes.probability === "number" ? mlRes.probability : (mlRes.probabilityPct ?? 0));
+          ml.confidence = typeof mlRes.confidence === "number" ? mlRes.confidence : ml.probability;
+        }
+        // get recent accuracy if implementation exists
+        try {
+          const acc = await getRecentMLAccuracy(symbol).catch(()=>null);
+          if (typeof acc === "number") ml.lastAccuracy = acc;
+          else if (acc && typeof acc.accuracy === "number") ml.lastAccuracy = acc.accuracy;
+        } catch {}
+      }
+    } catch (e) {
+      console.error("ML integration error:", e?.message || e);
+    }
+
     // assemble top-level summary
     const generatedAt = new Date().toISOString();
     const price = mtf.find(x=>x.tf==="15m")?.price || mtf[0]?.price || 0;
@@ -295,6 +324,7 @@ export async function buildAIReport(symbol = "BTCUSDT", context = null) {
       sellProb: probs.sell,
       ellConsensus: probs.ellAvg,
       annotatedTargets,
+      ml,            // ML included here
       generatedAt
     };
   } catch (e) {
@@ -347,6 +377,9 @@ export async function formatAIReport(report) {
     const buyProb = Number(report.buyProb ?? 0);
     const sellProb = Number(report.sellProb ?? 0);
 
+    // ML block
+    const ml = report.ml || { bias: "N/A", probability: 0, confidence: 0, lastAccuracy: 0 };
+
     // Final HTML message (old-premium style but per-TF blocks)
     const html = `
 🚀 <b>${report.symbol} — AI Trader (single-file, Option-B UI)</b>
@@ -377,8 +410,12 @@ ${topShorts}
 
 📐 Fib Zone (15m): ${ (mtf.find(x=>x.tf==='15m')?.fib) ? `${nf(mtf.find(x=>x.tf==='15m').fib.lo,2)} - ${nf(mtf.find(x=>x.tf==='15m').fib.hi,2)}` : "N/A" }
 
+🧠 <b>ML Prediction (15m)</b>
+Bias: <b>${ml.bias}</b>
+Probability: <b>${ml.probability}%</b> | Confidence: <b>${ml.confidence}%</b>
+Last Accuracy: <b>${ml.lastAccuracy}%</b>
+
 📰 News Impact: Placeholder (hook your news module)
-ML: Placeholder (hook your ML module)
 
 <i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | vSingleFile | UI: Option-B per TF</i>
 `.trim();
