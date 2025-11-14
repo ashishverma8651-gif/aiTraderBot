@@ -1,336 +1,300 @@
-// utils.js — v11.2 (Stable + computeFibLevels Export Added)
 import axios from "axios";
 import fs from "fs";
 import path from "path";
-import WebSocket from "ws";
-import EventEmitter from "events";
-import CONFIG from "./config.js";
+import { CONFIG } from "./config.js";
 
-const CACHE_DIR = path.resolve("./cache");
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
-const CACHE_FILE = CONFIG.CACHE_FILE || path.join(CACHE_DIR, "marketData.json");
-const AXIOS_TIMEOUT = 10000;
-
-// ---------------- TIME ----------------
-export const nowLocal = () =>
-  new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-
-// ---------------- KEEP ALIVE ----------------
-export async function keepAlive(url = CONFIG.SELF_PING_URL) {
-  const urls = Array.from(
-    new Set(
-      [
-        url,
-        CONFIG.SELF_PING_URL,
-        ...(CONFIG.SERVER?.KEEP_ALIVE_URLS || []),
-        "https://aitraderbot.onrender.com",
-      ].filter(Boolean)
-    )
-  );
-
-  for (const u of urls) {
-    try {
-      const res = await axios.get(u, { timeout: AXIOS_TIMEOUT });
-      if (res.status === 200) {
-        console.log("🌐 KeepAlive OK →", u);
-        return { ok: true };
-      }
-    } catch (e) {
-      console.warn("⚠️ KeepAlive failed →", u, e.message);
-    }
-  }
-
-  return { ok: false };
-}
-
-// ---------------- CACHE ----------------
-function saveCache(sym, data) {
+// ==============================
+// SAFE AXIOS WRAPPER
+// ==============================
+async function safeAxiosGet(url, options = {}) {
   try {
-    let cache = {};
-    if (fs.existsSync(CACHE_FILE)) {
-      cache = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8") || "{}");
-    }
-    cache[sym] = { ts: Date.now(), data };
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
+    const res = await axios.get(url, { timeout: 10000, ...options });
+    return res.data;
   } catch (e) {
-    console.warn("Cache save failed:", e.message);
+    console.error("safeAxiosGet error:", e.message);
+    return null;
   }
 }
-function readCache() {
+
+// ==============================
+// BASIC TIME HELPERS
+// ==============================
+function nowLocal() {
+  return new Date().toLocaleString("en-IN", { hour12: false });
+}
+
+// ==============================
+// CANDLE CACHE SYSTEM
+// ==============================
+const CACHE_DIR = "./cache";
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
+
+function loadCache(symbol, interval) {
+  const p = path.join(CACHE_DIR, `${symbol}_${interval}.json`);
+  if (!fs.existsSync(p)) return [];
   try {
-    if (!fs.existsSync(CACHE_FILE)) return {};
-    return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8") || "{}");
+    return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch {
-    return {};
-  }
-}
-
-// ---------------- SAFE FETCH ----------------
-async function safeAxiosGet(url, label, transform) {
-  try {
-    const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
-    if (res.status !== 200) throw new Error("HTTP " + res.status);
-    const out = transform(res.data);
-    if (Array.isArray(out) && out.length) return { ok: true, data: out, source: label };
-    if (out?.data?.length) return { ok: true, data: out.data, source: label };
-    throw new Error("No usable data");
-  } catch (e) {
-    console.warn(`❌ ${label} failed:`, e.message);
-    return { ok: false };
-  }
-}
-
-// ---------------- NORMALIZER ----------------
-function normCandle(k) {
-  if (!k) return null;
-  if (Array.isArray(k)) {
-    return {
-      t: Number(k[0]) || 0,
-      open: Number(k[1]) || 0,
-      high: Number(k[2]) || 0,
-      low: Number(k[3]) || 0,
-      close: Number(k[4]) || 0,
-      vol: Number(k[5]) || 0,
-    };
-  }
-  if (typeof k === "object") {
-    return {
-      t: Number(k.t ?? k.time ?? k.timestamp ?? 0),
-      open: Number(k.open ?? k.o ?? 0),
-      high: Number(k.high ?? k.h ?? 0),
-      low: Number(k.low ?? k.l ?? 0),
-      close: Number(k.close ?? k.c ?? 0),
-      vol: Number(k.vol ?? k.v ?? k.volume ?? 0),
-    };
-  }
-  return null;
-}
-
-// ---------------- Volume Strength Analyzer ----------------
-export function analyzeVolume(candles) {
-  if (!candles?.length) return { avg: 0, current: 0, label: "No Data" };
-
-  const vols = candles.map((c) => c.vol || 0);
-  const avg = vols.reduce((a, b) => a + b, 0) / vols.length;
-  const current = vols.at(-1);
-  const ratio = avg ? current / avg : 1;
-
-  let label = "Normal Volume";
-  if (ratio > 2.5) label = "🚀 Ultra High Volume";
-  else if (ratio > 1.5) label = "🔥 High Volume Spike";
-  else if (ratio < 0.5) label = "🧊 Low Volume";
-
-  return { avg: avg.toFixed(2), current: current.toFixed(2), label, ratio: ratio.toFixed(2) };
-}
-
-// ---------------- Fibonacci Levels ----------------
-export function computeFibLevels(high, low) {
-  if (typeof high !== "number" || typeof low !== "number" || high <= low) {
     return [];
   }
+}
+function saveCache(symbol, interval, data) {
+  const p = path.join(CACHE_DIR, `${symbol}_${interval}.json`);
+  fs.writeFileSync(p, JSON.stringify(data, null, 2));
+}
 
+// ==============================
+// FETCH CANDLES FROM BINANCE
+// ==============================
+async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
+  const url =
+    `${CONFIG.BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const out = await safeAxiosGet(url);
+  if (!out) return [];
+
+  return out.map((k) => ({
+    time: k[0],
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+  }));
+}
+
+// ==============================
+// ENSURE CANDLE DATA (CACHE + LIVE)
+// ==============================
+async function ensureCandles(symbol, interval = "15m", limit = 200) {
+  let old = loadCache(symbol, interval);
+  const fresh = await fetchCrypto(symbol, interval, limit);
+
+  if (!fresh.length) return old;
+
+  // replace cache with latest
+  saveCache(symbol, interval, fresh);
+  return fresh;
+}
+
+// ==============================
+// INDICATOR FUNCTIONS
+// ==============================
+
+// -------- RSI ----------
+function computeRSI(candles, length = 14) {
+  let gains = 0, losses = 0;
+
+  for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
+    const diff = candles[i + 1].close - candles[i].close;
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+
+  const avgGain = gains / length;
+  const avgLoss = losses / length || 0.00001;
+
+  const rs = avgGain / avgLoss;
+  const rsi = 100 - 100 / (1 + rs);
+
+  return Number(rsi.toFixed(2));
+}
+
+// -------- ATR ----------
+function computeATR(candles, length = 14) {
+  let trs = [];
+
+  for (let i = candles.length - length; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1]?.close || candles[i].close;
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+
+    trs.push(tr);
+  }
+
+  return Number((trs.reduce((a, b) => a + b, 0) / length).toFixed(2));
+}
+
+// -------- MACD ----------
+function ema(values, period) {
+  const k = 2 / (period + 1);
+  let emaPrev = values[0];
+  const out = [];
+  for (let v of values) {
+    emaPrev = v * k + emaPrev * (1 - k);
+    out.push(emaPrev);
+  }
+  return out;
+}
+
+function computeMACD(candles) {
+  const closes = candles.map((c) => c.close);
+
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
+
+  const macdLine = ema12.map((v, i) => v - ema26[i]);
+  const signalLine = ema(macdLine.slice(-50), 9); // last 50 candles
+
+  return Number((macdLine.at(-1) - signalLine.at(-1)).toFixed(4));
+}
+
+// -------- PRICE TREND ----------
+function priceTrend(candles) {
+  const last = candles.at(-1).close;
+  const prev = candles.at(-2).close;
+
+  if (last > prev) return "UP";
+  if (last < prev) return "DOWN";
+  return "FLAT";
+}
+
+// -------- VOLUME TREND ----------
+function volumeTrend(candles) {
+  const last = candles.at(-1).volume;
+  const prev = candles.at(-2).volume;
+
+  if (last > prev) return "INCREASING";
+  if (last < prev) return "DECREASING";
+  return "STABLE";
+}
+
+// -------- COMBINED SIGNAL ----------
+function getSignal(rsi, macd, priceT, volT) {
+  let score = 0;
+
+  if (rsi < 30) score += 1;
+  if (rsi > 70) score -= 1;
+
+  if (macd > 0) score += 1;
+  else score -= 1;
+
+  if (priceT === "UP") score += 1;
+  if (priceT === "DOWN") score -= 1;
+
+  if (volT === "INCREASING") score += 1;
+
+  if (score >= 2) return "BUY";
+  if (score <= -2) return "SELL";
+  return "NEUTRAL";
+}
+
+// -------- MASTER INDICATOR WRAPPER ----------
+function calculateIndicators(candles) {
+  const rsi = computeRSI(candles);
+  const macd = computeMACD(candles);
+  const atr = computeATR(candles);
+  const pt = priceTrend(candles);
+  const vt = volumeTrend(candles);
+  const signal = getSignal(rsi, macd, pt, vt);
+
+  return {
+    rsi,
+    macd,
+    atr,
+    priceTrend: pt,
+    volumeTrend: vt,
+    signal,
+  };
+}
+
+// ==============================
+// FIBONACCI LEVELS
+// ==============================
+function computeFibLevels(candles) {
+  const high = Math.max(...candles.map((c) => c.high));
+  const low = Math.min(...candles.map((c) => c.low));
   const diff = high - low;
-  return [
-    { level: 0, value: low },
-    { level: 0.236, value: high - diff * 0.236 },
-    { level: 0.382, value: high - diff * 0.382 },
-    { level: 0.5, value: high - diff * 0.5 },
-    { level: 0.618, value: high - diff * 0.618 },
-    { level: 0.786, value: high - diff * 0.786 },
-    { level: 1, value: high },
-  ];
+
+  return {
+    level_0: high,
+    level_236: high - diff * 0.236,
+    level_382: high - diff * 0.382,
+    level_5: high - diff * 0.5,
+    level_618: high - diff * 0.618,
+    level_786: high - diff * 0.786,
+    level_1: low,
+  };
 }
 
-// ---------------- CONVERTER ----------------
-function ensureCandles(raw) {
-  if (!raw) return [];
-  if (raw?.chart?.result?.[0]) {
-    const r = raw.chart.result[0];
-    const ts = r.timestamp || [];
-    const quotes = r.indicators?.quote?.[0];
-    return ts
-      .map((t, i) =>
-        normCandle({
-          t: t * 1000,
-          open: quotes.open?.[i],
-          high: quotes.high?.[i],
-          low: quotes.low?.[i],
-          close: quotes.close?.[i],
-          vol: quotes.volume?.[i],
-        })
-      )
-      .filter((c) => c && !isNaN(c.close));
-  }
-  if (Array.isArray(raw))
-    return raw.map(normCandle).filter((c) => c && !isNaN(c.close)).sort((a, b) => a.t - b.t);
-  if (typeof raw === "object") {
-    const arr = Object.values(raw).flat(Infinity);
-    return arr.map(normCandle).filter((c) => c && !isNaN(c.close)).sort((a, b) => a.t - b.t);
-  }
-  return [];
+// ==============================
+// MARKET FETCH WRAPPER (USED IN TG UI)
+// ==============================
+async function fetchMarketData(symbol = "BTCUSDT") {
+  const candles = await ensureCandles(symbol, "15m", 200);
+  if (!candles.length) return null;
+
+  const ind = calculateIndicators(candles);
+  const fib = computeFibLevels(candles);
+
+  return {
+    symbol,
+    price: candles.at(-1).close,
+    volume: candles.at(-1).volume,
+    indicators: ind,
+    fib,
+    updated: nowLocal(),
+  };
 }
 
-// ---------------- FETCHERS ----------------
-async function fetchCrypto(symbol, interval = "15m", limit = 500) {
-  const cryptoCfg = CONFIG.DATA_SOURCES.CRYPTO;
-  const primaries = cryptoCfg.PRIMARY;
-
-  for (const base of primaries) {
-    try {
-      const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-      const out = await safeAxiosGet(url, `Binance(${base})`, (raw) => raw);
-      if (out.ok) {
-        const clean = ensureCandles(out.data);
-        if (clean.length) {
-          const volStats = analyzeVolume(clean);
-          return { ok: true, data: clean, source: `Binance(${base})`, volume: volStats };
-        }
-      }
-    } catch (e) {
-      console.warn("fetchCrypto error:", e.message);
-    }
-  }
-
-  const fb = cryptoCfg.FALLBACKS;
-  if (fb.COINGECKO) {
-    try {
-      const url = `${fb.COINGECKO}/coins/${symbol.replace(
-        "USDT",
-        ""
-      ).toLowerCase()}/market_chart?vs_currency=usd&days=1`;
-      const out = await safeAxiosGet(url, "CoinGecko", (raw) => {
-        if (!raw?.prices?.length) return [];
-        return raw.prices.map((p, i) => [
-          p[0],
-          p[1],
-          p[1],
-          p[1],
-          p[1],
-          raw.total_volumes?.[i]?.[1] || 0,
-        ]);
-      });
-      if (out.ok) {
-        const clean = ensureCandles(out.data);
-        const volStats = analyzeVolume(clean);
-        return { ok: true, data: clean, source: "CoinGecko", volume: volStats };
-      }
-    } catch (e) {
-      console.warn("CoinGecko fallback failed:", e.message);
-    }
-  }
-  return { ok: false };
-}
-
-// ---------------- LIVE STREAMER ----------------
-export class LiveCryptoStream extends EventEmitter {
-  constructor(symbols = ["BTCUSDT"]) {
-    super();
-    this.symbols = symbols.map((s) => s.toLowerCase());
-    this.ws = null;
-    this.reconnectTimer = null;
-    this.init();
-  }
-
-  init() {
-    const url =
-      CONFIG.DATA_SOURCES.CRYPTO.SOCKETS.MAIN +
-      "/" +
-      this.symbols.map((s) => `${s}@miniTicker`).join("/");
-    console.log("🔌 Connecting WebSocket:", url);
-    this.ws = new WebSocket(url);
-
-    this.ws.on("open", () => console.log("✅ WS Connected"));
-    this.ws.on("message", (msg) => {
-      try {
-        const data = JSON.parse(msg.toString());
-        if (data.s && data.c) {
-          const symbol = data.s.toUpperCase();
-          const price = Number(data.c);
-          this.emit("tick", { symbol, price, t: Date.now() });
-        }
-      } catch {}
-    });
-
-    this.ws.on("close", () => this.reconnect());
-    this.ws.on("error", (err) => {
-      console.warn("WS Error:", err.message);
-      this.ws.terminate();
-      this.reconnect();
-    });
-  }
-
-  reconnect() {
-    if (this.reconnectTimer) return;
-    console.warn("🔁 Reconnecting WebSocket in 10s...");
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.init();
-    }, CONFIG.DATA_SOURCES.CRYPTO.SOCKETS.RECONNECT_DELAY_MS || 10000);
-  }
-
-  close() {
-    if (this.ws) this.ws.close();
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-  }
-}
-
-// ---------------- Unified Entry ----------------
-export async function fetchMarketData(symbol = CONFIG.SYMBOL, interval = "15m", limit = 500) {
+// ==============================
+// KEEP ALIVE (render.com)
+// ==============================
+async function keepAlive() {
   try {
-    console.log(`⏳ Fetching ${symbol}...`);
-    const isCrypto = symbol.endsWith("USDT");
-    const isIndian = (CONFIG.MARKETS?.INDIAN || []).includes(symbol);
-    const isMetal = (CONFIG.MARKETS?.METALS || []).includes(symbol);
-
-    let res = { ok: false };
-    if (isCrypto) res = await fetchCrypto(symbol, interval, limit);
-    else if (isIndian)
-      res = await safeAxiosGet(
-        `${CONFIG.DATA_SOURCES.INDIAN.FALLBACKS.YAHOO}/v8/finance/chart/${symbol}?interval=15m&range=1d`,
-        "Yahoo(IN)",
-        (raw) => raw
-      );
-    else if (isMetal)
-      res = await safeAxiosGet(
-        `${CONFIG.DATA_SOURCES.METALS.PRIMARY[0]}/v8/finance/chart/${
-          symbol === "GOLD" ? "GC=F" : "SI=F"
-        }?interval=15m&range=1d`,
-        `Yahoo(${symbol})`,
-        (raw) => raw
-      );
-
-    if (res.ok && res.data?.length) {
-      const clean = ensureCandles(res.data);
-      const volStats = analyzeVolume(clean);
-      saveCache(symbol, clean);
-      console.log(`✅ ${symbol} data OK (${clean.length} candles, ${res.source})`);
-      return { data: clean, source: res.source, volume: volStats };
-    }
-
-    const cache = readCache();
-    if (cache[symbol]?.data?.length) {
-      console.log("♻️ Using cache for", symbol);
-      const volStats = analyzeVolume(cache[symbol].data);
-      return { data: cache[symbol].data, source: "cache", volume: volStats };
-    }
-
-    console.warn("⚠️ No data found for", symbol);
-    return { data: [], source: "error" };
-  } catch (e) {
-    console.error("❌ fetchMarketData error:", e.message);
-    const cache = readCache();
-    if (cache[symbol]?.data)
-      return { data: cache[symbol].data, source: "cache", volume: analyzeVolume(cache[symbol].data) };
-    return { data: [], source: "error" };
-  }
+    await axios.get(`https://${CONFIG.RENDER_URL}`);
+  } catch {}
 }
 
-// ✅ Unified exports
-export default {
-  nowLocal,
-  keepAlive,
-  fetchMarketData,
+// ==============================
+// WEBSOCKET (OPTIONAL)
+// ==============================
+class LiveCryptoStream {
+  constructor(symbol = "BTCUSDT") {
+    this.symbol = symbol;
+    this.ws = null;
+  }
+  start() {}
+  stop() {}
+}
+
+// ==============================
+// EXPORTS
+// ==============================
+export {
   analyzeVolume,
   computeFibLevels,
+  fetchCrypto,
+  fetchMarketData,
+  priceTrend,
+  volumeTrend,
+  calculateIndicators,
+  computeATR,
+  computeRSI,
+  computeMACD,
+  safeAxiosGet,
   LiveCryptoStream,
+  nowLocal,
+  keepAlive,
+};
+
+export default {
+  analyzeVolume,
+  computeFibLevels,
+  fetchCrypto,
+  fetchMarketData,
+  priceTrend,
+  volumeTrend,
+  calculateIndicators,
+  computeATR,
+  computeRSI,
+  computeMACD,
+  LiveCryptoStream,
+  nowLocal,
+  keepAlive,
 };
