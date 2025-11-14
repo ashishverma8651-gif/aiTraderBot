@@ -513,4 +513,62 @@ ${headlines}
 }
 
 // -------- Get Data Context (candles + ML + Elliott + News) ----------
-async function getDataContext(symbol = SYM
+async function getDataContext(symbol = SYMBOL) {
+  try {
+    const candlesResp = await fetchMarketData(symbol, "15m", DEFAULT_LIMIT).catch(e => {
+      console.warn("fetchMarketData(15m) error:", e?.message || e);
+      return null;
+    });
+
+    const candles = (candlesResp && candlesResp.data) || [];
+    if (!candles || candles.length === 0) {
+      return { price: lastPrice || 0, candles: [], ml: null, ell: null, news: null, socketAlive, error: "No candles" };
+    }
+
+    const last = candles.at(-1);
+    const price = (typeof lastPrice === "number" && !Number.isNaN(lastPrice)) ? lastPrice : (Number(last.close) || 0);
+
+    // trigger ML/Elliott/News in parallel if modules are available, else null
+    const mlP = (typeof runMLPrediction === "function") ? runMLPrediction(symbol).catch(e => { console.warn("ML err:", e?.message || e); return null; }) : Promise.resolve(null);
+    const ellP = (typeof analyzeElliott === "function") ? analyzeElliott(candles).catch(e => { console.warn("Elliott err:", e?.message || e); return null; }) : Promise.resolve(null);
+    const newsP = (typeof fetchNews === "function") ? fetchNews(symbol.replace("USDT", "")).catch(e => { console.warn("News err:", e?.message || e); return null; }) : Promise.resolve(null);
+
+    const [ml, ell, news] = await Promise.all([mlP, ellP, newsP]);
+
+    return { price, candles, ml, ell, news, socketAlive };
+  } catch (e) {
+    console.error("getDataContext error:", e?.message || e);
+    return { price: lastPrice || 0, candles: [], ml: null, ell: null, news: null, socketAlive, error: e?.message || String(e) };
+  }
+}
+
+// -------- Auto 15m report job (build -> format -> send) ----------
+async function sendAutoReport() {
+  try {
+    const ctx = await getDataContext(SYMBOL);
+    const report = await buildAIReport(SYMBOL, ctx);
+    await formatAIReport(report);
+    console.log(`Report sent for ${SYMBOL} @ ${new Date().toLocaleString()}`);
+  } catch (e) {
+    console.error("sendAutoReport error:", e?.message || e);
+  }
+}
+
+// schedule
+setInterval(sendAutoReport, REPORT_INTERVAL_MS);
+
+// immediate start
+(async () => {
+  try { await sendAutoReport(); } catch (e) { console.warn("initial report failed:", e?.message || e); }
+})();
+
+// Express server for keep-alive (optional)
+const app = express();
+const PORT = Number(ENV.PORT) || 10000;
+app.get("/", (req, res) => res.send("✅ aiTraderBot single-file running"));
+app.listen(PORT, () => console.log(`Server listening ${PORT}`));
+
+// Export in case user wants to import functions
+export default { sendAutoReport, getDataContext, fetchMarketData, computeRSI, computeMACD, computeATR };
+
+// End of file
