@@ -1,7 +1,7 @@
-// utils.js — Final hardened v1.0
+// utils.js — Final hardened v1.1
 // Compatible with aiTraderBot.js (v10.2) + tg_commands.js (Option-3)
 // - fetchMarketData(symbol, interval, limit)
-// - analyzeVolumeTrend(candles)
+// - analyzeVolume(candles), analyzeVolumeTrend(candles)
 // - computeFibLevels(candles) OR computeFibLevels(low, high)
 // - safe network + cache + mirrors + proxy
 // - Exports stable names
@@ -9,7 +9,7 @@
 import axios from "axios";
 import fs from "fs";
 import path from "path";
-import { CONFIG } from "./config.js";
+import CONFIG from "./config.js"; // use default import for consistency across project
 
 // ---------- constants ----------
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
@@ -233,6 +233,25 @@ export function analyzeVolumeTrend(candles = []) {
   return "stable";
 }
 
+// ---------- analyzeVolume (added for core_indicators compatibility) ----------
+export function analyzeVolume(candles = []) {
+  try {
+    if (!Array.isArray(candles) || !candles.length) return { avg: 0, current: 0, label: "No Data", ratio: 1 };
+    const vols = candles.map((c) => Number(c.vol ?? c.volume ?? 0));
+    const avg = vols.reduce((a, b) => a + b, 0) / vols.length;
+    const current = vols.at(-1) ?? 0;
+    const ratio = avg ? current / avg : 1;
+    let label = "Normal Volume";
+    if (ratio > 2.5) label = "🚀 Ultra High Volume";
+    else if (ratio > 1.5) label = "🔥 High Volume Spike";
+    else if (ratio < 0.5) label = "🧊 Low Volume";
+    return { avg: Number(avg.toFixed(2)), current: Number(current.toFixed(2)), label, ratio: Number(ratio.toFixed(2)) };
+  } catch (e) {
+    console.warn("analyzeVolume error:", e.message || e);
+    return { avg: 0, current: 0, label: "Error", ratio: 1 };
+  }
+}
+
 // calculateIndicators wrapper (returns mapping expected by tg_commands)
 export function calculateIndicators(candles = []) {
   try {
@@ -261,6 +280,7 @@ export function computeFibLevels(a, b) {
     let low, high;
     if (Array.isArray(a)) {
       const candles = a;
+      if (!candles.length) return null;
       high = Math.max(...candles.map(c => c.high));
       low = Math.min(...candles.map(c => c.low));
     } else {
@@ -376,6 +396,27 @@ export default {
   computeFibLevels,
   calculateIndicators,
   analyzeVolumeTrend,
+  analyzeVolume,
+  priceTrend,
+  volumeTrend,
+  deriveSignalFromIndicators,
+  keepAlive
+};
+
+export {
+  safeAxiosGet,
+  nowLocal,
+  fetchCrypto,
+  ensureCandles,
+  fetchMarketData,
+  fetchMultiTF,
+  computeRSI,
+  computeATR,
+  computeMACD,
+  computeFibLevels,
+  calculateIndicators,
+  analyzeVolumeTrend,
+  analyzeVolume,
   priceTrend,
   volumeTrend,
   deriveSignalFromIndicators,
