@@ -1,286 +1,405 @@
-// tg_commands.js — A-Type Premium UI (Old Style) + Heatmap + Multi-TF Elliott + AutoTrend + SmartSignal + ML/Elliott fusion
+// tg_commands.js — Option-B UI (per-TF compact blocks) + Elliott integration (Integrated: Fusion, TP confidence, Buy/Sell %)
 import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
 import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
-import { runMLPrediction } from "./ml_module_v8_6.js"; // best-effort import
 
-const BOT_TOKEN = CONFIG.TELEGRAM.BOT_TOKEN || process.env.BOT_TOKEN;
-const CHAT_ID = CONFIG.TELEGRAM.CHAT_ID || process.env.CHAT_ID;
+// Telegram init
+const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
+const CHAT_ID = CONFIG?.TELEGRAM?.CHAT_ID || process.env.CHAT_ID;
 const bot = BOT_TOKEN ? new TelegramBot(BOT_TOKEN, { polling: false }) : null;
 
-// ------------------------
-// Helpers
-// ------------------------
-function safeToFixed(v, d=2){ return (typeof v === 'number' && Number.isFinite(v)) ? v.toFixed(d) : "N/A"; }
-function emojiHeat(score){
-  // score -1..1 -> red/yellow/green
-  if (score >= 0.35) return "🟩";
-  if (score >= 0.1) return "🟨";
-  return "🟥";
-}
-function sentimentLabel(score){
-  if (score > 0.05) return `Bullish (${(score*100).toFixed(1)}%)`;
-  if (score < -0.05) return `Bearish (${(score*100).toFixed(1)}%)`;
-  return `Neutral (${(score*100).toFixed(1)}%)`;
+// Helper: safe number / readable
+const nf = (v, d = 2) => (typeof v === "number" && Number.isFinite(v)) ? v.toFixed(d) : "N/A";
+const bold = (s) => `<b>${s}</b>`;
+
+// Fusion label mapping (Option B: Strong Buy / Buy / Neutral / Sell / Strong Sell)
+function fusionLabel(score) {
+  // score: -1 .. +1
+  if (score >= 0.70) return { label: "Strong Buy", emoji: "🚀" };
+  if (score >= 0.20) return { label: "Buy", emoji: "🟢" };
+  if (score > -0.20 && score < 0.20) return { label: "Neutral", emoji: "⚪" };
+  if (score <= -0.20 && score > -0.70) return { label: "Sell", emoji: "🔴" };
+  return { label: "Strong Sell", emoji: "⛔" };
 }
 
-// produce basic trendlines from pivots (pair consecutive highs or lows into lines)
-function computeTrendlinesFromPivots(pivots){
-  const highs = pivots.filter(p=>p.type==='H');
-  const lows = pivots.filter(p=>p.type==='L');
-  const lines = [];
-  // take last 3 highs and lows
-  if (highs.length >= 2){
-    const lastHighs = highs.slice(-3);
-    for (let i=0;i<lastHighs.length-1;i++){
-      lines.push({ type: 'resistance', fromIdx: lastHighs[i].idx, toIdx: lastHighs[i+1].idx, y1: lastHighs[i].price, y2: lastHighs[i+1].price });
-    }
-  }
-  if (lows.length >= 2){
-    const lastLows = lows.slice(-3);
-    for (let i=0;i<lastLows.length-1;i++){
-      lines.push({ type: 'support', fromIdx: lastLows[i].idx, toIdx: lastLows[i+1].idx, y1: lastLows[i].price, y2: lastLows[i+1].price });
-    }
-  }
-  return lines;
-}
-
-// Smart Signal: combine deterministic indicator score + Elliott sentiment + ML prob
-function computeSmartSignal({indicatorSignal, ellSentiment=0, mlPrediction=null}){
-  // indicatorSignal: "BUY"/"SELL"/"NEUTRAL"
+// Fusion scoring (simple normalized combination)
+function computeFusionScore(indObj, ellObj) {
+  // indObj: { RSI, MACD: {hist}, ATR, priceTrend, volumeTrend }
+  // ellObj: { sentiment (-1..1) or scoring via analyzeElliott -> sentiment, confidence }
   let score = 0;
-  if (indicatorSignal === 'BUY') score += 30;
-  if (indicatorSignal === 'SELL') score -= 30;
-  // Elliott sentiment - range [-1,1] -> scale +/-40
-  score += (ellSentiment || 0) * 40;
-  // ML prediction: {label, prob} label "UP"/"DOWN"/"BUY"/"SELL" or "LONG"/"SHORT"
-  if (mlPrediction && typeof mlPrediction.prob === 'number'){
-    const p = mlPrediction.prob; // 0..1 or percentage
-    const prob = p > 1 ? p/100 : p;
-    const lab = (mlPrediction.label || "").toString().toUpperCase();
-    if (lab.includes("BUY") || lab.includes("UP") || lab.includes("LONG")) score += prob * 40;
-    if (lab.includes("SELL") || lab.includes("DOWN") || lab.includes("SHORT")) score -= prob * 40;
+  let weight = 0;
+
+  try {
+    // RSI: bullish when >60, bearish <40, scale -1..1
+    const rsi = Number(indObj?.RSI ?? 50);
+    const rsiScore = ((rsi - 50) / 50); // -1..+1
+    score += rsiScore * 0.4; weight += 0.4;
+
+    // MACD hist sign: positive => bullish
+    const macdh = Number(indObj?.MACD?.hist ?? 0);
+    const macdScore = Math.tanh(macdh / Math.max(1, Math.abs(indObj?.ATR || 1))); // soft scale
+    score += macdScore * 0.35; weight += 0.35;
+
+    // Price trend small boost
+    const pt = indObj?.priceTrend === "UP" ? 0.15 : indObj?.priceTrend === "DOWN" ? -0.15 : 0;
+    score += pt; weight += 0.15;
+
+    // Volume trend adjust
+    const vt = (indObj?.volumeTrend === "INCREASING") ? 0.08 : (indObj?.volumeTrend === "DECREASING") ? -0.08 : 0;
+    score += vt; weight += 0.08;
+
+    // Elliott sentiment (from analyzeElliott -> sentiment: -1..1)
+    const ellSent = Number(ellObj?.sentiment ?? 0);
+    const ellConf = Math.min(1, Number(ellObj?.confidence ?? 0) / 100);
+    score += ellSent * (0.25 * ellConf); weight += 0.25 * ellConf;
+
+    // Normalize to -1..1
+    const normalized = Math.max(-1, Math.min(1, score / Math.max(0.0001, weight)));
+    return Number(normalized.toFixed(3));
+  } catch (e) {
+    return 0;
   }
-  // scoring thresholds
-  if (score >= 35) return { label: "STRONG BUY", score };
-  if (score >= 10) return { label: "BUY", score };
-  if (score <= -35) return { label: "STRONG SELL", score };
-  if (score <= -10) return { label: "SELL", score };
-  return { label: "NEUTRAL", score };
 }
 
-// Helper: try to run ML, fallback gracefully
-async function tryRunML(symbol, candles15){
-  try{
-    // Many ML modules accept candles or symbol; try symbol first then candles
-    if (typeof runMLPrediction === 'function'){
-      // try symbol
-      const r = await runMLPrediction(symbol).catch(()=>null);
-      if (r && (r.prob !== undefined || r.confidence !== undefined)) return r;
-      // fallback if pass candles supported
-      const r2 = await runMLPrediction(candles15).catch(()=>null);
-      if (r2 && (r2.prob !== undefined || r2.confidence !== undefined)) return r2;
+// Compute overall fusion (weighted across timeframes)
+function computeOverallFusion(mtf) {
+  // assign weights by TF importance
+  const weights = { "1m": 0.05, "5m": 0.1, "15m": 0.4, "30m": 0.2, "1h": 0.25 };
+  let s = 0, wsum = 0;
+  for (const m of mtf) {
+    const score = Number(m.fusionScore ?? 0);
+    const w = weights[m.tf] ?? 0.1;
+    s += score * w;
+    wsum += w;
+  }
+  const overall = wsum ? s / wsum : 0;
+  return Number(Math.max(-1, Math.min(1, overall)).toFixed(3));
+}
+
+// Calculate buy/sell probabilities from fusion + ell signals
+function computeBuySellProb(overallFusion, mtf) {
+  // baseline from fusion: map -1..1 to 0..100 buy prob
+  let buy = (overallFusion + 1) / 2 * 100; // 0..100
+  let sell = 100 - buy;
+
+  // boost from Elliott consensus: average ell.sentiment weighted by their confidences
+  let ellSum = 0, ellW = 0;
+  for (const m of mtf) {
+    const ell = m.ell;
+    if (ell && typeof ell.sentiment === "number" && typeof ell.confidence === "number") {
+      const conf = Math.min(100, Math.max(0, ell.confidence));
+      ellSum += ell.sentiment * (conf / 100);
+      ellW += (conf / 100);
     }
-  } catch(e){}
+  }
+  const ellAvg = ellW ? (ellSum / ellW) : 0; // -1..1
+
+  // nudge buy/sell by up to ±10% depending on ellAvg
+  const nudge = ellAvg * 10; // -10 .. +10
+  buy = buy + nudge;
+  sell = 100 - buy;
+
+  // also incorporate number of bullish vs bearish TFs (fusion sign majority)
+  const bullishTFs = mtf.filter(m => (m.fusionScore ?? 0) > 0.2).length;
+  const bearishTFs = mtf.filter(m => (m.fusionScore ?? 0) < -0.2).length;
+  const biasDiff = bullishTFs - bearishTFs;
+  if (biasDiff > 0) {
+    buy += Math.min(8, biasDiff * 2); // small bonus
+  } else if (biasDiff < 0) {
+    sell += Math.min(8, Math.abs(biasDiff) * 2);
+  }
+
+  // clamp 0..100 and normalize
+  buy = Math.max(0, Math.min(100, buy));
+  sell = Math.max(0, Math.min(100, sell));
+  // minor renormalize so sum=100
+  const sum = buy + sell;
+  if (sum > 0) {
+    buy = Math.round((buy / sum) * 10000) / 100;
+    sell = Math.round((sell / sum) * 10000) / 100;
+  } else {
+    buy = 50; sell = 50;
+  }
+
+  return { buy, sell, ellAvg: Number(ellAvg.toFixed(3)) };
+}
+
+// Build per-TF block string
+function buildTFBlock(tf, price, ind, vol, ellSummary, fusionScore, fib) {
+  const fusion = fusionLabel(fusionScore);
+  const rsi = typeof ind.RSI === "number" ? ind.RSI.toFixed(1) : "N/A";
+  const macd = typeof ind.MACD?.hist === "number" ? ind.MACD.hist.toFixed(4) : "N/A";
+  const atr = typeof ind.ATR === "number" ? ind.ATR.toFixed(2) : "N/A";
+  const volTxt = vol?.status || "N/A";
+
+  // Trendlines compact (Option A): single-line resistance/support from pivots/ell
+  const support = ellSummary?.support ? nf(ellSummary.support, 2) : (fib?.lo ? nf(fib.lo, 2) : "N/A");
+  const resistance = ellSummary?.resistance ? nf(ellSummary.resistance, 2) : (fib?.hi ? nf(fib.hi, 2) : "N/A");
+
+  return `
+<b>【${tf.toUpperCase()}】 ${fusion.emoji} ${fusion.label}</b>
+💰 Price: <b>${nf(price,2)}</b>  |  📊 Vol: ${volTxt}
+RSI: <b>${rsi}</b> | MACD: <b>${macd}</b> | ATR: <b>${atr}</b>
+Structure: support:${support} | resistance:${resistance}
+Fusion Score: ${fusionScore}
+`.trim();
+}
+
+// Build heatmap top row (compact)
+function buildHeatmap(mtfData) {
+  // Map per-tf fusion to color emoji
+  const tfOrder = ["1m","5m","15m","30m","1h"];
+  const mapEmoji = (s) => {
+    if (s >= 0.7) return "🟩";
+    if (s >= 0.2) return "🟦";
+    if (s > -0.2 && s < 0.2) return "🟨";
+    if (s <= -0.2 && s > -0.7) return "🟧";
+    return "🟥";
+  };
+  const parts = tfOrder.map(tf => {
+    const blk = mtfData.find(x => x.tf === tf);
+    const score = blk ? blk.fusionScore ?? 0 : 0;
+    return `${tf.toUpperCase()}:${mapEmoji(score)}`;
+  });
+  return `<b>Elliott MultiTF Heatmap</b>\n` + parts.join(" | ");
+}
+
+// Helper: safe call analyzeElliott and extract quick support/resistance from pivots
+async function safeElliottForCandles(candles) {
+  try {
+    const ell = await analyzeElliott(candles);
+    if (!ell || !ell.ok) return { ok:false, error: ell?.error || "elliott_err" };
+    // build simple support/res from last pivots: use last wave pivots
+    const pivots = ell.pivots || [];
+    const lastHigh = pivots.filter(p=>p.type==='H').slice(-1)[0];
+    const lastLow = pivots.filter(p=>p.type==='L').slice(-1)[0];
+    const support = lastLow ? lastLow.price : null;
+    const resistance = lastHigh ? lastHigh.price : null;
+    return { ok:true, ell, support, resistance };
+  } catch (e) {
+    return { ok:false, error: e.message || String(e) };
+  }
+}
+
+// Helper: pick TP confidence for a target
+function resolveTargetConfidence(target, ell) {
+  // prefer explicit confidence reported by Elliott target or pattern
+  if (target && typeof target.confidence === "number") return Math.max(0, Math.min(100, target.confidence));
+  // fallback to ell global confidence
+  if (ell && typeof ell.confidence === "number") return Math.max(0, Math.min(100, ell.confidence));
+  // final heuristic: use 40 + (abs(fusionScore)*60) in caller when needed
   return null;
 }
 
-// ------------------------
-// Build Report (multi-TF + ell per TF)
-// ------------------------
-export async function buildAIReport(symbol = "BTCUSDT", context = null){
-  const tfs = ["1m","5m","15m","30m","1h"];
-  const mtfRaw = await fetchMultiTF(symbol, tfs).catch(()=> ({}));
-  const mtf = [];
+// ========== Public: buildAIReport ==========
+export async function buildAIReport(symbol = "BTCUSDT", context = null) {
+  try {
+    // fetch multi-TF data
+    const tfs = ["1m","5m","15m","30m","1h"];
+    const mtfRaw = await fetchMultiTF(symbol, tfs);
+    const mtf = [];
 
-  for (const tf of tfs){
-    const entry = mtfRaw[tf] || { data: [], price:0 };
-    const candles = entry.data || [];
-    const indicatorsObj = {
-      RSI: indicators.computeRSI ? indicators.computeRSI(candles) : null,
-      MACD: indicators.computeMACD ? indicators.computeMACD(candles) : { hist: 0 },
-      ATR: indicators.calculateATR ? indicators.calculateATR(candles) : (indicators.computeATR ? indicators.computeATR(candles) : 0),
-      priceTrend: candles.length >=2 ? (candles.at(-1).close > candles.at(-2).close ? "UP" : (candles.at(-1).close < candles.at(-2).close ? "DOWN" : "FLAT")) : "FLAT",
-      volumeTrend: indicators.volumeTrend ? indicators.volumeTrend(candles) : "STABLE"
-    };
-    const vol = indicators.analyzeVolume ? indicators.analyzeVolume(candles) : { status: "N/A" };
+    // gather per-tf analysis
+    for (const tf of tfs) {
+      const entry = mtfRaw[tf] || { data: [], price: 0 };
+      const candles = entry.data || [];
+      const price = (typeof entry.price === "number" && entry.price) ? entry.price : (candles?.at(-1)?.close ?? 0);
 
-    // run Elliott per TF if module present
-    let ell = null;
-    try{ ell = await analyzeElliott(candles, { atrPeriod:14 }).catch(()=>null); }catch(e){ ell = null; }
+      // indicators (use core_indicators API; ensure functions exist in your core_indicators)
+      const ind = {
+        RSI: indicators.computeRSI ? indicators.computeRSI(candles) : (indicators.computeRSI_fromCandles ? indicators.computeRSI_fromCandles(candles) : 50),
+        MACD: indicators.computeMACD ? indicators.computeMACD(candles) : { hist: 0, line:0, signal:0 },
+        ATR: indicators.computeATR ? indicators.computeATR(candles) : 0,
+        priceTrend: (candles.length >= 2) ? (candles.at(-1).close > candles.at(-2).close ? "UP" : (candles.at(-1).close < candles.at(-2).close ? "DOWN" : "FLAT")) : "FLAT",
+        volumeTrend: indicators.volumeTrend ? indicators.volumeTrend(candles) : "STABLE"
+      };
 
-    // build
-    mtf.push({
-      tf,
-      candles,
-      price: entry.price || 0,
-      indicators: indicatorsObj,
-      vol,
-      ell
+      const vol = indicators.analyzeVolume ? indicators.analyzeVolume(candles) : { status: "UNKNOWN", strength: 0 };
+
+      // elliott (safe)
+      const ellRes = await safeElliottForCandles(candles);
+      const ell = ellRes.ok ? ellRes.ell : null;
+
+      // fibs (use computeFibLevels which expects candles) - safe fallback names
+      let fib = null;
+      try {
+        if (typeof indicators.computeFibLevels === "function") fib = indicators.computeFibLevels(candles);
+        else if (typeof indicators.computeFibLevelsFromCandles === "function") fib = indicators.computeFibLevelsFromCandles(candles);
+        else fib = null;
+      } catch (e) { fib = null; }
+
+      // compute fusion score (indicators + ell)
+      const fusionScore = computeFusionScore(ind, ell || { sentiment: 0, confidence: 0 });
+
+      // quick targets from Elliott module (if available)
+      const rawTargets = (ell && Array.isArray(ell.targets)) ? ell.targets.slice(0,5) : [];
+
+      // annotate target confidences
+      const targets = rawTargets.map(t => {
+        const conf = resolveTargetConfidence(t, ell);
+        return Object.assign({}, t, { confidence: conf });
+      });
+
+      mtf.push({
+        tf, price, candles,
+        indicators: ind, vol,
+        ell, ellSummary: { support: ellRes?.support || null, resistance: ellRes?.resistance || null },
+        fib, fusionScore, targets
+      });
+    }
+
+    // compute overall fusion + buy/sell probabilities
+    const overallFusion = computeOverallFusion(mtf);
+    const probs = computeBuySellProb(overallFusion, mtf);
+
+    // assemble top-level summary
+    const generatedAt = new Date().toISOString();
+    const price = mtf.find(x=>x.tf==="15m")?.price || mtf[0]?.price || 0;
+
+    // aggregate top targets (dedupe by approximate price)
+    const allTargets = mtf.flatMap(m => (m.targets || []).map(t => ({ ...t, tf: m.tf })));
+    // dedupe by rounding
+    const uniqMap = new Map();
+    for (const t of allTargets) {
+      const key = Math.round((t.tp || t.target || t?.price || 0));
+      if (!uniqMap.has(key)) uniqMap.set(key, t);
+      else {
+        // merge confidences preferring higher
+        const prev = uniqMap.get(key);
+        const best = (t.confidence || 0) > (prev.confidence || 0) ? t : prev;
+        uniqMap.set(key, best);
+      }
+    }
+    const uniqTargets = Array.from(uniqMap.values()).slice(0, 6);
+
+    // produce TP list with confidence: if missing, heuristicize via fusion+ell
+    const annotatedTargets = uniqTargets.map(t => {
+      let conf = t.confidence;
+      if (conf == null) {
+        // heuristic: base 40 + abs(overallFusion)*40 + (ell.confidence*0.2)
+        const ellConfAvg = mtf.reduce((acc,m)=>acc + (m.ell?.confidence||0),0) / Math.max(1, mtf.length);
+        conf = Math.round(Math.max(10, Math.min(99, 40 + Math.abs(overallFusion) * 40 + (ellConfAvg * 0.2))));
+      }
+      return Object.assign({}, t, { confidence: Math.round(conf) });
     });
+
+    return {
+      ok: true,
+      symbol,
+      price,
+      mtf,
+      overallFusion,
+      buyProb: probs.buy,
+      sellProb: probs.sell,
+      ellConsensus: probs.ellAvg,
+      annotatedTargets,
+      generatedAt
+    };
+  } catch (e) {
+    return { ok:false, error: e.message || String(e) };
   }
-
-  // quick ML run for symbol using 15m candles if available (fusion)
-  const candles15 = mtf.find(x=>x.tf==="15m")?.candles || [];
-  const ml = await tryRunML(symbol, candles15);
-
-  return {
-    symbol,
-    price: mtf.find(x=>x.tf==="15m")?.price || mtf[0]?.price || 0,
-    mtf,
-    ml,
-    generatedAt: new Date().toISOString()
-  };
 }
 
-// ------------------------
-// Format + Send (old UI + new sections)
-// ------------------------
-export async function formatAIReport(report){
-  const price = Number(report.price || 0);
-
-  // --- Multi-TF block (old UI) ---
-  const tfBlock = report.mtf.map(m => {
-    const RSI = (m.indicators.RSI !== null && m.indicators.RSI !== undefined) ? Number(m.indicators.RSI).toFixed(1) : "N/A";
-    const MACD = (m.indicators.MACD && m.indicators.MACD.hist !== undefined) ? Number(m.indicators.MACD.hist).toFixed(4) : "N/A";
-    const ATR = (m.indicators.ATR !== null && m.indicators.ATR !== undefined) ? Number(m.indicators.ATR).toFixed(2) : "N/A";
-    const VOL = m.vol?.status || "N/A";
-
-    // derive simple indicator signal
-    let signal = "HOLD";
-    if (m.indicators.RSI && m.indicators.MACD && typeof m.indicators.MACD.hist === 'number') {
-      if (m.indicators.RSI < 35 && m.indicators.MACD.hist > 0) signal = "BUY";
-      else if (m.indicators.RSI > 65 && m.indicators.MACD.hist < 0) signal = "SELL";
+// ========== Public: formatAIReport ==========
+export async function formatAIReport(report) {
+  try {
+    if (!report || !report.ok) {
+      const txt = `Error building report: ${report?.error || "unknown"}`;
+      if (bot && CHAT_ID) try { await bot.sendMessage(CHAT_ID, txt); } catch {}
+      return txt;
     }
 
-    let badge = "⚪";
-    if (signal === "BUY") badge = "🟢";
-    if (signal === "SELL") badge = "🔴";
+    const price = Number(report.price || 0);
+    const mtf = report.mtf || [];
 
-    return `
-<b>【${m.tf.toUpperCase()}】 ${badge} ${signal}</b>
-💰 Price: <b>${m.price}</b>  |  📊 Vol: ${VOL}
-RSI: <b>${RSI}</b> | MACD: <b>${MACD}</b> | ATR: <b>${ATR}</b>
-`;
-  }).join(`\n──────────────\n`);
+    // Heatmap
+    const heat = buildHeatmap(mtf);
 
-  // --- Multi-TF Elliott: collect sentiment per TF and trendlines ---
-  const ellSummaries = [];
-  const heatScores = [];
-  const trendlineSummaries = [];
-  for (const m of report.mtf){
-    const ell = m.ell;
-    if (ell && ell.ok){
-      ellSummaries.push({ tf: m.tf, sentiment: ell.sentiment, confidence: ell.confidence, patterns: ell.patterns.length });
-      heatScores.push({ tf: m.tf, score: ell.sentiment || 0 });
-      // compute trendlines from pivots
-      const lines = computeTrendlinesFromPivots(ell.pivots || []);
-      const tSumm = lines.slice(0,3).map(l => `${l.type}:${safeToFixed(l.y1,2)}->${safeToFixed(l.y2,2)}`).join(", ") || "n/a";
-      trendlineSummaries.push({ tf: m.tf, lines: tSumm });
-    } else {
-      heatScores.push({ tf: m.tf, score: 0 });
-      trendlineSummaries.push({ tf: m.tf, lines: "n/a" });
+    // Per-TF blocks assembled into single body but per-TF (Option-B: one block per TF)
+    const tfBlocks = mtf.map(m => {
+      const block = buildTFBlock(m.tf, m.price, m.indicators || {}, m.vol || {}, m.ellSummary || {}, m.fusionScore || 0, m.fib || null);
+      return block;
+    }).join("\n\n──────────────\n\n");
+
+    // Elliott summary
+    let ellSummaryText = "Elliott: N/A (placeholder)";
+    const firstEll = mtf.find(m => m.ell && (m.ell.patterns?.length || m.ell.targets?.length));
+    if (firstEll && firstEll.ell) {
+      const conf = firstEll.ell.confidence ?? firstEll.ell.conf ?? 0;
+      ellSummaryText = `Elliott MultiTF (best): Conf ${conf}% | Patterns: ${firstEll.ell.patterns?.length || 0}`;
     }
-  }
 
-  // build heatmap string row
-  const heatRow = heatScores.map(h => `${h.tf.toUpperCase()}:${emojiHeat(h.score)}`).join("  ");
+    // TP/SL — combine annotated targets (show top 3 longs and top 3 shorts by confidence)
+    const targets = report.annotatedTargets || [];
+    // Partition longs vs shorts heuristically by comparing tp to current price
+    const longs = targets.filter(t => Number(t.tp || t.target || t.price || 0) > price).sort((a,b)=>b.confidence - a.confidence);
+    const shorts = targets.filter(t => Number(t.tp || t.target || t.price || 0) < price).sort((a,b)=>b.confidence - a.confidence);
 
-  // Compact Elliott text
-  const ellText = ellSummaries.length
-    ? ellSummaries.map(e => `${e.tf.toUpperCase()}: ${sentimentLabel(e.sentiment)} | Conf:${e.confidence}% | P:${e.patterns}`).join("\n")
-    : "<i>No Elliott data</i>";
+    const topLongs = longs.slice(0,3).map((t,i)=>`TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`).join(" | ") || "n/a";
+    const topShorts = shorts.slice(0,3).map((t,i)=>`TP${i+1}: ${nf(Number(t.tp||t.target||t.price||0),2)} (${t.source||t.type||t.tf||'Elliott'}) [${t.confidence}%]`).join(" | ") || "n/a";
 
-  // trendlines summary
-  const trendText = trendlineSummaries.map(t => `${t.tf.toUpperCase()}: ${t.lines}`).join("\n");
+    // Overall bias / strength
+    const overallFusion = Number(report.overallFusion ?? 0);
+    const biasLabel = fusionLabel(overallFusion).label;
+    const biasEmoji = fusionLabel(overallFusion).emoji;
+    const buyProb = Number(report.buyProb ?? 0);
+    const sellProb = Number(report.sellProb ?? 0);
 
-  // Smart Signals: compute per TF using indicators+Elliott+ML
-  const ml = report.ml || null;
-  const smartPerTF = report.mtf.map(m=>{
-    const indicatorSignal = (()=>{
-      if (m.indicators.RSI && m.indicators.MACD && typeof m.indicators.MACD.hist === 'number') {
-        if (m.indicators.RSI < 35 && m.indicators.MACD.hist > 0) return "BUY";
-        if (m.indicators.RSI > 65 && m.indicators.MACD.hist < 0) return "SELL";
-      }
-      return "NEUTRAL";
-    })();
-    const ellSent = (m.ell && m.ell.ok) ? (m.ell.sentiment || 0) : 0;
-    const fused = computeSmartSignal({ indicatorSignal, ellSentiment: ellSent, mlPrediction: ml });
-    return { tf: m.tf, indicator: indicatorSignal, ell: ellSent, ml: (ml ? (ml.label || "N/A") : "N/A"), smart: fused };
-  });
-
-  const smartText = smartPerTF.map(s => `${s.tf.toUpperCase()}: ${s.smart.label} (score:${Math.round(s.smart.score)})`).join("\n");
-
-  // ML fusion summary
-  const mlText = ml ? `ML: ${ml.label || "N/A"} | Prob: ${ (ml.prob!==undefined? ( (ml.prob>1)? `${ml.prob}%` : (ml.prob*100).toFixed(1)+"%") : (ml.confidence? `${ml.confidence}%` : "N/A")) }` : "ML: not available";
-
-  // TP/SL: combine 15m ell targets + fallback ATR * multiples
-  const ell15 = report.mtf.find(x=>x.tf==="15m")?.ell;
-  let tpsText = "TP: n/a";
-  let slText = "SL: n/a";
-  if (ell15 && ell15.ok){
-    const ts = (ell15.targets || []).slice(0,3).map((t,i)=>`TP${i+1}:${safeToFixed(t.tp,2)} (${t.source})`).join(" | ");
-    const ss = (ell15.stops || []).slice(0,1).map(s=>`SL:${safeToFixed(s.sl,2)} (${s.source})`).join(" | ");
-    if (ts) tpsText = ts;
-    if (ss) slText = ss;
-  } else {
-    // fallback using ATR 15m
-    const atr15 = report.mtf.find(x=>x.tf==="15m")?.indicators?.ATR || 0;
-    if (atr15){
-      tpsText = `TP1:${safeToFixed(price + atr15*1.5,2)} | TP2:${safeToFixed(price + atr15*3,2)} | TP3:${safeToFixed(price + atr15*5,2)}`;
-      slText = `SL:${safeToFixed(price - atr15*2,2)}`;
-    }
-  }
-
-  const fib15 = report.mtf.find(x => x.tf === "15m")?.fib;
-  const fibText = fib15 ? `${fib15.lo} - ${fib15.hi}` : "N/A";
-
-  // Final UI text (old style but extended)
-  const text = `
-🚀 <b>${report.symbol} — AI Trader v11 (A-Type + Fusion)</b>
+    // Final HTML message (old-premium style but per-TF blocks)
+    const html = `
+🚀 <b>${report.symbol} — AI Trader (single-file, Option-B UI)</b>
 ${new Date(report.generatedAt).toLocaleString()}
-Source: Multi (Binance Vision + backups)
-Price: <b>${price.toFixed(2)}</b>
+Source: Multi (Binance Vision + Backups)
+Price: <b>${nf(price,2)}</b>
 
-📈 <b>Elliott MultiTF Heatmap</b>
-${heatRow}
+${heat}
 
-<b>Elliott Details (per-TF)</b>
-${ellText}
-
-<b>Trendlines (auto from pivots)</b>
-${trendText}
+📈 <b>Elliott Overview</b>
+${ellSummaryText}
 
 ────────────────────
 <b>📊 Multi-Timeframe Analysis</b>
-${tfBlock}
+
+${tfBlocks}
+
 ────────────────────
+🧠 <b>Fusion Summary</b>
+Overall Bias: ${biasEmoji} <b>${biasLabel}</b> | Strength(Fusion): ${overallFusion}
+Buy Prob: <b>${buyProb}%</b> | Sell Prob: <b>${sellProb}%</b>
 
-<b>Smart Signals (Indicator+Elliott+ML Fusion)</b>
-${smartText}
+🎯 <b>LONG Targets (confidence)</b>
+${topLongs}
 
-${mlText}
+🎯 <b>SHORT Targets (confidence)</b>
+${topShorts}
 
-🎯 <b>TP/SL (Elliott+ATR fusion)</b>
-${tpsText}
-${slText}
+📐 Fib Zone (15m): ${ (mtf.find(x=>x.tf==='15m')?.fib) ? `${nf(mtf.find(x=>x.tf==='15m').fib.lo,2)} - ${nf(mtf.find(x=>x.tf==='15m').fib.hi,2)}` : "N/A" }
 
-📐 <b>Fib Zone (15m)</b>: ${fibText}
+📰 News Impact: Placeholder (hook your news module)
+ML: Placeholder (hook your ML module)
 
-📰 <b>News Impact:</b> Low (placeholder)
-• News module not active / placeholders
-
-<i>vSingleFile — Heatmap + AutoTrend + SmartSignal + ML/Elliott fusion</i>
+<i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | vSingleFile | UI: Option-B per TF</i>
 `.trim();
 
-  // send to telegram
-  if (!bot || !CHAT_ID) return text;
-  try{
-    await bot.sendMessage(CHAT_ID, text, { parse_mode: "HTML", disable_web_page_preview: true });
-  }catch(e){
-    console.error("Telegram send failed:", e?.message || e);
+    // send to Telegram if configured
+    if (bot && CHAT_ID) {
+      try {
+        await bot.sendMessage(CHAT_ID, html, { parse_mode: "HTML", disable_web_page_preview: true });
+      } catch (e) {
+        console.error("Telegram send failed:", e?.message || e);
+      }
+    }
+
+    return html;
+  } catch (e) {
+    const err = `formatAIReport error: ${e?.message || e}`;
+    console.error(err);
+    return err;
   }
-  return text;
 }
+
+// exports
+export { buildAIReport, formatAIReport };
+export default { buildAIReport, formatAIReport };
