@@ -251,6 +251,29 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       (m.targets || []).map(t => ({ ...t, tf: m.tf }))
     );
 
+
+// --- ML Prediction (15m) ---
+let ml = null;
+try {
+    ml = await runMLPrediction(symbol, "15m");
+} catch (e) {
+    ml = { error: e.message || "ml_error" };
+}
+
+// --- ML Accuracy ---
+let mlAcc = 0;
+try {
+    const acc = calculateAccuracy();
+    mlAcc = acc?.accuracy ?? 0;
+} catch (e) {
+    mlAcc = 0;
+}
+
+// attach into report
+report.ml = ml;
+report.mlAcc = mlAcc;
+
+
     // Dedupe
     const uniqMap = new Map();
     for (const t of allTargets) {
@@ -449,7 +472,14 @@ SL (short): ${slShort}
 📐 Fib Zone (15m): ${ (tf15?.fib) ? `${nf(tf15.fib.lo,2)} - ${nf(tf15.fib.hi,2)}` : "N/A" }
 
 //📰 News Impact: Placeholder (hook your news module)
-// ML Placeholder: integrate your ml_module_v8_6.js runMLPrediction here
+
+
+🤖 <b>ML Prediction</b>
+Label: <b>${report.ml?.label || "N/A"}</b>
+Probability: ${report.ml?.prob || 0}%
+Accuracy: ${report.mlAcc || 0}%
+ML Note: ${report.ml?.error ? report.ml.error : "OK"}
+
 
 <i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | UI: Option-B per TF | Engine: Elliott+Fusion</i>
 `.trim();
