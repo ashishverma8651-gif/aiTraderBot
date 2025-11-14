@@ -384,22 +384,3 @@ export async function keepAlive() {
 
 // ---------- exports ----------
 
-export {
-  safeAxiosGet,
-  nowLocal,
-  fetchCrypto,
-  ensureCandles,
-  fetchMarketData,
-  fetchMultiTF,
-  computeRSI,
-  computeATR,
-  computeMACD,
-  computeFibLevels,
-  calculateIndicators,
-  analyzeVolumeTrend,
-  analyzeVolume,
-  priceTrend,
-  volumeTrend,
-  
-  
-};
