@@ -446,8 +446,8 @@ SL (short): ${slShort}
 
 📐 Fib Zone (15m): ${ (tf15?.fib) ? `${nf(tf15.fib.lo,2)} - ${nf(tf15.fib.hi,2)}` : "N/A" }
 
-📰 News Impact: Placeholder (hook your news module)
-ML: Placeholder (hook your ML module) — integrate your `ml_module_v16.js` runMLPrediction to replace
+//📰 News Impact: Placeholder (hook your news module)//
+//ML: Placeholder (hook your ML module) — integrate your `ml_module_v8_6.js` runMLPrediction to replace//
 
 <i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | UI: Option-B per TF | Engine: Elliott+Fusion</i>
 `.trim();
