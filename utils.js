@@ -400,6 +400,6 @@ export {
   analyzeVolume,
   priceTrend,
   volumeTrend,
-  deriveSignalFromIndicators,
+  
   
 };
