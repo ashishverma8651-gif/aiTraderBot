@@ -400,7 +400,7 @@ export default {
   priceTrend,
   volumeTrend,
   deriveSignalFromIndicators,
-  keepAlive
+  
 };
 
 export {
@@ -420,5 +420,5 @@ export {
   priceTrend,
   volumeTrend,
   deriveSignalFromIndicators,
-  keepAlive
+  
 };
