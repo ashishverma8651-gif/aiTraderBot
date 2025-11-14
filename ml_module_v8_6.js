@@ -19,10 +19,13 @@ import {
   computeATR,
   analyzeVolume,
   computeFibLevels,
+
 } from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchMarketData, nowLocal } from "./utils.js";
 import { fetchNews } from "./news_social.js";
+
+import { computeFibLevelsFromCandles as computeFibLevels } from "./core_indicators.js";
 
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
