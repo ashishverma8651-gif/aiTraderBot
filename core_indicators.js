@@ -1,147 +1,110 @@
-// core_indicators.js — v11.0
-// Linked to CONFIG + UTILS + ML
-
-import fs from "fs";
-import path from "path";
-import CONFIG from "./config.js";
-import { analyzeVolume } from "./utils.js"; // optional import for volume
-const ML_PATH = CONFIG?.ML?.MODULE_PATH || "./ml_module_v8_6.js";
-
-const safeNum = (v, fallback = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-};
-const round2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : 0);
-
-// ---------- SMA ----------
-export function SMA(arr = [], period = 14) {
-  const res = [];
-  for (let i = 0; i < arr.length; i++) {
-    const slice = arr.slice(Math.max(0, i - period + 1), i + 1);
-    const avg = slice.reduce((a, b) => a + safeNum(b), 0) / Math.max(1, slice.length);
-    res.push(avg);
+// core_indicators.js — RSI, ATR, MACD, volume, fibs, deriveSignal
+export function computeRSI(candles = [], length = 14) {
+  if (!Array.isArray(candles) || candles.length < length + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
+    const a = candles[i+1], b = candles[i];
+    const diff = (Number(a.close)||0) - (Number(b.close)||0);
+    if (diff > 0) gains += diff; else losses -= diff;
   }
-  return res;
+  if (gains === 0 && losses === 0) return 50;
+  const avgGain = gains / length;
+  const avgLoss = (losses || 0.000001) / length;
+  const rs = avgGain / avgLoss;
+  return Number((100 - 100/(1+rs)).toFixed(2));
 }
 
-// ---------- EMA ----------
-export function EMA(data = [], period = 12) {
-  const closes = data.map((d) => (typeof d === "object" ? safeNum(d.close) : safeNum(d)));
-  const k = 2 / (period + 1);
-  const ema = [];
-  let prev = closes[0] || 0;
-  for (let i = 0; i < closes.length; i++) {
-    prev = closes[i] * k + prev * (1 - k);
-    ema.push(prev);
+export function computeATR(candles = [], length = 14) {
+  if (!Array.isArray(candles) || candles.length < length + 1) return 0;
+  const trs = [];
+  for (let i = candles.length - length; i < candles.length; i++) {
+    const cur = candles[i];
+    const prev = candles[i-1] ?? cur;
+    const high = Number(cur.high||0), low = Number(cur.low||0), prevC = Number(prev.close||0);
+    const tr = Math.max(high - low, Math.abs(high - prevC), Math.abs(low - prevC));
+    trs.push(tr);
   }
-  return ema;
+  const atr = trs.reduce((a,b)=>a+b,0)/trs.length;
+  return Number(atr.toFixed(2));
 }
 
-// ---------- ATR ----------
-export function calculateATR(candles = [], period = CONFIG.ML?.ATR_PERIOD || 14) {
-  if (candles.length < 2) return 0;
-  const trs = candles.slice(1).map((cur, i) => {
-    const prev = candles[i];
-    const high = safeNum(cur.high);
-    const low = safeNum(cur.low);
-    const prevClose = safeNum(prev.close);
-    return Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
-  });
-  const avg = trs.slice(-period).reduce((a, b) => a + b, 0) / Math.max(period, 1);
-  return round2(avg);
+function ema(values = [], period = 12) {
+  if (!Array.isArray(values) || !values.length) return [];
+  const k = 2/(period+1);
+  let prev = values[0];
+  const out = [];
+  for (const v of values) { prev = v*k + prev*(1-k); out.push(prev); }
+  return out;
 }
 
-// ---------- RSI ----------
-export function calculateRSI(candles = [], period = CONFIG.ML?.RSI_PERIOD || 14) {
-  if (candles.length < period + 1) return { value: null, summary: "NoData" };
-  const gains = [], losses = [];
-  for (let i = 1; i < candles.length; i++) {
-    const diff = safeNum(candles[i].close) - safeNum(candles[i - 1].close);
-    gains.push(Math.max(diff, 0));
-    losses.push(Math.max(-diff, 0));
-  }
-  let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < gains.length; i++) {
-    avgGain = (avgGain * (period - 1) + gains[i]) / period;
-    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
-  }
-  const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
-  const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
-  const val = round2(rsi);
-  return { value: val, summary: val > 70 ? "Overbought" : val < 30 ? "Oversold" : "Neutral" };
-}
-
-// ---------- MACD ----------
-export function calculateMACD(candles = [], fast = 12, slow = 26, signal = 9) {
-  const closes = candles.map((c) => safeNum(c.close));
-  const emaFast = EMA(closes, fast);
-  const emaSlow = EMA(closes, slow);
-  const macd = emaFast.map((v, i) => v - emaSlow[i]);
-  const signalLine = EMA(macd, signal);
-  const hist = macd.map((v, i) => v - signalLine[i]);
-  const latest = { macd: round2(macd.at(-1)), signal: round2(signalLine.at(-1)), hist: round2(hist.at(-1)) };
-  const summary = latest.hist > 0 ? "Bullish" : latest.hist < 0 ? "Bearish" : "Neutral";
-  return { macd, signal: signalLine, histogram: hist, latest, summary };
-}
-
-// ---------- Combined Indicators ----------
-export function analyzeIndicators(data = [], tf = "15m") {
-  if (!data.length) return { ok: false, summary: "NoData" };
-  const rsi = calculateRSI(data);
-  const macd = calculateMACD(data);
-  const atr = calculateATR(data);
-  const volStats = analyzeVolume(data);
-  const bullish = (rsi.summary === "Oversold" ? 1 : 0) + (macd.summary === "Bullish" ? 1 : 0);
-  const bearish = (rsi.summary === "Overbought" ? 1 : 0) + (macd.summary === "Bearish" ? 1 : 0);
-  const summary = bullish > bearish ? "Bullish" : bearish > bullish ? "Bearish" : "Neutral";
+export function computeMACD(candles = []) {
+  if (!Array.isArray(candles) || candles.length < 35) return { hist: 0, line: 0, signal:0 };
+  const closes = candles.map(c => Number(c.close||0));
+  const e12 = ema(closes,12);
+  const e26 = ema(closes,26);
+  const macdLine = e12.map((v,i)=> v - (e26[i]||0));
+  const signal = ema(macdLine, 9);
+  const hist = (macdLine.at(-1)||0) - (signal.at(-1)||0);
   return {
-    ok: true,
-    tf,
-    rsi: rsi.value,
-    macd: macd.latest.macd,
-    atr,
-    volume: volStats.label,
-    summary
+    hist: Number(hist.toFixed(6)),
+    line: Number((macdLine.at(-1)||0).toFixed(6)),
+    signal: Number((signal.at(-1)||0).toFixed(6))
   };
 }
 
-// ---------- Multi-TF Analyzer ----------
-export function analyzeMultiTF(tfDataMap = {}) {
-  const results = {};
-  for (const [tf, data] of Object.entries(tfDataMap)) {
-    results[tf] = analyzeIndicators(data, tf);
-  }
-  const vals = Object.values(results).filter((r) => r.ok);
-  const bull = vals.filter((r) => r.summary === "Bullish").length;
-  const bear = vals.filter((r) => r.summary === "Bearish").length;
-  const decision = bull > bear ? "Bullish" : bear > bull ? "Bearish" : "Neutral";
-  const confidence = Math.round((Math.max(bull, bear) / (vals.length || 1)) * 100);
-  return { decision, confidence, results };
+export function volumeTrend(candles=[]) {
+  if (!Array.isArray(candles) || candles.length<2) return "STABLE";
+  const last = Number(candles.at(-1).vol||0);
+  const prev = Number(candles.at(-2).vol||0);
+  if (last > prev) return "INCREASING";
+  if (last < prev) return "DECREASING";
+  return "STABLE";
 }
 
-// ---------- ML Integration ----------
-export async function runMLForCandles(candles = []) {
-  try {
-    if (!candles.length) return { error: "no_data" };
-    const ml = await import(ML_PATH).catch(() => null);
-    if (!ml?.runMLPrediction) return { error: "no_ml" };
-    const res = await ml.runMLPrediction(candles.slice(-CONFIG.ML.LOOKBACK || 500));
-    if (res && typeof res.prob === "number")
-      return { prob: round2(res.prob), label: res.label || "Unknown" };
-    return { error: "invalid_result" };
-  } catch (e) {
-    return { error: e.message || "ml_error" };
-  }
+// small volume analyzer used by tg
+export function analyzeVolume(candles = []) {
+  if (!Array.isArray(candles) || candles.length < 3) return { status:"UNKNOWN", strength:0 };
+  const v1 = Number(candles.at(-3).vol||0), v2 = Number(candles.at(-2).vol||0), v3 = Number(candles.at(-1).vol||0);
+  if (v3>v2 && v2>v1) return {status:"RISING", strength:3};
+  if (v3<v2 && v2<v1) return {status:"FALLING", strength:-3};
+  if (v3>v2) return {status:"SLIGHT_UP", strength:1};
+  if (v3<v2) return {status:"SLIGHT_DOWN", strength:-1};
+  return {status:"STABLE", strength:0};
 }
 
-export default {
-  SMA,
-  EMA,
-  calculateATR,
-  calculateRSI,
-  calculateMACD,
-  analyzeIndicators,
-  analyzeMultiTF,
-  runMLForCandles
-};
+export function computeFibLevelsFromCandles(candles=[]) {
+  if (!Array.isArray(candles) || candles.length===0) return null;
+  const highs = candles.map(c=>Number(c.high||0));
+  const lows = candles.map(c=>Number(c.low||0));
+  const hi = Math.max(...highs), lo = Math.min(...lows);
+  const diff = hi-lo;
+  return {
+    lo, hi,
+    retrace: {
+      "0.236": Number((hi - diff*0.236).toFixed(6)),
+      "0.382": Number((hi - diff*0.382).toFixed(6)),
+      "0.5": Number((hi - diff*0.5).toFixed(6)),
+      "0.618": Number((hi - diff*0.618).toFixed(6)),
+      "0.786": Number((hi - diff*0.786).toFixed(6))
+    }
+  };
+}
+
+// derive signal (quick heuristic)
+export function deriveSignal(indicators) {
+  if (!indicators) return "NEUTRAL";
+  let score = 0;
+  if (typeof indicators.RSI === "number") {
+    if (indicators.RSI < 30) score += 1;
+    if (indicators.RSI > 70) score -= 1;
+  }
+  if (indicators.MACD && typeof indicators.MACD.hist === "number") {
+    score += indicators.MACD.hist > 0 ? 1 : (indicators.MACD.hist < 0 ? -1 : 0);
+  }
+  if (indicators.priceTrend === "UP") score += 1;
+  if (indicators.priceTrend === "DOWN") score -= 1;
+  if (indicators.volumeTrend === "INCREASING") score += 1;
+  if (score >= 2) return "BUY";
+  if (score <= -2) return "SELL";
+  return "HOLD";
+}
