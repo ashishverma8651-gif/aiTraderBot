@@ -4,7 +4,11 @@
 
 import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
-import { fetchMarketData, analyzeVolumeTrend, computeFibLevels as _computeFibLevels } from "./utils.js";
+import { 
+  fetchMarketData, 
+  analyzeVolume,      // ✔ THIS is correct
+  computeFibLevels as _computeFibLevels 
+} from "./utils.js";
 import * as core from "./core_indicators.js";
 
 // Telegram Init
@@ -78,7 +82,7 @@ export async function buildAIReport(symbol = "BTCUSDT", context = null) {
           ? await calcIndicatorsSafe(candles)
           : { RSI: null, MACD: { hist: null }, ATR: null };
 
-        const volTrend = analyzeVolumeTrend(candles);
+        const volTrend = analyzeVolume(candles);
 
         const hi = candles.length ? Math.max(...candles.map(c => parseFloat(c.high))) : null;
         const lo = candles.length ? Math.min(...candles.map(c => parseFloat(c.low))) : null;
