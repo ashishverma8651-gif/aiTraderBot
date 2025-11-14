@@ -1,7 +1,4 @@
-// ===============================
-// utils.js — FINAL FIXED v9
-// ===============================
-
+// utils.js — robust, single-export-file v2.0
 import axios from "axios";
 import fs from "fs";
 import path from "path";
@@ -10,322 +7,203 @@ import CONFIG from "./config.js";
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-const AXIOS_TIMEOUT = 15000;
-const DEFAULT_LIMIT = 200;
+const AXIOS_TIMEOUT = Number(CONFIG?.AXIOS_TIMEOUT) || 15000;
+const DEFAULT_LIMIT = Number(CONFIG?.DEFAULT_LIMIT) || 200;
 
-const BINANCE_MIRRORS = [
-  "https://data-api.binance.vision",
-  "https://api.binance.com",
-  "https://api1.binance.com",
-  "https://api2.binance.com",
-  "https://api3.binance.com",
-];
+const BINANCE_MIRRORS = Array.isArray(CONFIG?.DATA_SOURCES?.CRYPTO?.PRIMARY) && CONFIG.DATA_SOURCES.CRYPTO.PRIMARY.length
+  ? CONFIG.DATA_SOURCES.CRYPTO.PRIMARY
+  : [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+  ];
 
-const FALLBACK_APIS = [
-  (symbol, interval, limit) =>
-    `https://api.coinstats.app/public/v1/charts?period=${interval}&coinId=${symbol.toLowerCase()}`,
-  (symbol, interval, limit) =>
-    `https://api.cryptorank.io/v0/coins/${symbol.toLowerCase()}/charts?period=${interval}&limit=${limit}`,
-];
-
-// ===============================
-// HELPERS
-// ===============================
-
-export function nowLocal() {
-  return new Date().toLocaleString("en-US", {
-    timeZone: "Asia/Kolkata",
-    hour12: true,
-  });
+function nowLocal() {
+  return new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata", hour12: true });
 }
-
-function cachePath(symbol, interval) {
-  return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
-}
-
+function cachePath(symbol, interval) { return path.join(CACHE_DIR, `${symbol}_${interval}.json`); }
 function readCache(symbol, interval) {
   try {
     const p = cachePath(symbol, interval);
     if (!fs.existsSync(p)) return [];
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return [];
-  }
+    return JSON.parse(fs.readFileSync(p, "utf8") || "[]");
+  } catch (e) { console.warn("readCache:", e?.message || e); return []; }
 }
-
 function writeCache(symbol, interval, data) {
-  try {
-    fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2));
-  } catch {}
+  try { fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2)); } catch (e) { console.warn("writeCache:", e?.message || e); }
 }
 
-// ===============================
-// SAFE AXIOS with MULTI fallback
-// ===============================
-
-async function safeAxiosGet(url) {
+async function safeAxiosGet(url, options = {}) {
   let lastErr = null;
-
-  for (const base of BINANCE_MIRRORS) {
-    const tryUrl = url.replace("https://api.binance.com", base);
+  const sources = [...BINANCE_MIRRORS, url];
+  for (const base of sources) {
+    let tryUrl = url;
+    try {
+      // If base looks like full host, replace official base only
+      if (base && base.startsWith("http") && url.includes("api.binance.com")) {
+        tryUrl = url.replace(/https?:\/\/api\.binance\.com/, base);
+      } else if (base === url) {
+        tryUrl = url;
+      }
+    } catch (_) { tryUrl = url; }
 
     try {
       const res = await axios.get(tryUrl, {
         timeout: AXIOS_TIMEOUT,
         proxy: CONFIG?.PROXY || false,
         headers: {
-          "User-Agent": CONFIG?.USER_AGENT || "aiTraderBot",
-          Accept: "application/json",
+          "User-Agent": CONFIG?.USER_AGENT || "aiTraderBot/1.0",
+          Accept: "application/json, text/plain, */*",
+          ...(options.headers || {})
         },
+        ...options,
       });
-
-      if (res?.status === 200) return res.data;
-    } catch (e) {
-      lastErr = e;
-    }
+      if (res && (res.status === 200 || res.status === 201)) return res.data;
+      lastErr = new Error(`HTTP ${res?.status}`);
+    } catch (err) { lastErr = err; }
   }
-
-  console.warn("⚠ Binance blocked → using fallback");
+  console.warn("safeAxiosGet failed for", url, lastErr?.message || lastErr);
   return null;
 }
 
-// ===============================
-// NORMALIZER
-// ===============================
-
-function normalizeBinance(raw) {
+function normalizeKlineArray(raw) {
   if (!Array.isArray(raw)) return [];
-
-  return raw
-    .map((k) => ({
-      t: Number(k[0]),
-      open: Number(k[1]),
-      high: Number(k[2]),
-      low: Number(k[3]),
-      close: Number(k[4]),
-      vol: Number(k[5]),
-    }))
-    .filter((c) => Number.isFinite(c.close));
+  return raw.map(k => ({
+    t: Number(k[0] ?? 0),
+    open: Number(k[1] ?? 0),
+    high: Number(k[2] ?? 0),
+    low: Number(k[3] ?? 0),
+    close: Number(k[4] ?? 0),
+    vol: Number(k[5] ?? 0),
+  })).filter(c => Number.isFinite(c.close));
 }
 
-function normalizeFallback(raw) {
-  if (!raw || !raw.chart) return [];
-
-  return raw.chart.map((c) => ({
-    t: c[0],
-    open: c[1],
-    high: c[1],
-    low: c[1],
-    close: c[1],
-    vol: c[2] || 0,
-  }));
+export async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = DEFAULT_LIMIT) {
+  try {
+    const baseUrl = CONFIG?.DATA_SOURCES?.CRYPTO?.PRIMARY?.[1] || "https://api.binance.com";
+    const url = `${baseUrl.replace(/\/$/, "")}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const raw = await safeAxiosGet(url);
+    if (!raw) return [];
+    return normalizeKlineArray(raw);
+  } catch (e) {
+    console.warn("fetchCrypto error:", e?.message || e);
+    return [];
+  }
 }
 
-// ===============================
-// FETCH (BINANCE + FALLBACKS)
-// ===============================
-
-async function fetchAny(symbol, interval, limit) {
-  // First try Binance
-  const binanceURL = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const raw = await safeAxiosGet(binanceURL);
-
-  if (raw) {
-    const norm = normalizeBinance(raw);
-    if (norm.length) return norm;
+export async function ensureCandles(symbol = "BTCUSDT", interval = "15m", limit = DEFAULT_LIMIT) {
+  const cached = readCache(symbol, interval) || [];
+  try {
+    const fresh = await fetchCrypto(symbol, interval, limit);
+    if (Array.isArray(fresh) && fresh.length) {
+      writeCache(symbol, interval, fresh);
+      return fresh;
+    }
+  } catch (e) {
+    console.warn("ensureCandles fetch error:", e?.message || e);
   }
-
-  // Try fallbacks
-  for (const api of FALLBACK_APIS) {
-    try {
-      const url = api(symbol, interval, limit);
-      const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
-      const norm = normalizeFallback(res.data);
-      if (norm.length) return norm;
-    } catch {}
-  }
-
-  return [];
+  return cached;
 }
 
-// ===============================
-// CACHE
-// ===============================
-
-async function ensureCandles(symbol, interval, limit) {
-  const fresh = await fetchAny(symbol, interval, limit);
-
-  if (fresh?.length) {
-    writeCache(symbol, interval, fresh);
-    return fresh;
+// indicators (simple, defensive)
+export function computeRSI(candles = [], len = 14) {
+  if (!Array.isArray(candles) || candles.length < len + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = candles.length - len - 1; i < candles.length - 1; i++) {
+    const diff = (candles[i+1].close ?? 0) - (candles[i].close ?? 0);
+    if (diff > 0) gains += diff; else losses -= diff;
   }
-
-  const cached = readCache(symbol, interval);
-  if (cached?.length) return cached;
-
-  return [];
-}
-
-// ===============================
-// INDICATORS
-// ===============================
-
-function computeRSI(c, length = 14) {
-  if (c.length < length + 1) return 50;
-
-  let g = 0,
-    l = 0;
-
-  for (let i = c.length - length - 1; i < c.length - 1; i++) {
-    const d = c[i + 1].close - c[i].close;
-    if (d > 0) g += d;
-    else l -= d;
-  }
-
-  const rs = (g / length) / ((l || 0.00001) / length);
+  if (gains === 0 && losses === 0) return 50;
+  const avgGain = gains / len;
+  const avgLoss = (losses || 1e-6) / len;
+  const rs = avgGain / avgLoss;
   return Number((100 - 100 / (1 + rs)).toFixed(2));
 }
-
-function computeATR(c, length = 14) {
-  if (c.length < length + 1) return 0;
-
-  const t = [];
-
-  for (let i = c.length - length; i < c.length; i++) {
-    const cur = c[i];
-    const prev = c[i - 1] ?? cur;
-
-    const tr = Math.max(
-      cur.high - cur.low,
-      Math.abs(cur.high - prev.close),
-      Math.abs(cur.low - prev.close)
-    );
-
-    t.push(tr);
+export function computeATR(candles = [], len = 14) {
+  if (!Array.isArray(candles) || candles.length < len + 1) return 0;
+  const trs = [];
+  for (let i = candles.length - len; i < candles.length; i++) {
+    const cur = candles[i];
+    const prev = candles[i-1] ?? cur;
+    const tr = Math.max((cur.high - cur.low), Math.abs(cur.high - (prev.close ?? cur.close)), Math.abs(cur.low - (prev.close ?? cur.close)));
+    trs.push(tr);
   }
-
-  return Number((t.reduce((a, b) => a + b, 0) / t.length).toFixed(2));
+  return Number((trs.reduce((a,b)=>a+b,0)/trs.length).toFixed(2));
+}
+function ema(values = [], period = 12) {
+  if (!Array.isArray(values) || values.length === 0) return [];
+  const k = 2/(period+1);
+  let prev = values[0];
+  const out = [];
+  for (const v of values) { prev = v*k + prev*(1-k); out.push(prev); }
+  return out;
+}
+export function computeMACD(candles = []) {
+  if (!Array.isArray(candles) || candles.length < 35) return { hist: 0, line: 0, signal: 0 };
+  const closes = candles.map(c => Number(c.close ?? 0));
+  const ema12 = ema(closes,12);
+  const ema26 = ema(closes,26);
+  const macdLine = ema12.map((v,i)=> v - (ema26[i] ?? 0));
+  const signal = ema(macdLine, 9);
+  const hist = (macdLine.at(-1) ?? 0) - (signal.at(-1) ?? 0);
+  return { hist: Number(hist.toFixed(6)), line: Number((macdLine.at(-1)||0).toFixed(6)), signal: Number((signal.at(-1)||0).toFixed(6)) };
+}
+export function priceTrend(candles=[]) {
+  if (!Array.isArray(candles) || candles.length < 2) return "FLAT";
+  const last = candles.at(-1).close; const prev = candles.at(-2).close;
+  return last>prev ? "UP": last<prev ? "DOWN":"FLAT";
+}
+export function volumeTrend(candles=[]) {
+  if (!Array.isArray(candles) || candles.length < 2) return "STABLE";
+  const last = candles.at(-1).vol ?? candles.at(-1).volume ?? 0;
+  const prev = candles.at(-2).vol ?? candles.at(-2).volume ?? 0;
+  return last>prev ? "INCREASING": last<prev ? "DECREASING":"STABLE";
+}
+export function analyzeVolume(candles=[]) {
+  if (!Array.isArray(candles) || candles.length < 3) return { status: "UNKNOWN", ratio: 1 };
+  const v1 = candles.at(-3).vol; const v2 = candles.at(-2).vol; const v3 = candles.at(-1).vol;
+  if (v3>v2 && v2>v1) return { status: "RISING", ratio: v3/v2 };
+  if (v3<v2 && v2<v1) return { status: "FALLING", ratio: v3/v2 };
+  return { status: "STABLE", ratio: v3/( (v1+v2+v3)/3 ) };
+}
+export function computeFibLevels(candles=[]) {
+  if (!Array.isArray(candles) || !candles.length) return null;
+  const highs = candles.map(c => Number(c.high || 0)); const lows = candles.map(c => Number(c.low || 0));
+  const hi = Math.max(...highs); const lo = Math.min(...lows); if (!isFinite(hi) || !isFinite(lo)) return null;
+  const diff = hi - lo;
+  return { lo, hi, retrace: { "0.236": hi - diff*0.236, "0.382": hi - diff*0.382, "0.5": hi - diff*0.5, "0.618": hi - diff*0.618, "0.786": hi - diff*0.786 }};
 }
 
-function ema(v, p) {
-  const k = 2 / (p + 1);
-  let prev = v[0];
-  return v.map((x) => (prev = x * k + prev * (1 - k)));
+export async function fetchMarketData(symbol="BTCUSDT", interval="15m", limit=DEFAULT_LIMIT) {
+  try {
+    const candles = await ensureCandles(symbol, interval, limit);
+    const data = Array.isArray(candles) ? candles : [];
+    const last = data.at(-1) || {};
+    return {
+      data,
+      price: Number(last.close ?? 0),
+      volume: Number(last.vol ?? last.volume ?? 0),
+      indicators: data.length ? { RSI: computeRSI(data), MACD: computeMACD(data), ATR: computeATR(data), priceTrend: priceTrend(data), volumeTrend: volumeTrend(data) } : null,
+      fib: data.length ? computeFibLevels(data) : null,
+      updated: nowLocal(),
+    };
+  } catch (e) {
+    console.error("fetchMarketData error:", e?.message || e);
+    const cached = readCache(symbol, interval) || [];
+    return { data: cached, price: Number(cached.at(-1)?.close ?? 0), volume: Number(cached.at(-1)?.vol ?? 0), indicators: cached.length ? { RSI: computeRSI(cached), MACD: computeMACD(cached), ATR: computeATR(cached) } : null, fib: cached.length ? computeFibLevels(cached) : null, updated: nowLocal(), error: e?.message || String(e) };
+  }
 }
 
-function computeMACD(c) {
-  if (c.length < 35) return { hist: 0, line: 0, signal: 0 };
-
-  const close = c.map((x) => x.close);
-  const e12 = ema(close, 12);
-  const e26 = ema(close, 26);
-
-  const macd = e12.map((v, i) => v - e26[i]);
-  const signal = ema(macd, 9);
-
-  return {
-    hist: Number((macd.at(-1) - signal.at(-1)).toFixed(6)),
-    line: Number(macd.at(-1).toFixed(6)),
-    signal: Number(signal.at(-1).toFixed(6)),
-  };
-}
-
-function priceTrend(c) {
-  if (c.length < 2) return "FLAT";
-  const a = c.at(-1).close;
-  const b = c.at(-2).close;
-  return a > b ? "UP" : a < b ? "DOWN" : "FLAT";
-}
-
-function volumeTrend(c) {
-  if (c.length < 2) return "STABLE";
-  const a = c.at(-1).vol;
-  const b = c.at(-2).vol;
-  return a > b ? "INCREASING" : a < b ? "DECREASING" : "STABLE";
-}
-
-export function analyzeVolume(c) {
-  if (!Array.isArray(c) || c.length < 3)
-    return { status: "UNKNOWN", strength: 0 };
-
-  const v1 = c.at(-3).vol;
-  const v2 = c.at(-2).vol;
-  const v3 = c.at(-1).vol;
-
-  if (v3 > v2 && v2 > v1) return { status: "RISING", strength: 3 };
-  if (v3 < v2 && v2 < v1) return { status: "FALLING", strength: -3 };
-  if (v3 > v2) return { status: "SLIGHT_UP", strength: 1 };
-  if (v3 < v2) return { status: "SLIGHT_DOWN", strength: -1 };
-
-  return { status: "STABLE", strength: 0 };
-}
-
-// ===============================
-// FIB LEVELS
-// ===============================
-
-export function computeFibLevels(c) {
-  const hi = Math.max(...c.map((x) => x.high));
-  const lo = Math.min(...c.map((x) => x.low));
-  const d = hi - lo;
-
-  return {
-    lo,
-    hi,
-    retrace: {
-      0.236: hi - d * 0.236,
-      0.382: hi - d * 0.382,
-      0.5: hi - d * 0.5,
-      0.618: hi - d * 0.618,
-      0.786: hi - d * 0.786,
-    },
-  };
-}
-
-// ===============================
-// MARKET DATA
-// ===============================
-
-export async function fetchMarketData(symbol, interval, limit = DEFAULT_LIMIT) {
-  const c = await ensureCandles(symbol, interval, limit);
-
-  return {
-    data: c,
-    price: c.at(-1)?.close || 0,
-    volume: c.at(-1)?.vol || 0,
-    indicators: {
-      RSI: computeRSI(c),
-      MACD: computeMACD(c),
-      ATR: computeATR(c),
-      priceTrend: priceTrend(c),
-      volumeTrend: volumeTrend(c),
-    },
-    fib: computeFibLevels(c),
-    updated: nowLocal(),
-  };
-}
-
-export async function fetchMultiTF(symbol, tfs = ["1m", "5m", "15m"]) {
+export async function fetchMultiTF(symbol="BTCUSDT", tfs=["1m","5m","15m","30m","1h"]) {
   const out = {};
-
-  await Promise.all(
-    tfs.map(async (tf) => {
-      out[tf] = await fetchMarketData(symbol, tf);
-    })
-  );
-
+  await Promise.all(tfs.map(async(tf)=>{ out[tf] = await fetchMarketData(symbol, tf, DEFAULT_LIMIT); }));
   return out;
 }
 
-// ===============================
-// KEEP ALIVE
-// ===============================
-
 export async function keepAlive() {
   try {
-    await axios.get(CONFIG.SELF_PING_URL);
-    return { ok: true };
-  } catch {
-    return { ok: false };
-  }
+    const url = CONFIG?.SELF_PING_URL || `https://${CONFIG?.RENDER_URL || ""}`; if (!url) return { ok:false };
+    await axios.get(url, { timeout: 8000 }); return { ok:true };
+  } catch { return { ok:false }; }
 }
