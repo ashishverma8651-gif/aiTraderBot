@@ -138,4 +138,33 @@ export async function fetchMultiTF(symbol = "BTCUSDT", tfs = ["1m","5m","15m","3
   return out;
 }
 
+// near top already: import axios from "axios"; import CONFIG from "./config.js";
+// Add this function anywhere in utils.js (prefer near other helper/exports)
+
+export async function keepAlive() {
+  // If user provided SELF_PING_URL, try that; otherwise try a few fallback urls from config
+  const urls = Array.from(new Set([
+    CONFIG?.SELF_PING_URL,
+    ...(CONFIG?.SERVER?.KEEP_ALIVE_URLS || []),
+    // you can add more fallback urls here if you want:
+    // `https://${process.env.RENDER_INTERNAL_URL || ""}`
+  ].filter(Boolean)));
+
+  if (!urls.length) {
+    // nothing to ping — return false but not fatal
+    return { ok: false, reason: "no_ping_url" };
+  }
+
+  for (const u of urls) {
+    try {
+      const res = await axios.get(u, { timeout: 8000, proxy: CONFIG?.PROXY || false });
+      if (res && (res.status === 200 || res.status === 204 || res.status === 302)) {
+        return { ok: true, url: u, status: res.status };
+      }
+    } catch (e) {
+      // try next url
+    }
+  }
+  return { ok: false, reason: "all_failed" };
+}
 export { nowLocal, readCache, writeCache, cachePath };
