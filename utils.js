@@ -399,7 +399,7 @@ export {
   analyzeVolumeTrend,
   analyzeVolume,
   priceTrend,
-  volumeTrend,
+ 
   
   
 };
