@@ -1,12 +1,17 @@
+// ===============================================
+// utils.js — FINAL VERSION (Compatible with TG Option 3)
+// Multi-Timeframe + Stable Indicators + Fib + Volume Trend
+// ===============================================
+
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { CONFIG } from "./config.js";
 
-// ==============================
-// SAFE AXIOS WRAPPER (with proxy + mirror)
-// ==============================
-async function safeAxiosGet(url, options = {}) {
+// ===============================================
+// SAFE AXIOS WRAPPER
+// ===============================================
+export async function safeAxiosGet(url, options = {}) {
   const finalURL = url.replace(
     "https://api.binance.com",
     CONFIG.BINANCE_MIRROR || "https://api1.binance.com"
@@ -25,16 +30,16 @@ async function safeAxiosGet(url, options = {}) {
   }
 }
 
-// ==============================
-// BASIC TIME HELPERS
-// ==============================
-function nowLocal() {
+// ===============================================
+// TIME
+// ===============================================
+export function nowLocal() {
   return new Date().toLocaleString("en-IN", { hour12: false });
 }
 
-// ==============================
-// CANDLE CACHE SYSTEM
-// ==============================
+// ===============================================
+// CACHE
+// ===============================================
 const CACHE_DIR = "./cache";
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
 
@@ -53,10 +58,10 @@ function saveCache(symbol, interval, data) {
   fs.writeFileSync(p, JSON.stringify(data, null, 2));
 }
 
-// ==============================
-// FETCH CANDLES FROM BINANCE
-// ==============================
-async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
+// ===============================================
+// FETCH CANDLES (RAW BINANCE)
+// ===============================================
+export async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
   const url =
     `${CONFIG.BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 
@@ -65,35 +70,33 @@ async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
 
   return out.map((k) => ({
     time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
+    open: +k[1],
+    high: +k[2],
+    low: +k[3],
+    close: +k[4],
+    volume: +k[5],
   }));
 }
 
-// ==============================
-// ENSURE CANDLE DATA (CACHE + LIVE)
-// ==============================
-async function ensureCandles(symbol, interval = "15m", limit = 200) {
-  let old = loadCache(symbol, interval);
+// ===============================================
+// ENSURE CANDLES (CACHE + LIVE)
+// ===============================================
+export async function ensureCandles(symbol, interval = "15m", limit = 200) {
+  const old = loadCache(symbol, interval);
   const fresh = await fetchCrypto(symbol, interval, limit);
 
   if (!fresh.length) return old;
-
   saveCache(symbol, interval, fresh);
   return fresh;
 }
 
-// ==============================
+// ===============================================
 // INDICATORS
-// ==============================
-function computeRSI(candles, length = 14) {
+// ===============================================
+export function computeRSI(candles, length = 14) {
   if (candles.length < length + 2) return 50;
 
-  let gains = 0,
-    losses = 0;
+  let gains = 0, losses = 0;
 
   for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
     const diff = candles[i + 1].close - candles[i].close;
@@ -104,19 +107,16 @@ function computeRSI(candles, length = 14) {
   if (gains === 0 && losses === 0) return 50;
 
   const avgGain = gains / length;
-  const avgLoss = losses / length || 0.00001;
+  const avgLoss = losses / length || 0.001;
 
   const rs = avgGain / avgLoss;
-  const rsi = 100 - 100 / (1 + rs);
-
-  return Number(rsi.toFixed(2));
+  return +(100 - 100 / (1 + rs)).toFixed(2);
 }
 
-function computeATR(candles, length = 14) {
-  if (candles.length < length + 1) return 0;
+export function computeATR(candles, length = 14) {
+  if (candles.length < length + 2) return 0;
 
   let trs = [];
-
   for (let i = candles.length - length; i < candles.length; i++) {
     const high = candles[i].high;
     const low = candles[i].low;
@@ -127,26 +127,20 @@ function computeATR(candles, length = 14) {
       Math.abs(high - prevClose),
       Math.abs(low - prevClose)
     );
-
     trs.push(tr);
   }
 
-  return Number((trs.reduce((a, b) => a + b, 0) / length).toFixed(2));
+  return +(trs.reduce((a, b) => a + b, 0) / length).toFixed(2);
 }
 
 function ema(values, period) {
   const k = 2 / (period + 1);
   let emaPrev = values[0];
-  const out = [];
-  for (let v of values) {
-    emaPrev = v * k + emaPrev * (1 - k);
-    out.push(emaPrev);
-  }
-  return out;
+  return values.map((v) => (emaPrev = v * k + emaPrev * (1 - k)));
 }
 
-function computeMACD(candles) {
-  if (candles.length < 40) return 0;
+export function computeMACD(candles) {
+  if (candles.length < 40) return { hist: 0 };
 
   const closes = candles.map((c) => c.close);
 
@@ -156,10 +150,12 @@ function computeMACD(candles) {
   const macdLine = ema12.map((v, i) => v - ema26[i]);
   const signalLine = ema(macdLine, 9);
 
-  return Number((macdLine.at(-1) - signalLine.at(-1)).toFixed(4));
+  return {
+    hist: +(macdLine.at(-1) - signalLine.at(-1)).toFixed(4),
+  };
 }
 
-function priceTrend(candles) {
+export function priceTrend(candles) {
   const last = candles.at(-1).close;
   const prev = candles.at(-2).close;
 
@@ -168,42 +164,25 @@ function priceTrend(candles) {
   return "FLAT";
 }
 
-function volumeTrend(candles) {
+export function volumeTrend(candles) {
+  if (!candles.length) return "stable";
+
   const last = candles.at(-1).volume;
-  const prev = candles.at(-2).volume;
+  const prev = candles.at(-2)?.volume ?? last;
 
   if (last > prev) return "INCREASING";
   if (last < prev) return "DECREASING";
   return "STABLE";
 }
 
-function analyzeVolume(candles) {
-  const vt = volumeTrend(candles);
-  if (vt === "INCREASING") return "Smart money activity possible";
-  if (vt === "DECREASING") return "Weak market interest";
-  return "Stable volume";
+export function analyzeVolumeTrend(candles) {
+  const v = volumeTrend(candles);
+  if (v === "INCREASING") return "up";
+  if (v === "DECREASING") return "down";
+  return "stable";
 }
 
-function getSignal(rsi, macd, priceT, volT) {
-  let score = 0;
-
-  if (rsi < 30) score += 1;
-  if (rsi > 70) score -= 1;
-
-  if (macd > 0) score += 1;
-  else score -= 1;
-
-  if (priceT === "UP") score += 1;
-  if (priceT === "DOWN") score -= 1;
-
-  if (volT === "INCREASING") score += 1;
-
-  if (score >= 2) return "BUY";
-  if (score <= -2) return "SELL";
-  return "NEUTRAL";
-}
-
-function calculateIndicators(candles) {
+export function calculateIndicators(candles) {
   const rsi = computeRSI(candles);
   const macd = computeMACD(candles);
   const atr = computeATR(candles);
@@ -211,92 +190,84 @@ function calculateIndicators(candles) {
   const vt = volumeTrend(candles);
 
   return {
-    rsi,
-    macd,
-    atr,
+    RSI: rsi,
+    MACD: macd,
+    ATR: atr,
     priceTrend: pt,
     volumeTrend: vt,
-    volumeNote: analyzeVolume(candles),
-    signal: getSignal(rsi, macd, pt, vt),
   };
 }
 
-// ==============================
-// FIB LEVELS
-// ==============================
-function computeFibLevels(candles) {
-  const high = Math.max(...candles.map((c) => c.high));
-  const low = Math.min(...candles.map((c) => c.low));
+// ===============================================
+// FIB LEVELS (Dual Mode)
+// supports:
+//    computeFibLevels(candles)
+//    computeFibLevels(low, high)
+// ===============================================
+export function computeFibLevels(a, b) {
+  let low, high;
+
+  if (Array.isArray(a)) {
+    high = Math.max(...a.map((c) => c.high));
+    low = Math.min(...a.map((c) => c.low));
+  } else {
+    low = a;
+    high = b;
+  }
+
   const diff = high - low;
 
   return {
-    high,
-    low,
-    level_236: high - diff * 0.236,
-    level_382: high - diff * 0.382,
-    level_5: high - diff * 0.5,
-    level_618: high - diff * 0.618,
-    level_786: high - diff * 0.786,
+    lo: low,
+    hi: high,
+    retrace: {
+      "0.236": high - diff * 0.236,
+      "0.382": high - diff * 0.382,
+      "0.5": high - diff * 0.5,
+      "0.618": high - diff * 0.618,
+      "0.786": high - diff * 0.786,
+    },
   };
 }
 
-// ==============================
-// MASTER MARKET FETCH
-// ==============================
-async function fetchMarketData(symbol = "BTCUSDT") {
-  const candles = await ensureCandles(symbol, "15m", 200);
-  if (!candles.length) return null;
+// ===============================================
+// MASTER MARKET FETCH (NOW SUPPORTS TF)
+// ===============================================
+export async function fetchMarketData(symbol = "BTCUSDT", interval = "15m", limit = 200) {
+  const candles = await ensureCandles(symbol, interval, limit);
 
   return {
-    symbol,
-    price: candles.at(-1).close,
-    volume: candles.at(-1).volume,
-    indicators: calculateIndicators(candles),
-    fib: computeFibLevels(candles),
+    data: candles,
+    price: candles.at(-1)?.close ?? 0,
+    volume: candles.at(-1)?.volume ?? 0,
+    indicators: candles.length ? calculateIndicators(candles) : null,
+    fib: candles.length ? computeFibLevels(candles) : null,
     updated: nowLocal(),
   };
 }
 
-// ==============================
+// ===============================================
 // KEEP ALIVE
-// ==============================
-async function keepAlive() {
+// ===============================================
+export async function keepAlive() {
   try {
     await axios.get(`https://${CONFIG.RENDER_URL}`);
   } catch {}
 }
 
-// ==============================
-// EXPORT
-// ==============================
-export {
-  computeFibLevels,
-  fetchCrypto,
-  fetchMarketData,
-  priceTrend,
-  volumeTrend,
-  calculateIndicators,
-  computeATR,
-  computeRSI,
-  computeMACD,
-  analyzeVolume,
-  safeAxiosGet,
-  nowLocal,
-  keepAlive,
-};
-
 export default {
-  computeFibLevels,
-  fetchCrypto,
-  fetchMarketData,
-  priceTrend,
-  volumeTrend,
-  calculateIndicators,
-  computeATR,
-  computeRSI,
-  computeMACD,
-  analyzeVolume,
   safeAxiosGet,
   nowLocal,
+  fetchCrypto,
+  ensureCandles,
+  fetchMarketData,
+  computeRSI,
+  computeATR,
+  computeMACD,
+  computeFibLevels,
+  calculateIndicators,
+  analyzeVolumeTrend,
+  priceTrend,
+  volumeTrend,
   keepAlive,
 };
