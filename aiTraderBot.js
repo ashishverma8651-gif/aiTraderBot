@@ -1,218 +1,322 @@
 // aiTraderBot.js
-// Single-file AI Trader (Option 2 - ENV vars)
-// - Multi-source fetch (mirrors + fallbacks + proxy)
-// - Cache, multi-TF candles (1m,5m,15m,30m,1h)
-// - Indicators: RSI, ATR, MACD, Volume Trend, Fib
-// - WebSocket live price (Binance mirrors) with auto-reconnect
-// - Telegram report every 15m (HTML TradingView-like)
-// - Single file solution (drop into your project & run)
+// Single-file AI Trader vX — Multi-source, WebSocket mirrors, indicators, Telegram 15m auto-report
+// Drop into your project root and run: node aiTraderBot.js
+// Requires: axios, ws, node-telegram-bot-api, express
+// Optional: https-proxy-agent (if using HTTP(S) proxy)
 
 import fs from "fs";
 import path from "path";
 import axios from "axios";
-import TelegramBot from "node-telegram-bot-api";
 import WebSocket from "ws";
 import express from "express";
+import TelegramBot from "node-telegram-bot-api";
 
-// -------- CONFIG (from ENV) ----------
-const ENV = process.env;
-const BOT_TOKEN = ENV.BOT_TOKEN || null;
-const CHAT_ID = ENV.CHAT_ID || null;
-const SYMBOL = ENV.SYMBOL || "BTCUSDT";
-const REPORT_INTERVAL_MS = Number(ENV.REPORT_INTERVAL_MS) || 15 * 60 * 1000;
-const CACHE_DIR = path.resolve(process.cwd(), "cache");
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+//
+// ------------------- CONFIG (edit or use ENV) -------------------
+//
+const CONFIG = {
+  SYMBOL: process.env.SYMBOL || "BTCUSDT",
+  INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
+  REPORT_INTERVAL_MIN: Number(process.env.REPORT_INTERVAL_MIN || "15"),
+  CACHE_DIR: process.env.CACHE_DIR || path.resolve(process.cwd(), "cache"),
+  DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 200),
+  AXIOS_TIMEOUT: Number(process.env.AXIOS_TIMEOUT || 15000),
 
-const DEFAULT_LIMIT = 200;
-const AXIOS_TIMEOUT = Number(ENV.AXIOS_TIMEOUT) || 15000;
+  // Sources (order matters: first is preferred)
+  BINANCE_HTTP_MIRRORS: [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+  ],
+  OTHER_SOURCES: {
+    BYBIT: "https://api-testnet.bybit.com", // replace with production if needed
+    KUCOIN: "https://api.kucoin.com",
+    COINBASE: "https://api.exchange.coinbase.com",
+    COINGECKO: "https://api.coingecko.com/api/v3",
+  },
 
-// Mirror lists (can override via env, comma-separated)
-const BINANCE_HTTP_MIRRORS = (ENV.BINANCE_HTTP_MIRRORS || "https://data-api.binance.vision,https://api.binance.com,https://api1.binance.com,https://api2.binance.com").split(",");
-const BINANCE_WS_MIRRORS = (ENV.BINANCE_WS_MIRRORS || "wss://stream.binance.com:9443/ws/,wss://data-stream.binance.vision/ws/").split(",");
+  // Websocket mirrors for live ticker
+  BINANCE_WS_MIRRORS: [
+    "wss://stream.binance.com:9443/ws",
+    "wss://data-stream.binance.vision/ws",
+    "wss://stream.binance.us:9443/ws",
+  ],
 
-// Fallback other markets (Bybit / Kucoin / Coinbase)
-const OTHER_HTTP_SOURCES = [
-  "https://api.bybit.com",
-  "https://api.kucoin.com",
-  "https://api.exchange.coinbase.com"
-];
+  // Telegram
+  TELEGRAM_BOT_TOKEN: process.env.BOT_TOKEN || null,
+  TELEGRAM_CHAT_ID: process.env.CHAT_ID || null,
 
-// Proxy support: prefer PROXY_URL or standard HTTP_PROXY/HTTPS_PROXY if set
-const PROXY_URL = ENV.PROXY_URL || ENV.HTTP_PROXY || ENV.HTTPS_PROXY || null;
+  // Keep-alive & server
+  SERVER_PORT: Number(process.env.PORT || 10000),
+  SELF_PING_URL: process.env.SELF_PING_URL || null,
 
-// Telegram bot init
-const bot = BOT_TOKEN ? new TelegramBot(BOT_TOKEN, { polling: false }) : null;
-if (!BOT_TOKEN) console.warn("⚠️ BOT_TOKEN not set — Telegram messages will be skipped.");
-if (!CHAT_ID) console.warn("⚠️ CHAT_ID not set — Telegram messages will be skipped.");
+  // Proxy (optional): set HTTP_PROXY or HTTPS_PROXY in env, or set PROXY = { host, port, auth }
+  PROXY: process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null,
+};
 
-// Optional external modules placeholders (you can create these files later)
-let runMLPrediction = null;
-let analyzeElliott = null;
-let fetchNews = null;
-try { runMLPrediction = (await import("./ml_module_v8_6.js")).runMLPrediction; } catch {}
-try { analyzeElliott = (await import("./elliott_module.js")).analyzeElliott; } catch {}
-try { fetchNews = (await import("./news_social.js")).fetchNews; } catch {}
+//
+// ------------------- Boot / folder setup -------------------
+if (!fs.existsSync(CONFIG.CACHE_DIR)) fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true });
 
-// -------- helpers: cache --------
-function cachePath(symbol, interval) {
-  return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
+//
+// ------------------- Optional proxy agent hookup -------------------
+let axiosInstance = axios.create({ timeout: CONFIG.AXIOS_TIMEOUT });
+if (CONFIG.PROXY) {
+  // Try to use https-proxy-agent if available; otherwise use axios proxy field (limited)
+  try {
+    // dynamic import
+    const HttpsProxyAgent = (await import("https-proxy-agent")).default;
+    const agent = HttpsProxyAgent(CONFIG.PROXY);
+    axiosInstance = axios.create({
+      timeout: CONFIG.AXIOS_TIMEOUT,
+      httpsAgent: agent,
+      httpAgent: agent,
+    });
+    console.log("Using https-proxy-agent for outbound http(s) proxy");
+  } catch (e) {
+    // fallback: axios proxy config if PROXY is host:port or url
+    console.warn("https-proxy-agent not available or proxy parse failed, using basic axios proxy/config fallback.");
+    // If PROXY is a url like http://user:pass@host:port, axios proxy auto won't accept string; leave axiosInstance default.
+  }
 }
+
+//
+// ------------------- Utilities: time, cache -------------------
+function nowLocalISO() {
+  return new Date().toISOString();
+}
+
+function nowLocalReadable() {
+  return new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata", hour12: true });
+}
+
+function cachePath(symbol, interval) {
+  return path.join(CONFIG.CACHE_DIR, `${symbol}_${interval}.json`);
+}
+
 function readCache(symbol, interval) {
   try {
     const p = cachePath(symbol, interval);
     if (!fs.existsSync(p)) return [];
     return JSON.parse(fs.readFileSync(p, "utf8") || "[]");
   } catch (e) {
-    console.warn("readCache error:", e?.message || e);
+    console.warn("readCache err", e?.message || e);
     return [];
   }
 }
+
 function writeCache(symbol, interval, data) {
   try {
     fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2));
   } catch (e) {
-    console.warn("writeCache error:", e?.message || e);
+    console.warn("writeCache err", e?.message || e);
   }
 }
-function nowLocal() {
-  return new Date().toLocaleString("en-IN", { hour12: false });
-}
 
-// -------- helpers: network (safe axios with mirrors + proxy) ----------
-async function safeAxiosGet(originalUrl, options = {}) {
-  // Build candidate URLs from mirrors + fallback sources
-  const candidates = [];
-
-  // Try Binance HTTP mirrors first (replace base if original has api.binance.com)
-  for (const base of BINANCE_HTTP_MIRRORS) {
-    try {
-      if (originalUrl.includes("api.binance.com") || originalUrl.includes("/api/v3/")) {
-        const tryUrl = originalUrl.replace(/https?:\/\/[^/]+/, base);
-        candidates.push(tryUrl);
-      } else {
-        candidates.push(originalUrl);
-      }
-    } catch {
-      candidates.push(originalUrl);
-    }
-  }
-
-  // Add original URL last
-  if (!candidates.includes(originalUrl)) candidates.push(originalUrl);
-
-  // Add other provider endpoints by transforming known endpoints where applicable (best-effort)
-  for (const s of OTHER_HTTP_SOURCES) {
-    // naive transform: when calling klines URL for binance we don't have direct equivalent — but keep original as fallback.
-    // still push s so axios tries it (should fail fast).
-    candidates.push(s);
-  }
-
+//
+// ------------------- Safe HTTP getter with mirrors + failover -------------------
+async function safeGetFromSources(url, sources = []) {
+  // sources: array of base URLs that replace https://api.binance.com in url
   let lastErr = null;
-  for (const url of candidates) {
+  // Try each provided source first
+  for (const base of sources) {
     try {
-      const axiosOpts = {
-        timeout: AXIOS_TIMEOUT,
-        headers: {
-          "User-Agent": "aiTraderBot/1.0 (+https://example.com)",
-          Accept: "application/json, text/plain, */*",
-          ...(options.headers || {}),
-        },
-        ...options,
-      };
-
-      // If PROXY_URL given, set it up using env for axios (http(s)_proxy) — axios doesn't accept proxy string directly with fetch adapter,
-      // but many environments use HTTP_PROXY env — we'll pass nothing here but set global env so underlying adapter picks it up.
-      if (PROXY_URL) {
-        // set env for underlying library (works for many runtime setups)
-        process.env.HTTP_PROXY = PROXY_URL;
-        process.env.HTTPS_PROXY = PROXY_URL;
-      }
-
-      const res = await axios.get(url, axiosOpts);
+      const tryUrl = url.replace("https://api.binance.com", base);
+      const res = await axiosInstance.get(tryUrl, { timeout: CONFIG.AXIOS_TIMEOUT });
       if (res && (res.status === 200 || res.status === 201)) return res.data;
       lastErr = new Error(`HTTP ${res?.status}`);
-    } catch (err) {
-      lastErr = err;
-      // continue to next URL
+    } catch (e) {
+      lastErr = e;
     }
   }
 
-  console.warn("safeAxiosGet failed for", originalUrl, lastErr?.message || lastErr);
+  // Attempt original URL fallback
+  try {
+    const res = await axiosInstance.get(url, { timeout: CONFIG.AXIOS_TIMEOUT });
+    if (res && (res.status === 200 || res.status === 201)) return res.data;
+  } catch (e) {
+    lastErr = e;
+  }
+
+  console.warn("safeGetFromSources failed:", lastErr?.message || lastErr);
   return null;
 }
 
-// -------- normalize klines (binance style) ----------
-function normalizeKlineArray(raw) {
+//
+// ------------------- Normalize Binance klines to uniform objects -------------------
+function normalizeKlines(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.map((k) => ({
-    t: Number(k[0] ?? 0),
-    open: Number(k[1] ?? 0),
-    high: Number(k[2] ?? 0),
-    low: Number(k[3] ?? 0),
-    close: Number(k[4] ?? 0),
-    vol: Number(k[5] ?? 0),
-  })).filter(c => Number.isFinite(c.close));
+  return raw
+    .map((r) => ({
+      t: Number(r[0] ?? r.openTime ?? 0),
+      open: Number(r[1] ?? r.open ?? 0),
+      high: Number(r[2] ?? r.high ?? 0),
+      low: Number(r[3] ?? r.low ?? 0),
+      close: Number(r[4] ?? r.close ?? 0),
+      vol: Number(r[5] ?? r.volume ?? 0),
+    }))
+    .filter((c) => Number.isFinite(c.close));
 }
 
-// -------- fetch candles (primary) ----------
-async function fetchCrypto(symbol = SYMBOL, interval = "15m", limit = DEFAULT_LIMIT) {
-  // Standard Binance klines endpoint (we'll let safeAxiosGet try mirrors)
+//
+// ------------------- Fetch candles (multi-source) -------------------
+async function fetchCandlesBinance(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT) {
   const base = "https://api.binance.com";
   const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const raw = await safeAxiosGet(url);
-  if (!raw) return [];
-  return normalizeKlineArray(raw);
+  const data = await safeGetFromSources(url, CONFIG.BINANCE_HTTP_MIRRORS);
+  return data ? normalizeKlines(data) : [];
 }
 
-async function ensureCandles(symbol = SYMBOL, interval = "15m", limit = DEFAULT_LIMIT) {
-  try {
-    const cached = readCache(symbol, interval) || [];
-    const fresh = await fetchCrypto(symbol, interval, limit);
-    if (Array.isArray(fresh) && fresh.length) {
-      writeCache(symbol, interval, fresh);
-      return fresh;
+// Fallback attempt to other exchanges (simple — not full compatibility)
+async function fetchCandlesFallback(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT) {
+  // Try Bybit, KuCoin, Coinbase minimal endpoints — NOTE: intervals may not match exactly
+  // By default we attempt to map to similar endpoints, but priority is Binance Vision.
+  const tries = [];
+
+  // bybit (kline)
+  tries.push(async () => {
+    try {
+      const s = symbol.replace("USDT", "USDT");
+      const url = `${CONFIG.OTHER_SOURCES.BYBIT}/public/linear/kline?symbol=${s}&interval=${interval}&limit=${limit}`;
+      const res = await axiosInstance.get(url);
+      if (res?.data?.result) {
+        // bybit returns result array
+        return res.data.result.map((r) => ({
+          t: Number(r[0]),
+          open: Number(r[1]),
+          high: Number(r[2]),
+          low: Number(r[3]),
+          close: Number(r[4]),
+          vol: Number(r[5]),
+        }));
+      }
+      return null;
+    } catch (e) {
+      return null;
     }
-    return cached;
-  } catch (e) {
-    console.warn("ensureCandles error:", e?.message || e);
-    return readCache(symbol, interval) || [];
+  });
+
+  // kucoin
+  tries.push(async () => {
+    try {
+      const url = `${CONFIG.OTHER_SOURCES.KUCOIN}/api/v1/market/candles?symbol=${symbol}&type=${interval}&limit=${limit}`;
+      const res = await axiosInstance.get(url);
+      if (res?.data?.data) {
+        return res.data.data.map((r) => ({
+          t: Number(r[0]),
+          open: Number(r[1]),
+          high: Number(r[2]),
+          low: Number(r[3]),
+          close: Number(r[4]),
+          vol: Number(r[5]),
+        }));
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  });
+
+  // coinbase (granularity in seconds — only do 15m -> 900)
+  tries.push(async () => {
+    try {
+      const gran = intervalToSeconds(interval);
+      const url = `${CONFIG.OTHER_SOURCES.COINBASE}/products/${symbol.replace("USDT", "-USD")}/candles?granularity=${gran}`;
+      const res = await axiosInstance.get(url);
+      if (Array.isArray(res?.data)) {
+        // Coinbase returns [time, low, high, open, close, volume] — note order differs
+        return res.data.map((r) => ({
+          t: Number(r[0] * 1000),
+          low: Number(r[1]),
+          high: Number(r[2]),
+          open: Number(r[3]),
+          close: Number(r[4]),
+          vol: Number(r[5]),
+        }));
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  });
+
+  for (const fn of tries) {
+    try {
+      const out = await fn();
+      if (Array.isArray(out) && out.length) return out;
+    } catch (_) {}
   }
+
+  return [];
 }
 
-// -------- INDICATORS: RSI, ATR, MACD, etc. ----------
-function computeRSI(candles, length = 14) {
-  if (!Array.isArray(candles) || candles.length < length + 1) return 50;
-  let gains = 0, losses = 0;
+function intervalToSeconds(interval) {
+  if (!interval) return 60;
+  if (interval.endsWith("m")) return Number(interval.slice(0, -1)) * 60;
+  if (interval.endsWith("h")) return Number(interval.slice(0, -1)) * 3600;
+  if (interval.endsWith("d")) return Number(interval.slice(0, -1)) * 86400;
+  return 60;
+}
+
+//
+// ------------------- Caching wrapper with fallback -------------------
+async function ensureCandles(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT) {
+  const cached = readCache(symbol, interval) || [];
+  let fresh = [];
+  try {
+    fresh = await fetchCandlesBinance(symbol, interval, limit);
+    if ((!fresh || !fresh.length) && CONFIG.OTHER_SOURCES) {
+      fresh = await fetchCandlesFallback(symbol, interval, limit);
+    }
+  } catch (e) {
+    console.warn("ensureCandles fetch error", e?.message || e);
+  }
+
+  if (Array.isArray(fresh) && fresh.length) {
+    writeCache(symbol, interval, fresh);
+    return fresh;
+  }
+  return cached;
+}
+
+//
+// ------------------- Indicators: RSI, ATR, EMA, MACD -------------------
+function computeRSI(candles = [], length = 14) {
+  if (!Array.isArray(candles) || candles.length < length + 1) return null;
+  let gains = 0,
+    losses = 0;
   for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
-    const diff = (candles[i + 1].close ?? 0) - (candles[i].close ?? 0);
+    const diff = (candles[i + 1].close || 0) - (candles[i].close || 0);
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
   if (gains === 0 && losses === 0) return 50;
   const avgGain = gains / length;
-  const avgLoss = (losses || 0.000001) / length;
+  const avgLoss = (losses || 1e-6) / length;
   const rs = avgGain / avgLoss;
   return Number((100 - 100 / (1 + rs)).toFixed(2));
 }
 
-function computeATR(candles, length = 14) {
+function computeATR(candles = [], length = 14) {
   if (!Array.isArray(candles) || candles.length < length + 1) return 0;
   const trs = [];
   for (let i = candles.length - length; i < candles.length; i++) {
     const cur = candles[i];
-    const prev = candles[i - 1] ?? cur;
-    const high = Number(cur.high ?? 0);
-    const low = Number(cur.low ?? 0);
-    const prevClose = Number(prev.close ?? 0);
+    const prev = candles[i - 1] || cur;
+    const high = Number(cur.high || 0);
+    const low = Number(cur.low || 0);
+    const prevClose = Number(prev.close || 0);
     const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
     trs.push(tr);
   }
-  const atr = trs.reduce((a, b) => a + b, 0) / Math.max(1, trs.length);
-  return Number(atr.toFixed(6));
+  if (!trs.length) return 0;
+  return Number((trs.reduce((a, b) => a + b, 0) / trs.length).toFixed(2));
 }
 
 function ema(values = [], period = 12) {
-  if (!Array.isArray(values) || values.length === 0) return [];
+  if (!Array.isArray(values) || !values.length) return [];
   const k = 2 / (period + 1);
   let prev = values[0];
   const out = [];
@@ -224,39 +328,30 @@ function ema(values = [], period = 12) {
 }
 
 function computeMACD(candles = []) {
-  if (!Array.isArray(candles) || candles.length < 35) return { hist: 0, macd: 0, signal: 0 };
-  const closes = candles.map(c => Number(c.close ?? 0));
+  if (!Array.isArray(candles) || candles.length < 35) return { hist: 0, line: 0, signal: 0 };
+  const closes = candles.map((c) => Number(c.close || 0));
   const ema12 = ema(closes, 12);
   const ema26 = ema(closes, 26);
-  const macdLine = ema12.map((v, i) => v - (ema26[i] ?? 0));
-  const signalLine = ema(macdLine, 9);
-  const hist = (macdLine.at(-1) ?? 0) - (signalLine.at(-1) ?? 0);
-  return { hist: Number(hist.toFixed(8)), macd: Number((macdLine.at(-1) ?? 0).toFixed(8)), signal: Number((signalLine.at(-1) ?? 0).toFixed(8)) };
+  const macdLine = ema12.map((v, i) => v - (ema26[i] || 0));
+  const signal = ema(macdLine, 9);
+  const hist = (macdLine.at(-1) || 0) - (signal.at(-1) || 0);
+  return { hist: Number(hist.toFixed(6)), line: Number((macdLine.at(-1) || 0).toFixed(6)), signal: Number((signal.at(-1) || 0).toFixed(6)) };
 }
 
 function priceTrend(candles = []) {
   if (!Array.isArray(candles) || candles.length < 2) return "FLAT";
-  const last = Number(candles.at(-1).close ?? 0);
-  const prev = Number(candles.at(-2).close ?? 0);
+  const last = Number(candles.at(-1).close || 0);
+  const prev = Number(candles.at(-2).close || 0);
   if (last > prev) return "UP";
   if (last < prev) return "DOWN";
   return "FLAT";
 }
 
-function volumeTrend(candles = []) {
-  if (!Array.isArray(candles) || candles.length < 2) return "STABLE";
-  const last = Number(candles.at(-1).vol ?? candles.at(-1).volume ?? 0);
-  const prev = Number(candles.at(-2).vol ?? candles.at(-2).volume ?? 0);
-  if (last > prev) return "INCREASING";
-  if (last < prev) return "DECREASING";
-  return "STABLE";
-}
-
 function analyzeVolume(candles = []) {
   if (!Array.isArray(candles) || candles.length < 3) return { status: "UNKNOWN", strength: 0 };
-  const v1 = Number(candles.at(-3).vol ?? 0);
-  const v2 = Number(candles.at(-2).vol ?? 0);
-  const v3 = Number(candles.at(-1).vol ?? 0);
+  const v1 = Number(candles.at(-3).vol || 0);
+  const v2 = Number(candles.at(-2).vol || 0);
+  const v3 = Number(candles.at(-1).vol || 0);
   if (v3 > v2 && v2 > v1) return { status: "RISING", strength: 3 };
   if (v3 < v2 && v2 < v1) return { status: "FALLING", strength: -3 };
   if (v3 > v2) return { status: "SLIGHT_UP", strength: 1 };
@@ -266,309 +361,307 @@ function analyzeVolume(candles = []) {
 
 function computeFibLevelsFromCandles(candles = []) {
   if (!Array.isArray(candles) || !candles.length) return null;
+  const highs = candles.map((c) => Number(c.high || 0));
+  const lows = candles.map((c) => Number(c.low || 0));
+  const hi = Math.max(...highs);
+  const lo = Math.min(...lows);
+  const diff = hi - lo;
+  return {
+    lo,
+    hi,
+    retrace: {
+      "0.236": Number((hi - diff * 0.236).toFixed(6)),
+      "0.382": Number((hi - diff * 0.382).toFixed(6)),
+      "0.5": Number((hi - diff * 0.5).toFixed(6)),
+      "0.618": Number((hi - diff * 0.618).toFixed(6)),
+      "0.786": Number((hi - diff * 0.786).toFixed(6)),
+    },
+    extensions: {
+      "1.272": Number((hi + diff * 0.272).toFixed(6)),
+      "1.618": Number((hi + diff * 0.618).toFixed(6)),
+    },
+  };
+}
+
+//
+// ------------------- Elliott placeholder (you can replace with your module) -------------------
+async function analyzeElliottSimple(candles = []) {
+  // This is a simple heuristic placeholder; replace with your real elliott module if you have it.
   try {
-    const highs = candles.map(c => Number(c.high ?? 0));
-    const lows = candles.map(c => Number(c.low ?? 0));
-    const hi = Math.max(...highs);
-    const lo = Math.min(...lows);
-    if (!isFinite(hi) || !isFinite(lo)) return null;
-    const diff = hi - lo;
-    return {
-      lo, hi,
-      retrace: {
-        "0.236": Number((hi - diff * 0.236).toFixed(6)),
-        "0.382": Number((hi - diff * 0.382).toFixed(6)),
-        "0.5": Number((hi - diff * 0.5).toFixed(6)),
-        "0.618": Number((hi - diff * 0.618).toFixed(6)),
-        "0.786": Number((hi - diff * 0.786).toFixed(6)),
-      },
-      extensions: {
-        "1.272": Number((hi + diff * 0.272).toFixed(6)),
-        "1.618": Number((hi + diff * 0.618).toFixed(6)),
-      }
-    };
+    if (!Array.isArray(candles) || candles.length < 21) return null;
+    const rsi = computeRSI(candles, 14);
+    if (rsi > 65) return { wave: "impulse-up", confidence: 60 };
+    if (rsi < 35) return { wave: "impulse-down", confidence: 60 };
+    return { wave: "sideways", confidence: 35 };
   } catch (e) {
     return null;
   }
 }
 
-// ---------- fetchMarketData (returns { data, price, volume, indicators, fib, updated }) ----------
-async function fetchMarketData(symbol = SYMBOL, interval = "15m", limit = DEFAULT_LIMIT) {
+//
+// ------------------- ML placeholder (load model if exists) -------------------
+async function runMLPrediction(symbol = "BTCUSDT", candles = []) {
+  // Minimal stub: tries to load ./ml_model.json if present and runs a simple scoring rule.
   try {
-    const candles = await ensureCandles(symbol, interval, limit);
-    const data = Array.isArray(candles) ? candles : [];
-    const price = data.at(-1)?.close ?? 0;
-    const volume = data.at(-1)?.vol ?? data.at(-1)?.volume ?? 0;
-    const indicators = data.length ? {
-      RSI: computeRSI(data),
-      MACD: computeMACD(data),
-      ATR: computeATR(data),
-      priceTrend: priceTrend(data),
-      volumeTrend: volumeTrend(data),
-      volumeNote: analyzeVolume(data)
-    } : null;
-    const fib = data.length ? computeFibLevelsFromCandles(data) : null;
-    return { data, price, volume, indicators, fib, updated: nowLocal() };
+    const modelPath = path.resolve("./ml_model.json");
+    if (!fs.existsSync(modelPath)) return null;
+    const model = JSON.parse(fs.readFileSync(modelPath, "utf8"));
+    // Very small heuristic: if model.threshold and last close is greater return bullish prob (fake)
+    const last = candles.at(-1)?.close || 0;
+    const prob = model && model.threshold ? Math.min(99, Math.max(1, Math.round((last % 100) / (model.threshold || 1) * 100))) : 50;
+    return { label: prob > 55 ? "Bullish" : "Neutral", prob: prob, raw: model };
   } catch (e) {
-    console.error("fetchMarketData error:", e?.message || e);
-    return { data: [], price: 0, volume: 0, indicators: null, fib: null, updated: nowLocal(), error: e?.message || String(e) };
+    console.warn("ML load error", e?.message || e);
+    return null;
   }
 }
 
-// -------- WebSocket live price (Binance mirrors) ----------
+//
+// ------------------- News placeholder -------------------
+async function fetchNewsStub(symbol = "BTC") {
+  try {
+    // Try Coingecko coin news (simple): /search/trending isn't headline based but keep lightweight
+    // Real production: use a reliable news API (GNews, NewsAPI) and parse sentiment
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+//
+// ------------------- Fetch market data wrapper (returns indicators + fib etc) -------------------
+async function fetchMarketData(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT) {
+  const candles = await ensureCandles(symbol, interval, limit);
+  const data = Array.isArray(candles) ? candles : [];
+  const last = data.at(-1) || {};
+  const indicators = {
+    RSI: computeRSI(data, 14),
+    MACD: computeMACD(data),
+    ATR: computeATR(data, 14),
+    priceTrend: priceTrend(data),
+    volume: analyzeVolume(data),
+  };
+  const fib = computeFibLevelsFromCandles(data);
+  return {
+    data,
+    price: Number(last.close || 0),
+    volume: Number(last.vol || 0),
+    indicators,
+    fib,
+    updated: nowLocalReadable(),
+  };
+}
+
+//
+// ------------------- WebSocket live price mirror (rotating) -------------------
 let ws = null;
-let lastPrice = null;
 let socketAlive = false;
-let wsIndex = 0;
+let lastPrice = null;
+let wsMirrorIndex = 0;
 let wsReconnectTimer = null;
 
-function connectLiveSocket(symbol = SYMBOL) {
-  const stream = `${symbol.toLowerCase()}@ticker`;
+function connectLiveSocket(symbol = CONFIG.SYMBOL) {
+  const stream = `${symbol.toLowerCase()}@ticker`; // 24hr ticker stream (binance)
+  const mirrors = CONFIG.BINANCE_WS_MIRRORS || [];
   function doConnect() {
-    const base = BINANCE_WS_MIRRORS[wsIndex % BINANCE_WS_MIRRORS.length];
-    const url = base.endsWith("/") ? base + stream : base + "/" + stream;
+    const base = mirrors[wsMirrorIndex % mirrors.length];
+    const url = base.endsWith("/") ? `${base}${stream}` : `${base}/${stream}`;
+    console.log("WS connecting to", url);
     try {
       if (ws) {
-        try { ws.removeAllListeners?.(); ws.close?.(); } catch {}
+        try { ws.removeAllListeners?.(); ws.terminate?.(); ws.close?.(); } catch (_) {}
         ws = null;
       }
       ws = new WebSocket(url);
-      ws.on("open", () => { socketAlive = true; console.log("WS open", url); });
-      ws.on("message", (d) => {
+      ws.on("open", () => {
+        socketAlive = true;
+        console.log("WS open:", url);
+      });
+      ws.on("message", (msg) => {
         try {
-          const json = typeof d === "string" ? JSON.parse(d) : JSON.parse(d.toString());
-          // Binance ticker uses 'c' as last price
-          if (json && (json.c || json.price)) {
-            lastPrice = parseFloat(json.c ?? json.price);
-          }
-        } catch {}
+          const j = typeof msg === "string" ? JSON.parse(msg) : JSON.parse(msg.toString());
+          // Binance ticker uses 'c' as close
+          const p = Number(j.c || j.price || j.lastPrice || 0);
+          if (p) lastPrice = p;
+        } catch (e) {}
       });
       ws.on("close", (code, reason) => {
         socketAlive = false;
-        console.warn("WS close:", code, String(reason).slice(0, 100));
-        wsIndex = (wsIndex + 1) % BINANCE_WS_MIRRORS.length;
+        console.warn("WS closed", code, String(reason).slice(0, 120));
+        wsMirrorIndex = (wsMirrorIndex + 1) % mirrors.length;
         if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
         wsReconnectTimer = setTimeout(doConnect, 8000);
       });
       ws.on("error", (err) => {
         socketAlive = false;
-        console.warn("WS error:", err && err.message ? err.message : String(err));
-        try { ws.close(); } catch {}
+        console.warn("WS error:", err?.message || String(err).slice(0,120));
+        try { ws.close(); } catch (_) {}
       });
     } catch (e) {
       socketAlive = false;
-      console.error("connectLiveSocket fatal:", e?.message || e);
-      wsIndex = (wsIndex + 1) % BINANCE_WS_MIRRORS.length;
+      console.warn("WS connect failed", e?.message || e);
+      wsMirrorIndex = (wsMirrorIndex + 1) % mirrors.length;
       setTimeout(doConnect, 8000);
     }
   }
   doConnect();
 }
 
-// start WS
-try { connectLiveSocket(SYMBOL); } catch (e) { console.warn("WS start failed:", e?.message || e); }
+//
+// ------------------- Telegram setup -------------------
+const BOT_TOKEN = CONFIG.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = CONFIG.TELEGRAM_CHAT_ID;
+const bot = BOT_TOKEN ? new TelegramBot(BOT_TOKEN, { polling: false }) : null;
 
-// keep WS alive
-setInterval(() => { if (!socketAlive) { console.log("WS not alive — reconnecting"); try { connectLiveSocket(SYMBOL); } catch (e) {} } }, 60_000);
-
-// -------- Build AI Report object ----------
-async function buildAIReport(symbol = SYMBOL, context = null) {
+async function sendTelegramHTML(html) {
+  if (!bot || !CHAT_ID) {
+    console.warn("Telegram not configured (BOT_TOKEN or CHAT_ID missing)");
+    return false;
+  }
   try {
-    // context: { price, candles, ml, ell, news, socketAlive }
-    let ctx = context;
-    if (!ctx) {
-      const c = await fetchMarketData(symbol, "15m", DEFAULT_LIMIT);
-      ctx = { price: c.price, candles: c.data, ml: null, ell: null, news: null, socketAlive };
+    await bot.sendMessage(CHAT_ID, html, { parse_mode: "HTML", disable_web_page_preview: true });
+    return true;
+  } catch (e) {
+    console.error("Telegram send failed", e?.message || e);
+    return false;
+  }
+}
+
+//
+// ------------------- Build report (Multi-TF, 15m focused) -------------------
+async function buildAIReport(symbol = CONFIG.SYMBOL) {
+  try {
+    const tfs = CONFIG.INTERVALS;
+    const mtf = [];
+    for (const tf of tfs) {
+      try {
+        const resp = await fetchMarketData(symbol, tf, CONFIG.DEFAULT_LIMIT);
+        const cand = resp.data || [];
+        const last = cand.at(-1) || {};
+        const indicators = resp.indicators || {};
+        const volText = indicators && indicators.volume ? indicators.volume.status : "UNKNOWN";
+        const bias = (() => {
+          const rsi = indicators?.RSI;
+          const macdHist = indicators?.MACD?.hist;
+          if (rsi !== null && typeof macdHist === "number") {
+            if (rsi > 60 && macdHist > 0) return "Bullish";
+            if (rsi < 40 && macdHist < 0) return "Bearish";
+            return "Neutral";
+          }
+          return "N/A";
+        })();
+        mtf.push({
+          tf,
+          price: resp.price || 0,
+          lastClose: last.close || 0,
+          indicators,
+          volText,
+          bias,
+          fib: resp.fib || null,
+        });
+      } catch (e) {
+        mtf.push({ tf, error: String(e?.message || e) });
+      }
     }
 
-    const tfs = ["1m", "5m", "15m", "30m", "1h"];
-    const mtf = await Promise.all(tfs.map(async (tf) => {
-      try {
-        const res = await fetchMarketData(symbol, tf, DEFAULT_LIMIT);
-        const candles = res.data || [];
-        const indicators = candles.length ? {
-          RSI: computeRSI(candles),
-          MACD: computeMACD(candles),
-          ATR: computeATR(candles),
-          priceTrend: priceTrend(candles),
-          volumeTrend: volumeTrend(candles),
-          volumeNote: analyzeVolume(candles)
-        } : null;
-        const hi = candles.length ? Math.max(...candles.map(c => Number(c.high ?? 0))) : null;
-        const lo = candles.length ? Math.min(...candles.map(c => Number(c.low ?? 0))) : null;
-        const fib = (hi !== null && lo !== null) ? computeFibLevelsFromCandles(candles) : null;
-        const bias = (indicators?.RSI !== undefined && indicators?.MACD?.hist !== undefined)
-          ? (indicators.RSI > 60 && indicators.MACD.hist > 0 ? "Bullish" : indicators.RSI < 40 && indicators.MACD.hist < 0 ? "Bearish" : "Neutral")
-          : "N/A";
-        return { tf, candles, last: candles.at(-1) ?? null, indicators, fib, bias, volTrend: indicators?.volumeNote || null };
-      } catch (e) {
-        return { tf, error: String(e?.message || e) };
-      }
-    }));
-
-    const tf15 = mtf.find(m => m.tf === "15m") || {};
-    const price = ctx.price ?? (tf15.last ? Number(tf15.last.close) : 0);
+    // 15m context (candles, ml, ell, news)
+    const ctx15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
+    const ml = await runMLPrediction(symbol, ctx15.data);
+    const ell = await analyzeElliottSimple(ctx15.data);
+    const news = await fetchNewsStub(symbol.replace("USDT", ""));
+    const price = lastPrice || ctx15.price || 0;
 
     return {
       symbol,
       price,
       mtf,
-      ml: ctx.ml || null,
-      ell: ctx.ell || null,
-      news: ctx.news || null,
-      fib15: tf15.fib || null,
-      socketAlive: ctx.socketAlive || socketAlive || false,
-      generatedAt: new Date().toISOString()
+      ml,
+      ell,
+      news,
+      generatedAt: nowLocalReadable(),
     };
   } catch (e) {
-    console.error("buildAIReport error:", e?.message || e);
-    return { symbol, price: 0, mtf: [], ml: null, ell: null, news: null, fib15: null, socketAlive: false, generatedAt: new Date().toISOString(), error: e?.message || String(e) };
+    return { symbol, price: 0, mtf: [], ml: null, ell: null, news: null, generatedAt: nowLocalReadable(), error: String(e?.message || e) };
   }
 }
 
-// -------- Format & send report to Telegram (HTML) ----------
-async function formatAIReport(report) {
-  try {
-    const symbol = report.symbol || SYMBOL;
-    const price = Number(report.price || 0);
-    const generatedAt = report.generatedAt ? new Date(report.generatedAt).toLocaleString() : nowLocal();
+function formatReportHTML(r) {
+  const price = Number(r.price || 0).toFixed(2);
+  const generated = r.generatedAt || nowLocalReadable();
+  const header = `<b>🚀 ${r.symbol} — AI Trader (single-file)</b>\n${generated}\n\nPrice: <b>${price}</b>\n\n`;
 
-    // ML & Elliott
-    const mlLabel = report.ml?.label || "Neutral";
-    const mlProb = Number(report.ml?.prob ?? report.ml?.confidence ?? 0);
-    const ellText = report.ell ? `${report.ell.wave || "N/A"} | Conf: ${(report.ell.confidence || 0).toFixed(1)}%` : "N/A";
-
-    // Multi-TF block
-    const tfLines = (report.mtf || []).map(m => {
+  const mtfBlock = r.mtf
+    .map((m) => {
       if (m.error) return `<b>[${m.tf}]</b> Error: ${m.error}`;
-      const rsi = (m.indicators?.RSI !== undefined && m.indicators?.RSI !== null) ? m.indicators.RSI.toFixed(1) : "N/A";
-      const macd = (m.indicators?.MACD?.hist !== undefined && m.indicators?.MACD?.hist !== null) ? m.indicators.MACD.hist.toFixed(4) : "N/A";
-      const atr = (m.indicators?.ATR !== undefined && m.indicators?.ATR !== null) ? m.indicators.ATR.toFixed(4) : "N/A";
-      const volLabel = m.volTrend ? (m.volTrend.label || m.volTrend.status || "N/A") : "N/A";
-      const emoji = m.bias === "Bullish" ? "🟢" : m.bias === "Bearish" ? "🔴" : "⚪";
-      const lastPrice = m.last?.close ? Number(m.last.close).toFixed(2) : "N/A";
-      const signal = m.bias === "Bullish" ? "BUY" : m.bias === "Bearish" ? "SELL" : "HOLD";
+      const rsi = m.indicators?.RSI ?? "N/A";
+      const macd = m.indicators?.MACD?.hist ?? "N/A";
+      const atr = m.indicators?.ATR ?? "N/A";
+      const vol = (m.indicators && m.indicators.volume && m.indicators.volume.status) || "N/A";
+      const sig = m.bias || "N/A";
+      return `<b>[${m.tf}]</b> ${sig}\nRSI:${rsi} | MACD:${typeof macd === "number" ? macd.toFixed(4) : macd} | ATR:${atr}\nPrice: ${m.lastClose || m.price || "N/A"} | Vol:${vol}\n`;
+    })
+    .join("\n-----------------\n");
 
-      return `<b>[${m.tf}]</b> ${emoji} ${m.bias}
-RSI:${rsi} | MACD:${macd} | ATR:${atr}
-Price: ${lastPrice} | Vol:${volLabel} | Signal:${signal}`;
-    }).join("\n\n<b>─</b>\n\n");
+  const ellTxt = r.ell ? `${r.ell.wave} | Conf ${r.ell.confidence || 0}` : "N/A";
+  const mlTxt = r.ml ? `${r.ml.label} (${r.ml.prob ?? 0}%)` : "N/A";
 
-    // TP/SL using ATR(15) fallback
-    const atr15 = (report.mtf || []).find(x => x.tf === "15m")?.indicators?.ATR ?? Math.max(price * 0.005, 1);
-    const tp1 = (price + atr15 * 1.5).toFixed(2);
-    const tp2 = (price + atr15 * 3).toFixed(2);
-    const tp3 = (price + atr15 * 5).toFixed(2);
-    const sl = (price - atr15 * 2).toFixed(2);
+  const footer = `\n\n<b>🧠 ML:</b> ${mlTxt}\n<b>📈 Elliott:</b> ${ellTxt}\n\n<i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | vSingleFile</i>`;
 
-    const fib = report.fib15;
-    const fibRange = fib ? `${fib.lo} - ${fib.hi}` : "N/A";
-
-    const newsSent = report.news?.sentiment || 0;
-    const newsTxt = newsSent > 0 ? "Bullish 🟢" : newsSent < 0 ? "Bearish 🔴" : "Neutral";
-    const headlines = (report.news?.headlines || []).slice(0, 4).map(h => `• ${h}`).join("\n") || "N/A";
-
-    // Compose HTML (Telegram parse_mode HTML)
-    const html = `
-<b>${symbol} — AI Trader</b>
-<i>${generatedAt}</i>
-
-<b>Price:</b> <code>${price.toFixed(2)}</code>
-
-<b>AI Prediction:</b> ${mlLabel} (${mlProb}%)
-<b>Elliott (15m):</b> ${ellText}
-
-<b>📊 Multi-Timeframe Overview</b>
-<pre>${tfLines}</pre>
-
-<b>🎯 TP / SL (ATR-based)</b>
-TP1: ${tp1} | TP2: ${tp2} | TP3: ${tp3}
-SL: ${sl}
-
-<b>Fib Zone (15m):</b> ${fibRange}
-
-<b>📰 News Impact:</b> ${newsTxt}
-${headlines}
-
-<i>Data: Multi-source (Binance Vision + Binance + Bybit/KuCoin/CB) | vSingleFile</i>
-`.trim();
-
-    // send to Telegram if configured
-    if (!bot || !BOT_TOKEN || !CHAT_ID) {
-      console.log("Telegram not configured — returning HTML payload as string");
-      return html;
-    }
-
-    try {
-      await bot.sendMessage(CHAT_ID, html, { parse_mode: "HTML", disable_web_page_preview: true });
-      return html;
-    } catch (err) {
-      console.error("Telegram send failed:", err?.message || err);
-      return html;
-    }
-  } catch (err) {
-    console.error("formatAIReport error:", err?.message || err);
-    return `Error building report for ${report?.symbol || SYMBOL}`;
-  }
+  return `${header}<b>📊 Multi-Timeframe Overview</b>\n${mtfBlock}\n${footer}`;
 }
 
-// -------- Get Data Context (candles + ML + Elliott + News) ----------
-async function getDataContext(symbol = SYMBOL) {
-  try {
-    const candlesResp = await fetchMarketData(symbol, "15m", DEFAULT_LIMIT).catch(e => {
-      console.warn("fetchMarketData(15m) error:", e?.message || e);
-      return null;
-    });
-
-    const candles = (candlesResp && candlesResp.data) || [];
-    if (!candles || candles.length === 0) {
-      return { price: lastPrice || 0, candles: [], ml: null, ell: null, news: null, socketAlive, error: "No candles" };
-    }
-
-    const last = candles.at(-1);
-    const price = (typeof lastPrice === "number" && !Number.isNaN(lastPrice)) ? lastPrice : (Number(last.close) || 0);
-
-    // trigger ML/Elliott/News in parallel if modules are available, else null
-    const mlP = (typeof runMLPrediction === "function") ? runMLPrediction(symbol).catch(e => { console.warn("ML err:", e?.message || e); return null; }) : Promise.resolve(null);
-    const ellP = (typeof analyzeElliott === "function") ? analyzeElliott(candles).catch(e => { console.warn("Elliott err:", e?.message || e); return null; }) : Promise.resolve(null);
-    const newsP = (typeof fetchNews === "function") ? fetchNews(symbol.replace("USDT", "")).catch(e => { console.warn("News err:", e?.message || e); return null; }) : Promise.resolve(null);
-
-    const [ml, ell, news] = await Promise.all([mlP, ellP, newsP]);
-
-    return { price, candles, ml, ell, news, socketAlive };
-  } catch (e) {
-    console.error("getDataContext error:", e?.message || e);
-    return { price: lastPrice || 0, candles: [], ml: null, ell: null, news: null, socketAlive, error: e?.message || String(e) };
-  }
-}
-
-// -------- Auto 15m report job (build -> format -> send) ----------
+//
+// ------------------- Auto 15m report + runner -------------------
 async function sendAutoReport() {
   try {
-    const ctx = await getDataContext(SYMBOL);
-    const report = await buildAIReport(SYMBOL, ctx);
-    await formatAIReport(report);
-    console.log(`Report sent for ${SYMBOL} @ ${new Date().toLocaleString()}`);
+    const reportObj = await buildAIReport(CONFIG.SYMBOL);
+    const html = formatReportHTML(reportObj);
+    await sendTelegramHTML(html);
+    console.log(`[${new Date().toLocaleTimeString()}] Report sent for ${CONFIG.SYMBOL}`);
   } catch (e) {
-    console.error("sendAutoReport error:", e?.message || e);
+    console.error("sendAutoReport failed", e?.message || e);
   }
 }
 
-// schedule
-setInterval(sendAutoReport, REPORT_INTERVAL_MS);
+//
+// ------------------- Express keep-alive endpoint -------------------
+const app = express();
+app.get("/", (_, res) => res.send(`✅ AI Trader singlefile running — ${nowLocalReadable()}`));
+app.listen(CONFIG.SERVER_PORT, () => console.log(`Server live on port ${CONFIG.SERVER_PORT}`));
 
-// immediate start
+//
+// ------------------- Start WS + schedule -------------------
+try {
+  connectLiveSocket(CONFIG.SYMBOL);
+} catch (e) {
+  console.warn("WS init failed", e?.message || e);
+}
+
+const intervalMs = Math.max(60_000, CONFIG.REPORT_INTERVAL_MIN * 60_000);
+setInterval(() => {
+  // ensure live send only when configured
+  if (BOT_TOKEN && CHAT_ID) sendAutoReport(); else console.log("Telegram not configured — skipping auto send.");
+}, intervalMs);
+
+// immediate run once
 (async () => {
-  try { await sendAutoReport(); } catch (e) { console.warn("initial report failed:", e?.message || e); }
+  try {
+    await sendAutoReport();
+  } catch (e) {
+    console.warn("initial send failed", e?.message || e);
+  }
 })();
 
-// Express server for keep-alive (optional)
-const app = express();
-const PORT = Number(ENV.PORT) || 10000;
-app.get("/", (req, res) => res.send("✅ aiTraderBot single-file running"));
-app.listen(PORT, () => console.log(`Server listening ${PORT}`));
+// Keep-alive ping to SELF_PING_URL
+if (CONFIG.SELF_PING_URL) {
+  setInterval(async () => {
+    try {
+      await axiosInstance.get(CONFIG.SELF_PING_URL);
+      console.log("KeepAlive ping success");
+    } catch (e) {
+      console.warn("KeepAlive failed", e?.message || e);
+    }
+  }, 5 * 60_000);
+}
 
-// Export in case user wants to import functions
-export default { sendAutoReport, getDataContext, fetchMarketData, computeRSI, computeMACD, computeATR };
-
-// End of file
+export default { sendAutoReport };
