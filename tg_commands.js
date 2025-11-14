@@ -401,5 +401,5 @@ ML: Placeholder (hook your ML module)
 }
 
 // exports
-export { buildAIReport, formatAIReport };
+
 export default { buildAIReport, formatAIReport };
