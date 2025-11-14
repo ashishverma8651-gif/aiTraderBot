@@ -19,8 +19,12 @@ const BINANCE_MIRRORS = Array.isArray(CONFIG?.BINANCE_MIRRORS) && CONFIG.BINANCE
   : [CONFIG?.BINANCE_BASE || "https://api.binance.com"];
 
 // ---------- helpers ----------
-function nowLocal() {
-  return new Date().toLocaleString("en-IN", { hour12: false });
+// TIME FORMAT UTILITY
+export function nowLocal() {
+  return new Date().toLocaleString("en-US", {
+    timeZone: "Asia/Kolkata",
+    hour12: true
+  });
 }
 
 function cachePath(symbol, interval) {
