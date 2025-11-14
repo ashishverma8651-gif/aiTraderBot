@@ -1,83 +1,141 @@
-// =========================================
-// utils.js — FINAL STABLE (NO PROXY, NO ERRORS)
-// =========================================
-
+// utils.js — multi-source fetch, caching, helpers
 import axios from "axios";
+import fs from "fs";
+import path from "path";
+import CONFIG from "./config.js";
 
-// Local Time
+const CACHE_DIR = CONFIG.PATHS?.CACHE_DIR || path.resolve("./cache");
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+const AXIOS_TIMEOUT = 15000;
+
 function nowLocal() {
-  return new Date().toLocaleString("en-IN", { hour12: false });
+  return new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata", hour12: true });
 }
 
-// Volume Trend
-function analyzeVolume(candles = []) {
-  if (candles.length < 5) return "stable";
-
-  const last = candles.slice(-5).map(c => parseFloat(c.volume));
-  const avgOld = (last[0] + last[1] + last[2]) / 3;
-  const avgNew = (last[3] + last[4]) / 2;
-
-  if (avgNew > avgOld * 1.15) return "up";
-  if (avgNew < avgOld * 0.85) return "down";
-  return "stable";
+function cachePath(symbol, interval) {
+  return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
+}
+function readCache(symbol, interval) {
+  try {
+    const p = cachePath(symbol, interval);
+    if (!fs.existsSync(p)) return [];
+    return JSON.parse(fs.readFileSync(p, "utf8") || "[]");
+  } catch {
+    return [];
+  }
+}
+function writeCache(symbol, interval, data) {
+  try {
+    fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2));
+  } catch (e) {
+    // ignore
+  }
 }
 
-// Multi-source market data
-const SOURCES = [
-  (s, tf, l) => `https://data-stream.binance.vision/api/v3/klines?symbol=${s}&interval=${tf}&limit=${l}`,
-  (s, tf, l) => `https://api1.binance.com/api/v3/klines?symbol=${s}&interval=${tf}&limit=${l}`,
-  (s, tf, l) => `https://api2.binance.com/api/v3/klines?symbol=${s}&interval=${tf}&limit=${l}`
-];
-
-async function fetchMarketData(symbol, tf = "15m", limit = 200) {
-  for (const build of SOURCES) {
-    const url = build(symbol, tf, limit);
-
+// Try a list of base URLs until one works
+async function safeAxiosGet(url, bases = [], options = {}) {
+  let lastErr = null;
+  // try with provided bases first
+  for (const b of bases) {
     try {
-      const res = await axios.get(url, { timeout: 5000 });
-
-      return res.data.map(x => ({
-        openTime: x[0],
-        open: x[1],
-        high: x[2],
-        low: x[3],
-        close: x[4],
-        volume: x[5],
-        closeTime: x[6]
-      }));
-    } catch (err) {
-      console.log("❗ Source failed:", url);
-      continue;
+      // replace default binance host with base when appropriate
+      const tryUrl = url.replace("https://api.binance.com", b);
+      const res = await axios.get(tryUrl, {
+        timeout: AXIOS_TIMEOUT,
+        proxy: CONFIG.PROXY || false,
+        headers: { "User-Agent": "aiTraderBot/1.0", Accept: "application/json" },
+        ...options
+      });
+      if (res && res.status === 200) return res.data;
+    } catch (e) {
+      lastErr = e;
     }
   }
 
-  throw new Error("All market-data sources failed");
+  // fall back to original url
+  try {
+    const res = await axios.get(url, { timeout: AXIOS_TIMEOUT, proxy: CONFIG.PROXY || false, ...options });
+    if (res && res.status === 200) return res.data;
+  } catch (e) {
+    lastErr = e;
+  }
+
+  console.warn("safeAxiosGet failed:", lastErr?.message || lastErr);
+  return null;
 }
 
-// FIB Levels
-function computeFibLevels(lo, hi) {
-  const r = hi - lo;
+// normalize Binance klines -> {t, open, high, low, close, vol}
+function normalizeKlineArray(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map(k => ({
+      t: Number(k[0] ?? 0),
+      open: Number(k[1] ?? 0),
+      high: Number(k[2] ?? 0),
+      low: Number(k[3] ?? 0),
+      close: Number(k[4] ?? 0),
+      vol: Number(k[5] ?? 0)
+    }))
+    .filter(c => Number.isFinite(c.close));
+}
+
+// fetchCrypto: tries multiple binance mirrors and fallback sources (only OHLCV endp)
+export async function fetchCrypto(symbol = "BTCUSDT", interval = "15m", limit = 200) {
+  // primary binance endpoint form
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+
+  // create composite bases array from config (Binance -> Bybit -> KuCoin -> Coinbase)
+  const bases = [
+    ...(CONFIG.DATA_SOURCES.BINANCE || []),
+    ...(CONFIG.DATA_SOURCES.BYBIT || []),
+    ...(CONFIG.DATA_SOURCES.KUCOIN || []),
+    ...(CONFIG.DATA_SOURCES.COINBASE || [])
+  ];
+
+  const raw = await safeAxiosGet(url, bases);
+  if (!raw) return [];
+  return normalizeKlineArray(raw);
+}
+
+// Ensure candles with cache fallback
+export async function ensureCandles(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT || 200) {
+  const cached = readCache(symbol, interval) || [];
+  try {
+    const fresh = await fetchCrypto(symbol, interval, limit);
+    if (Array.isArray(fresh) && fresh.length) {
+      writeCache(symbol, interval, fresh);
+      return fresh;
+    }
+    return cached;
+  } catch {
+    return cached;
+  }
+}
+
+// fetchMarketData wrapper
+export async function fetchMarketData(symbol = "BTCUSDT", interval = "15m", limit = CONFIG.DEFAULT_LIMIT || 200) {
+  const candles = await ensureCandles(symbol, interval, limit);
+  const last = candles.at(-1) || null;
   return {
-    retrace: {
-      "0.236": hi - r * 0.236,
-      "0.382": hi - r * 0.382,
-      "0.5": hi - r * 0.5,
-      "0.618": hi - r * 0.618,
-      "0.786": hi - r * 0.786
-    },
-    extensions: {
-      "1.272": hi + r * 0.272,
-      "1.618": hi + r * 0.618
-    },
-    lo,
-    hi
+    data: candles,
+    price: last ? Number(last.close || 0) : 0,
+    volume: last ? Number(last.vol || 0) : 0,
+    updated: nowLocal()
   };
 }
 
-// EXPORTS
-export {
-  nowLocal,
-  fetchMarketData,
-  analyzeVolume,
-  computeFibLevels
-};
+// fetch multiple TFs
+export async function fetchMultiTF(symbol = "BTCUSDT", tfs = ["1m","5m","15m","30m","1h"]) {
+  const out = {};
+  await Promise.all(tfs.map(async tf => {
+    try {
+      out[tf] = await fetchMarketData(symbol, tf, CONFIG.DEFAULT_LIMIT || 200);
+    } catch (e) {
+      out[tf] = { data: [], price: 0, volume: 0, error: String(e) };
+    }
+  }));
+  return out;
+}
+
+export { nowLocal, readCache, writeCache, cachePath };
