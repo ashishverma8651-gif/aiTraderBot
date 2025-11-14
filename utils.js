@@ -413,7 +413,7 @@ export async function keepAlive() {
 }
 
 // ---------- exports ----------
-export {
+//export {
   safeAxiosGet,
   nowLocal,
   fetchCrypto,
@@ -430,25 +430,6 @@ export {
   priceTrend,
   volumeTrend,
   deriveSignalFromIndicators,
-  keepAlive,
-};
+  
+};//
 
-export default {
-  safeAxiosGet,
-  nowLocal,
-  fetchCrypto,
-  ensureCandles,
-  fetchMarketData,
-  fetchMultiTF,
-  computeRSI,
-  computeATR,
-  computeMACD,
-  computeFibLevels,
-  calculateIndicators,
-  analyzeVolumeTrend,
-  analyzeVolume,
-  priceTrend,
-  volumeTrend,
-  deriveSignalFromIndicators,
-  keepAlive,
-};
