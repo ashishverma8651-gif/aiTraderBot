@@ -1,26 +1,21 @@
-// utils.js — Final hardened v1.1
+// utils.js — Final hardened v1.1 (fixed exports + full implementation)
 // Compatible with aiTraderBot.js (v10.2) + tg_commands.js (Option-3)
-// - fetchMarketData(symbol, interval, limit)
-// - analyzeVolume(candles), analyzeVolumeTrend(candles)
-// - computeFibLevels(candles) OR computeFibLevels(low, high)
-// - safe network + cache + mirrors + proxy
-// - Exports stable names
 
 import axios from "axios";
 import fs from "fs";
 import path from "path";
-import CONFIG from "./config.js"; // use default import for consistency across project
+import CONFIG from "./config.js"; // project uses default import
 
 // ---------- constants ----------
 const CACHE_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-const AXIOS_TIMEOUT = 15000;
-const DEFAULT_LIMIT = 200;
-const DEFAULT_INTERVAL = "15m";
+const AXIOS_TIMEOUT = Number(CONFIG?.AXIOS_TIMEOUT) || 15000;
+const DEFAULT_LIMIT = Number(CONFIG?.DEFAULT_LIMIT) || 200;
+const DEFAULT_INTERVAL = CONFIG?.DEFAULT_INTERVAL || "15m";
 
-const BINANCE_MIRRORS = Array.isArray(CONFIG?.BINANCE_WS_MIRRORS) && CONFIG.BINANCE_WS_MIRRORS.length
-  ? CONFIG.BINANCE_WS_MIRRORS
+const BINANCE_MIRRORS = Array.isArray(CONFIG?.BINANCE_MIRRORS) && CONFIG.BINANCE_MIRRORS.length
+  ? CONFIG.BINANCE_MIRRORS
   : [CONFIG?.BINANCE_BASE || "https://api.binance.com"];
 
 // ---------- helpers ----------
@@ -39,7 +34,7 @@ function readCache(symbol, interval) {
     const raw = fs.readFileSync(p, "utf8");
     return JSON.parse(raw || "[]");
   } catch (e) {
-    console.warn("readCache error:", e.message || e);
+    console.warn("readCache error:", e?.message || e);
     return [];
   }
 }
@@ -49,31 +44,53 @@ function writeCache(symbol, interval, data) {
     const p = cachePath(symbol, interval);
     fs.writeFileSync(p, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.warn("writeCache error:", e.message || e);
+    console.warn("writeCache error:", e?.message || e);
   }
 }
 
+// ---------- safe axios (mirrors + proxy + retries) ----------
 async function safeAxiosGet(url, options = {}) {
-  // try multiple mirrors if configured
-  const mirrors = BINANCE_MIRRORS.length ? BINANCE_MIRRORS : [url];
+  // Try a small sequence: provided mirrors -> original url
+  const sources = Array.from(new Set([...(BINANCE_MIRRORS || []), url]));
   let lastErr = null;
-  for (const base of mirrors) {
-    // prefer replacing if base looks like binance base
-    const tryUrl = base.includes("http") && url.includes("/api/") && base !== CONFIG?.BINANCE_BASE
-      ? url.replace(CONFIG?.BINANCE_BASE || "https://api.binance.com", base)
-      : (base === url ? url : url);
+
+  for (const base of sources) {
+    // If base contains full URL already, use it; otherwise attempt to replace known base
+    let tryUrl = url;
+    try {
+      if (base && base.startsWith("http") && url.includes("/api/") && CONFIG?.BINANCE_BASE) {
+        // replace only if original base is present
+        tryUrl = url.replace(CONFIG.BINANCE_BASE || "https://api.binance.com", base);
+      } else if (base === url) {
+        tryUrl = url;
+      } else if (base && base.startsWith("http") && !url.includes(CONFIG?.BINANCE_BASE || "api.binance.com")) {
+        tryUrl = url; // leave it - don't attempt unsafe replace
+      }
+    } catch (_) {
+      tryUrl = url;
+    }
+
+    // Execute request with optional proxy settings
     try {
       const res = await axios.get(tryUrl, {
         timeout: AXIOS_TIMEOUT,
+        // proxy in config can be an object or false; axios accepts false only with http adapter - keep as is
         proxy: CONFIG?.PROXY || false,
+        headers: {
+          "User-Agent": CONFIG?.USER_AGENT || "aiTraderBot/1.0 (+https://example.com)",
+          Accept: "application/json, text/plain, */*",
+          ...(options.headers || {}),
+        },
         ...options,
       });
       if (res && (res.status === 200 || res.status === 201)) return res.data;
+      lastErr = new Error(`HTTP ${res?.status}`);
     } catch (err) {
       lastErr = err;
-      // try next mirror
+      // continue to next mirror
     }
   }
+
   console.warn("safeAxiosGet failed for", url, lastErr?.message || lastErr);
   return null;
 }
@@ -81,33 +98,33 @@ async function safeAxiosGet(url, options = {}) {
 // ---------- normalizer ----------
 function normalizeKlineArray(rawKlines) {
   if (!Array.isArray(rawKlines)) return [];
-  return rawKlines.map((k) => ({
-    t: Number(k[0] ?? 0),
-    open: Number(k[1] ?? k.open ?? 0),
-    high: Number(k[2] ?? k.high ?? 0),
-    low: Number(k[3] ?? k.low ?? 0),
-    close: Number(k[4] ?? k.close ?? 0),
-    vol: Number(k[5] ?? k.volume ?? 0),
-  })).filter(c => Number.isFinite(c.close));
+  return rawKlines
+    .map((k) => ({
+      t: Number(k[0] ?? 0),
+      open: Number(k[1] ?? k.open ?? 0),
+      high: Number(k[2] ?? k.high ?? 0),
+      low: Number(k[3] ?? k.low ?? 0),
+      close: Number(k[4] ?? k.close ?? 0),
+      vol: Number(k[5] ?? k.volume ?? 0),
+    }))
+    .filter((c) => Number.isFinite(c.close));
 }
 
-// ---------- fetch raw candles ----------
+// ---------- fetch raw candles (primary) ----------
 export async function fetchCrypto(symbol = "BTCUSDT", interval = DEFAULT_INTERVAL, limit = DEFAULT_LIMIT) {
   try {
     const base = CONFIG?.BINANCE_BASE || "https://api.binance.com";
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const raw = await safeAxiosGet(url);
     if (!raw) return [];
-    // Binance returns array of arrays
-    const normalized = normalizeKlineArray(raw);
-    return normalized;
+    return normalizeKlineArray(raw);
   } catch (e) {
-    console.warn("fetchCrypto error:", e.message || e);
+    console.warn("fetchCrypto error:", e?.message || e);
     return [];
   }
 }
 
-// ---------- caching wrapper ----------
+// ---------- cache wrapper ----------
 export async function ensureCandles(symbol = "BTCUSDT", interval = DEFAULT_INTERVAL, limit = DEFAULT_LIMIT) {
   try {
     const cached = readCache(symbol, interval) || [];
@@ -119,20 +136,23 @@ export async function ensureCandles(symbol = "BTCUSDT", interval = DEFAULT_INTER
     // fallback to cache
     return cached;
   } catch (e) {
-    console.warn("ensureCandles error:", e.message || e);
+    console.warn("ensureCandles error:", e?.message || e);
     return readCache(symbol, interval) || [];
   }
 }
 
 // ---------- INDICATORS ----------
-// RSI (simple smoothed version)
+// RSI
 export function computeRSI(candles = [], length = 14) {
   try {
     const N = length;
     if (!Array.isArray(candles) || candles.length < N + 1) return 50;
-    let gains = 0, losses = 0;
+    let gains = 0,
+      losses = 0;
     for (let i = candles.length - N - 1; i < candles.length - 1; i++) {
-      const diff = (candles[i + 1].close ?? candles[i + 1].c) - (candles[i].close ?? candles[i].c);
+      const a = candles[i + 1];
+      const b = candles[i];
+      const diff = (a?.close ?? a?.c ?? 0) - (b?.close ?? b?.c ?? 0);
       if (diff > 0) gains += diff;
       else losses -= diff;
     }
@@ -142,7 +162,7 @@ export function computeRSI(candles = [], length = 14) {
     const rs = avgGain / avgLoss;
     return Number((100 - 100 / (1 + rs)).toFixed(2));
   } catch (e) {
-    console.warn("computeRSI error:", e.message || e);
+    console.warn("computeRSI error:", e?.message || e);
     return 50;
   }
 }
@@ -153,25 +173,23 @@ export function computeATR(candles = [], length = 14) {
     if (!Array.isArray(candles) || candles.length < length + 1) return 0;
     const trs = [];
     for (let i = candles.length - length; i < candles.length; i++) {
-      const high = candles[i].high;
-      const low = candles[i].low;
-      const prevClose = candles[i - 1]?.close ?? candles[i].close;
-      const tr = Math.max(
-        high - low,
-        Math.abs(high - prevClose),
-        Math.abs(low - prevClose)
-      );
+      const cur = candles[i];
+      const prev = candles[i - 1] ?? cur;
+      const high = Number(cur?.high ?? 0);
+      const low = Number(cur?.low ?? 0);
+      const prevClose = Number(prev?.close ?? prev?.c ?? 0);
+      const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
       trs.push(tr);
     }
     const atr = trs.reduce((a, b) => a + b, 0) / trs.length;
     return Number(atr.toFixed(2));
   } catch (e) {
-    console.warn("computeATR error:", e.message || e);
+    console.warn("computeATR error:", e?.message || e);
     return 0;
   }
 }
 
-// MACD histogram (simple)
+// EMA helper
 function ema(values = [], period = 12) {
   if (!Array.isArray(values) || values.length === 0) return [];
   const k = 2 / (period + 1);
@@ -183,18 +201,24 @@ function ema(values = [], period = 12) {
   }
   return out;
 }
+
+// MACD
 export function computeMACD(candles = []) {
   try {
     if (!Array.isArray(candles) || candles.length < 35) return { hist: 0, line: 0, signal: 0 };
-    const closes = candles.map(c => c.close);
+    const closes = candles.map((c) => Number(c.close ?? 0));
     const ema12 = ema(closes, 12);
     const ema26 = ema(closes, 26);
     const macdLine = ema12.map((v, i) => v - (ema26[i] ?? 0));
     const signalLine = ema(macdLine, 9);
     const hist = (macdLine.at(-1) ?? 0) - (signalLine.at(-1) ?? 0);
-    return { hist: Number(hist.toFixed(6)), line: Number((macdLine.at(-1) ?? 0).toFixed(6)), signal: Number((signalLine.at(-1) ?? 0).toFixed(6)) };
+    return {
+      hist: Number(hist.toFixed(6)),
+      line: Number((macdLine.at(-1) ?? 0).toFixed(6)),
+      signal: Number((signalLine.at(-1) ?? 0).toFixed(6)),
+    };
   } catch (e) {
-    console.warn("computeMACD error:", e.message || e);
+    console.warn("computeMACD error:", e?.message || e);
     return { hist: 0, line: 0, signal: 0 };
   }
 }
@@ -202,9 +226,9 @@ export function computeMACD(candles = []) {
 // Price / Volume trends
 export function priceTrend(candles = []) {
   try {
-    if (!candles || candles.length < 2) return "FLAT";
-    const last = candles.at(-1).close;
-    const prev = candles.at(-2).close;
+    if (!Array.isArray(candles) || candles.length < 2) return "FLAT";
+    const last = Number(candles.at(-1)?.close ?? 0);
+    const prev = Number(candles.at(-2)?.close ?? 0);
     if (last > prev) return "UP";
     if (last < prev) return "DOWN";
     return "FLAT";
@@ -215,9 +239,9 @@ export function priceTrend(candles = []) {
 
 export function volumeTrend(candles = []) {
   try {
-    if (!candles || candles.length < 2) return "STABLE";
-    const last = candles.at(-1).vol ?? candles.at(-1).volume ?? 0;
-    const prev = candles.at(-2).vol ?? candles.at(-2).volume ?? last;
+    if (!Array.isArray(candles) || candles.length < 2) return "STABLE";
+    const last = Number(candles.at(-1)?.vol ?? candles.at(-1)?.volume ?? 0);
+    const prev = Number(candles.at(-2)?.vol ?? candles.at(-2)?.volume ?? last);
     if (last > prev) return "INCREASING";
     if (last < prev) return "DECREASING";
     return "STABLE";
@@ -233,7 +257,7 @@ export function analyzeVolumeTrend(candles = []) {
   return "stable";
 }
 
-// ---------- analyzeVolume (added for core_indicators compatibility) ----------
+// analyzeVolume (detailed)
 export function analyzeVolume(candles = []) {
   try {
     if (!Array.isArray(candles) || !candles.length) return { avg: 0, current: 0, label: "No Data", ratio: 1 };
@@ -247,12 +271,12 @@ export function analyzeVolume(candles = []) {
     else if (ratio < 0.5) label = "🧊 Low Volume";
     return { avg: Number(avg.toFixed(2)), current: Number(current.toFixed(2)), label, ratio: Number(ratio.toFixed(2)) };
   } catch (e) {
-    console.warn("analyzeVolume error:", e.message || e);
+    console.warn("analyzeVolume error:", e?.message || e);
     return { avg: 0, current: 0, label: "Error", ratio: 1 };
   }
 }
 
-// calculateIndicators wrapper (returns mapping expected by tg_commands)
+// calculateIndicators wrapper (tg_commands compatibility)
 export function calculateIndicators(candles = []) {
   try {
     const rsi = computeRSI(candles, 14);
@@ -260,16 +284,15 @@ export function calculateIndicators(candles = []) {
     const atr = computeATR(candles, 14);
     const pt = priceTrend(candles);
     const vt = volumeTrend(candles);
-
     return {
       RSI: Number(rsi),
       MACD: { hist: Number(macd.hist), line: Number(macd.line), signal: Number(macd.signal) },
       ATR: Number(atr),
       priceTrend: pt,
-      volumeTrend: vt
+      volumeTrend: vt,
     };
   } catch (e) {
-    console.warn("calculateIndicators error:", e.message || e);
+    console.warn("calculateIndicators error:", e?.message || e);
     return { RSI: null, MACD: { hist: null, line: null, signal: null }, ATR: null, priceTrend: "FLAT", volumeTrend: "STABLE" };
   }
 }
@@ -281,8 +304,8 @@ export function computeFibLevels(a, b) {
     if (Array.isArray(a)) {
       const candles = a;
       if (!candles.length) return null;
-      high = Math.max(...candles.map(c => c.high));
-      low = Math.min(...candles.map(c => c.low));
+      high = Math.max(...candles.map((c) => Number(c.high ?? 0)));
+      low = Math.min(...candles.map((c) => Number(c.low ?? 0)));
     } else {
       low = Number(a);
       high = Number(b);
@@ -297,22 +320,21 @@ export function computeFibLevels(a, b) {
         "0.382": Number((high - diff * 0.382).toFixed(6)),
         "0.5": Number((high - diff * 0.5).toFixed(6)),
         "0.618": Number((high - diff * 0.618).toFixed(6)),
-        "0.786": Number((high - diff * 0.786).toFixed(6))
+        "0.786": Number((high - diff * 0.786).toFixed(6)),
       },
       extensions: {
         "1.272": Number((high + diff * 0.272).toFixed(6)),
-        "1.618": Number((high + diff * 0.618).toFixed(6))
-      }
+        "1.618": Number((high + diff * 0.618).toFixed(6)),
+      },
     };
   } catch (e) {
-    console.warn("computeFibLevels error:", e.message || e);
+    console.warn("computeFibLevels error:", e?.message || e);
     return null;
   }
 }
 
-// ---------- Combined signal logic (simple / deterministic) ----------
+// deriveSignal
 export function deriveSignalFromIndicators(ind) {
-  // ind: { RSI, MACD: {hist}, ATR, priceTrend, volumeTrend }
   if (!ind) return "N/A";
   let score = 0;
   if (ind.RSI !== null && ind.RSI !== undefined) {
@@ -331,7 +353,7 @@ export function deriveSignalFromIndicators(ind) {
   return "NEUTRAL";
 }
 
-// ---------- fetchMarketData (primary public function) ----------
+// ---------- fetchMarketData (main public) ----------
 export async function fetchMarketData(symbol = "BTCUSDT", interval = DEFAULT_INTERVAL, limit = DEFAULT_LIMIT) {
   try {
     const candles = await ensureCandles(symbol, interval, limit);
@@ -340,39 +362,47 @@ export async function fetchMarketData(symbol = "BTCUSDT", interval = DEFAULT_INT
     const volume = data.at(-1)?.vol ?? data.at(-1)?.volume ?? 0;
     const indicators = data.length ? calculateIndicators(data) : null;
     const fib = data.length ? computeFibLevels(data) : null;
-
     return { data, price, volume, indicators, fib, updated: nowLocal() };
   } catch (e) {
-    console.error("fetchMarketData error:", e.message || e);
-    // fallback: cached raw
+    console.error("fetchMarketData error:", e?.message || e);
     const cached = readCache(symbol, interval) || [];
     const price = cached.at(-1)?.close ?? 0;
-    return { data: cached, price, volume: cached.at(-1)?.vol ?? 0, indicators: cached.length ? calculateIndicators(cached) : null, fib: cached.length ? computeFibLevels(cached) : null, updated: nowLocal() };
+    return {
+      data: cached,
+      price,
+      volume: cached.at(-1)?.vol ?? 0,
+      indicators: cached.length ? calculateIndicators(cached) : null,
+      fib: cached.length ? computeFibLevels(cached) : null,
+      updated: nowLocal(),
+    };
   }
 }
 
-// ---------- convenience: multi-TF batch fetch ----------
-export async function fetchMultiTF(symbol = "BTCUSDT", tfs = ["1m","5m","15m","30m","1h"]) {
+// ---------- fetchMultiTF convenience ----------
+export async function fetchMultiTF(symbol = "BTCUSDT", tfs = ["1m", "5m", "15m", "30m", "1h"]) {
   const out = {};
-  for (const tf of tfs) {
-    try {
-      const res = await fetchMarketData(symbol, tf, DEFAULT_LIMIT);
-      out[tf] = res;
-    } catch (e) {
-      out[tf] = { data: [], price: 0, volume: 0, indicators: null, fib: null, updated: nowLocal(), error: e.message || String(e) };
-    }
-  }
+  await Promise.all(
+    tfs.map(async (tf) => {
+      try {
+        const res = await fetchMarketData(symbol, tf, DEFAULT_LIMIT);
+        out[tf] = res;
+      } catch (e) {
+        out[tf] = { data: [], price: 0, volume: 0, indicators: null, fib: null, updated: nowLocal(), error: String(e?.message || e) };
+      }
+    })
+  );
   return out;
 }
 
 // ---------- keepAlive ----------
 export async function keepAlive() {
   try {
-    const urls = Array.from(new Set([CONFIG?.SELF_PING_URL, ...(CONFIG?.SERVER?.KEEP_ALIVE_URLS || []), `https://${CONFIG?.RENDER_URL || ""}`].filter(Boolean)));
+    const urls = Array.from(
+      new Set([CONFIG?.SELF_PING_URL, ...(CONFIG?.SERVER?.KEEP_ALIVE_URLS || []), `https://${CONFIG?.RENDER_URL || ""}`].filter(Boolean))
+    );
     for (const u of urls) {
       try {
         await axios.get(u, { timeout: 8000 });
-        // we just return first successful
         return { ok: true };
       } catch (_) {}
     }
@@ -383,10 +413,42 @@ export async function keepAlive() {
 }
 
 // ---------- exports ----------
-
 export {
   safeAxiosGet,
   nowLocal,
+  fetchCrypto,
+  ensureCandles,
+  fetchMarketData,
+  fetchMultiTF,
+  computeRSI,
+  computeATR,
+  computeMACD,
+  computeFibLevels,
+  calculateIndicators,
+  analyzeVolumeTrend,
+  analyzeVolume,
+  priceTrend,
+  volumeTrend,
+  deriveSignalFromIndicators,
+  keepAlive,
+};
 
-  
+export default {
+  safeAxiosGet,
+  nowLocal,
+  fetchCrypto,
+  ensureCandles,
+  fetchMarketData,
+  fetchMultiTF,
+  computeRSI,
+  computeATR,
+  computeMACD,
+  computeFibLevels,
+  calculateIndicators,
+  analyzeVolumeTrend,
+  analyzeVolume,
+  priceTrend,
+  volumeTrend,
+  deriveSignalFromIndicators,
+  keepAlive,
 };
