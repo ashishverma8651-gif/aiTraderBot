@@ -171,17 +171,29 @@ setInterval(async () => {
 // ======================================================
 // REVERSAL WATCHER
 // ======================================================
-startReversalWatcher(CONFIG.SYMBOL, {
-  pollIntervalMs: 20000,
-  lookback: 60,
-  minProb: 58,
-  sendAlert: async (msg) => {
-    await sendTelegram("⚡ <b>Reversal Signal</b>\n" + msg);
+// ======================================================
+// REVERSAL WATCHER (Option-D Multiframe + ML + Feedback)
+// ======================================================
+startReversalWatcher(
+  CONFIG.SYMBOL,
+  {
+    pollIntervalMs: 20000,        // 20 sec scan
+    tfs: ["1m", "5m", "15m"],     // multi-timeframe
+    weights: {                    // TF importance
+      "1m": 0.25,
+      "5m": 0.35,
+      "15m": 0.40
+    },
+    minAlertConfidence: 65,       // threshold
+    microLookback: 60,            // small ML window
+    feedbackWindowsSec: [60, 300] // 1m & 5m accuracy feedback
+  },
+  async (msg) => {
+    await sendTelegram(msg);      // NO prefix (module already adds formatting)
   }
-});
+);
 
 console.log("⚡ Reversal Watcher ACTIVE");
-
 
 
 // ======================================================
