@@ -1,7 +1,8 @@
-// config.js — central settings
+// config.js — unified settings for AI Trader
 import fs from "fs";
 import path from "path";
 
+// ensure cache folder exists
 const CACHE_DIR = path.resolve("./cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -9,12 +10,24 @@ const ENV = process.env.NODE_ENV || "production";
 
 export const CONFIG = {
   MODE: ENV,
-  SYMBOL: process.env.SYMBOL || "BTCUSDT",
-  INTERVALS: ["1m","5m","15m","30m","1h"],
-  DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 200),
-  REPORT_INTERVAL_MS: Number(process.env.REPORT_INTERVAL_MS || 15 * 60 * 1000),
 
-  // Multi-source endpoints (priority order)
+  // Trading symbol
+  SYMBOL: process.env.SYMBOL || "BTCUSDT",
+
+  // Timeframes used across all modules
+  INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
+
+  // Candle history limit
+  DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 200),
+
+  // Auto-report interval (default: 15m)
+  REPORT_INTERVAL_MS: Number(
+    process.env.REPORT_INTERVAL_MS || 15 * 60 * 1000
+  ),
+
+  // =====================================================
+  // PRICE + CANDLE FETCHING ENDPOINTS
+  // =====================================================
   DATA_SOURCES: {
     BINANCE: [
       "https://data-api.binance.vision",
@@ -23,28 +36,37 @@ export const CONFIG = {
       "https://api2.binance.com",
       "https://api3.binance.com"
     ],
-    BYBIT: ["https://api.bytick.com", "https://api.bybit.com"],
+    BYBIT: ["https://api.bybit.com", "https://api.bytick.com"],
     KUCOIN: ["https://api.kucoin.com"],
     COINBASE: ["https://api.exchange.coinbase.com"]
   },
 
-  // WebSocket mirrors (for price tick)
+  // =====================================================
+  // WEBSOCKET MIRRORS (live price)
+  // =====================================================
   WS_MIRRORS: [
-    "wss://data-stream.binance.vision/ws",
-    "wss://stream.binance.com:9443/ws"
+    "wss://stream.binance.com:9443/ws",
+    "wss://data-stream.binance.vision/ws"
   ],
 
-  // Optional HTTP proxy (set to null or full proxy object for axios)
-  PROXY: process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null,
+  // Optional proxy
+  PROXY:
+    process.env.HTTP_PROXY ||
+    process.env.HTTPS_PROXY ||
+    null,
 
-  // Telegram
+  // =====================================================
+  // TELEGRAM BOT
+  // =====================================================
   TELEGRAM: {
     BOT_TOKEN: process.env.BOT_TOKEN || null,
     CHAT_ID: process.env.CHAT_ID || null
   },
 
-  // Keep-alive
-  SELF_PING_URL: process.env.SELF_PING_URL || null,
+  // =====================================================
+  // KEEP-ALIVE PING (Render/Hosting)
+  // =====================================================
+  SELF_URL: process.env.SELF_URL || process.env.SELF_PING_URL || null,
 
   PATHS: {
     CACHE_DIR
