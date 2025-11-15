@@ -5,7 +5,8 @@ import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 
-import { runMLPrediction, runMicroPrediction, calculateAccuracy } from "./ml_module_v8_6.js";
+import { runMLPrediction, runMicroPrediction, calculateAccuracy, recordPrediction, recordOutcome } from "./ml_module_v8_6.js";
+
 
 // Telegram init
 const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
