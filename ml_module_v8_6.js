@@ -1,10 +1,12 @@
 // ml_module_v8_6.js — ML Engine v16 (Advanced: 15m + 1m micro-watcher + auto-train + feedback)
+// + News integration (news_social.fetchNews) — adds news features to feature vector & prediction adjustments
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 import { fetchMarketData, nowLocal } from "./utils.js";
 import { analyzeElliott } from "./elliott_module.js";
 import * as indicators from "./core_indicators.js"; // safe usage with feature detection
+import newsModule from "./news_social.js"; // new: news/social fetcher
 
 // ---------------------------
 // Storage paths
@@ -30,7 +32,9 @@ const DEFAULTS = {
   autoRetrainHours: CONFIG.ML?.RETRAIN_INTERVAL_HOURS ?? 6,
   autoTrainOnStart: CONFIG.ML?.AUTO_TRAIN_ON_START ?? true,
   microWatcherEnabled: CONFIG.ML?.MICRO_WATCHER ?? false,
-  microWatcherIntervalSeconds: CONFIG.ML?.MICRO_WATCHER_INTERVAL_SECONDS ?? 30
+  microWatcherIntervalSeconds: CONFIG.ML?.MICRO_WATCHER_INTERVAL_SECONDS ?? 30,
+  newsFeatureEnabled: CONFIG.ML?.NEWS_FEATURES ?? true, // new toggle
+  newsTopicFromSymbol: CONFIG.ML?.NEWS_TOPIC_FROM_SYMBOL ?? true
 };
 
 // ---------------------------
@@ -88,8 +92,37 @@ function updateSGD(model, x, y, lr = 0.02) {
 }
 
 // ---------------------------
+// NEWS helpers
+// ---------------------------
+// normalize news impact (newsModule.fetchNews returns newsImpact ~ average score -100..100)
+// produce two features:
+//  - newsScore: -1 .. +1 (signed sentiment)
+//  - newsAbs: 0 .. 1 (magnitude / impact)
+async function safeFetchNewsFeatures(symbol) {
+  if (!DEFAULTS.newsFeatureEnabled || !newsModule || typeof newsModule.fetchNews !== "function") return { newsScore: 0, newsAbs: 0, raw: null };
+  try {
+    // derive topic from symbol (BTCUSDT -> BTC)
+    let topic = String(symbol || "").toUpperCase().replace(/[^A-Z]/g, "");
+    if (DEFAULTS.newsTopicFromSymbol) {
+      topic = (topic.length > 3) ? topic.slice(0, 3) : (topic || "BTC");
+    } else {
+      topic = CONFIG.ML?.NEWS_TOPIC || "BTC";
+    }
+    const n = await newsModule.fetchNews(topic);
+    if (!n) return { newsScore: 0, newsAbs: 0, raw: null };
+    const rawImpact = Number(n.newsImpact ?? n.newsImpact === 0 ? n.newsImpact : 0); // -100..100
+    const newsScore = Math.max(-1, Math.min(1, (rawImpact) / 100)); // -1..1
+    const newsAbs = Math.min(1, Math.abs(newsScore)); // 0..1
+    return { newsScore, newsAbs, raw: n };
+  } catch (e) {
+    console.warn("ml_v16.safeFetchNewsFeatures err", e?.message || e);
+    return { newsScore: 0, newsAbs: 0, raw: null };
+  }
+}
+
+// ---------------------------
 // Feature extraction (single-window)
-// returns { symbol, interval, features: [], close, vol, ell, fetchedAt }
+// returns { symbol, interval, features: [], close, vol, ell, news, fetchedAt }
 // ---------------------------
 export async function extractFeatures(symbol, interval = "15m", lookback = DEFAULTS.lookback) {
   try {
@@ -132,7 +165,12 @@ export async function extractFeatures(symbol, interval = "15m", lookback = DEFAU
     const ellSent = ell?.sentiment ?? 0;
     const ellConf = (ell?.confidence ?? 0) / 100; // 0..1
 
-    // feature vector (order matters)
+    // news features (best-effort)
+    const newsFeat = await safeFetchNewsFeatures(symbol);
+    const newsScore = newsFeat.newsScore || 0;
+    const newsAbs = newsFeat.newsAbs || 0;
+
+    // feature vector (order matters) — appended news features at end
     const features = [
       avgRet || 0,
       volChange || 0,
@@ -140,7 +178,9 @@ export async function extractFeatures(symbol, interval = "15m", lookback = DEFAU
       (macdHist || 0),          // raw scaled later by model
       (atr || 0),
       ellSent || 0,
-      ellConf || 0
+      ellConf || 0,
+      newsScore,                // -1..1
+      newsAbs                   // 0..1 (magnitude)
     ];
 
     return {
@@ -150,6 +190,7 @@ export async function extractFeatures(symbol, interval = "15m", lookback = DEFAU
       close: lastClose,
       vol: lastVol,
       ell,
+      news: newsFeat.raw || null,
       fetchedAt: nowISO()
     };
   } catch (e) {
@@ -167,6 +208,11 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
     const resp = await fetchMarketData(symbol, interval, window + horizon + 10);
     const data = resp?.data || [];
     if (!Array.isArray(data) || data.length < window + horizon) return null;
+
+    // fetch news once for dataset (cheap, avoids per-sample calls)
+    const newsFeatGlobal = await safeFetchNewsFeatures(symbol);
+    const newsScoreGlobal = newsFeatGlobal.newsScore || 0;
+    const newsAbsGlobal = newsFeatGlobal.newsAbs || 0;
 
     const X = [], Y = [], meta = [];
 
@@ -201,6 +247,10 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
       const ellSent = ell?.sentiment ?? 0;
       const ellConf = (ell?.confidence ?? 0) / 100;
 
+      // Use global news features for each sample (simple and stable)
+      const newsScore = newsScoreGlobal;
+      const newsAbs = newsAbsGlobal;
+
       const features = [
         avgRet || 0,
         volChange || 0,
@@ -208,7 +258,9 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
         (macdHist || 0),
         (atr || 0),
         ellSent || 0,
-        ellConf || 0
+        ellConf || 0,
+        newsScore,
+        newsAbs
       ];
 
       // label from futureCandles (binary: up/down)
@@ -284,7 +336,7 @@ export async function trainModel(symbols = [CONFIG.SYMBOL || "BTCUSDT"], options
 // ---------------------------
 // Prediction API (main) - for 15m contextual predictions
 // runMLPrediction(symbol)
-// returns { id, symbol, label, prob, features, ell, meta }
+// returns { id, symbol, label, prob, features, ell, news, meta }
 // ---------------------------
 export async function runMLPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", interval = "15m") {
   try {
@@ -294,7 +346,16 @@ export async function runMLPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", inter
     const f = await extractFeatures(symbol, interval, DEFAULTS.lookback);
     if (!f) return { error: "no_features" };
 
-    const p = predictRaw(model, f.features);
+    const rawProb = predictRaw(model, f.features);
+    let p = rawProb;
+
+    // adjust prob slightly based on news (small nudge) and ell confidence
+    try {
+      const newsScore = (f.news && typeof f.news.newsImpact === "number") ? (f.news.newsImpact / 100) : (f.features?.[f.features.length - 2] ?? 0);
+      // small multiplier: news nudges up to ±5%
+      p = Math.max(0, Math.min(1, p + (newsScore * 0.05)));
+    } catch (e) {}
+
     const pct = Math.round(p * 10000) / 100; // 2 decimals
     const label = pct > 55 ? "Bullish" : pct < 45 ? "Bearish" : "Neutral";
 
@@ -304,10 +365,10 @@ export async function runMLPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", inter
       label,
       prob: pct,
       features: f.features,
-      meta: { interval, ell: f.ell }
+      meta: { interval, ell: f.ell, news: f.news }
     });
 
-    return { id: predId, symbol, label, prob: pct, features: f.features, ell: f.ell };
+    return { id: predId, symbol, label, prob: pct, features: f.features, ell: f.ell, news: f.news };
   } catch (e) {
     return { error: e?.message || String(e) };
   }
@@ -325,42 +386,52 @@ export async function runMicroPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", in
     const f = await extractFeatures(symbol, interval, lookback);
     if (!f) return { error: "no_features" };
 
-    const p = model ? predictRaw(model, f.features) : 0.5;
-    const pct = Math.round(p * 10000) / 100;
-    // also compute quick candlestick pattern heuristics for reversal
-    // basic pattern detection: last 3 candles
+    const pModel = model ? predictRaw(model, f.features) : 0.5;
+    let p = pModel;
+
+    // small pattern boost if micro patterns detected
     const resp = await fetchMarketData(symbol, interval, 10);
     const candles = resp?.data || [];
     const last = candles.at(-1) || null, prev = candles.at(-2) || null;
     const patterns = [];
     try {
       if (last && prev) {
-        // hammer: small body near top with long lower wick (bullish)
         const body = Math.abs(last.close - last.open);
         const lowerWick = Math.abs(last.open < last.close ? last.open - last.low : last.close - last.low);
         const upperWick = Math.abs(last.high - Math.max(last.open, last.close));
         if (lowerWick > body * 1.8 && upperWick < body * 0.5) patterns.push("Hammer");
-        // shooting star
         if (upperWick > body * 1.8 && lowerWick < body * 0.5) patterns.push("Shooting Star");
-        // bullish engulfing
         if ((last.close > last.open) && (prev.close < prev.open) && (last.open < prev.close) && (last.close > prev.open)) patterns.push("Bullish Engulfing");
         if ((last.close < last.open) && (prev.close > prev.open) && (last.open > prev.close) && (last.close < prev.open)) patterns.push("Bearish Engulfing");
       }
     } catch (e) {}
 
-    // include ell micro-summary (best-effort)
-    let ell = null;
-    try { ell = await analyzeElliott(candles); } catch (e) { ell = null; }
+    // micro-news influence (small)
+    const newsFeat = await safeFetchNewsFeatures(symbol);
+    try {
+      p = Math.max(0, Math.min(1, p + (newsFeat.newsScore * 0.03)));
+    } catch (e) {}
 
-    // assemble micro result
+    // pattern nudges (e.g., a hammer bullish pattern add small bonus)
+    try {
+      if (patterns.includes("Hammer")) p = Math.min(1, p + 0.04);
+      if (patterns.includes("Shooting Star")) p = Math.max(0, p - 0.04);
+      if (patterns.includes("Bullish Engulfing")) p = Math.min(1, p + 0.06);
+      if (patterns.includes("Bearish Engulfing")) p = Math.max(0, p - 0.06);
+    } catch (e) {}
+
+    const pct = Math.round(p * 10000) / 100;
+    const label = pct > 55 ? "Bullish" : pct < 45 ? "Bearish" : "Neutral";
+
     return {
       symbol,
       interval,
       prob: pct,
-      label: pct > 55 ? "Bullish" : pct < 45 ? "Bearish" : "Neutral",
+      label,
       features: f.features,
       patterns,
-      ell,
+      ell: f.ell,
+      news: newsFeat.raw || null,
       fetchedAt: nowISO()
     };
   } catch (e) {
@@ -443,8 +514,11 @@ export async function evaluateModelOnSymbols(symbols = [CONFIG.SYMBOL || "BTCUSD
       try {
         const f = await extractFeatures(s, interval);
         if (!f) { out.push({ symbol: s, error: "no_features" }); continue; }
-        const p = predictRaw(model, f.features);
-        out.push({ symbol: s, prob: Math.round(p * 10000) / 100, features: f.features, ell: f.ell });
+        const pRaw = predictRaw(model, f.features);
+        // small news adjustment for display
+        const newsScore = f.features?.[f.features.length - 2] ?? 0;
+        const p = Math.max(0, Math.min(1, pRaw + (newsScore * 0.03)));
+        out.push({ symbol: s, prob: Math.round(p * 10000) / 100, features: f.features, ell: f.ell, news: f.news });
       } catch (e) {
         out.push({ symbol: s, error: e.message || String(e) });
       }
@@ -538,7 +612,7 @@ export function startMicroWatcher(symbols = [CONFIG.SYMBOL || "BTCUSDT"], interv
         for (const s of _microWatcherSymbols) {
           const res = await runMicroPrediction(s, "1m", DEFAULTS.microLookback);
           if (res && !res.error) {
-            await recordPrediction({ symbol: s, predictedAt: nowISO(), label: res.label, prob: res.prob, features: res.features, meta: { micro: true, patterns: res.patterns }});
+            await recordPrediction({ symbol: s, predictedAt: nowISO(), label: res.label, prob: res.prob, features: res.features, meta: { micro: true, patterns: res.patterns, news: res.news }});
           }
         }
       } catch (e) { console.warn("ml_v16.microWatcher err", e?.message || e); }
