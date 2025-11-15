@@ -1,4 +1,5 @@
 // tg_commands.js — AI Trader (Option-B UI) + Elliott + Fusion + ML v3 (ML Bias + ML TP) + News (Adaptive Option D)
+// FULL PATCHED — sanitize HTML values + robust ML field support + no auto-send (caller sends)
 
 // PART 1 of 3
 import TelegramBot from "node-telegram-bot-api";
@@ -20,7 +21,7 @@ import {
 import newsModule from "./news_social.js";
 
 // ==========================
-// Telegram Init (kept for external use but NOT used to auto-send here)
+// Telegram Init (kept for optional use but NOT used to auto-send here)
 // ==========================
 const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
 const CHAT_ID = CONFIG?.TELEGRAM?.CHAT_ID || process.env.CHAT_ID;
@@ -34,6 +35,22 @@ const nf = (v, d = 2) =>
 
 function clamp(v, lo = -1, hi = 1) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+// Escape dynamic text for Telegram HTML while allowing our own tags
+// We will escape &, <, >, " so any dynamic content cannot break HTML
+function esc(text) {
+  if (text == null) return "";
+  // numbers to string
+  if (typeof text === "number") return String(text);
+  if (typeof text !== "string") {
+    try { return JSON.stringify(text); } catch { return String(text); }
+  }
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 // Fusion label mapping
@@ -143,16 +160,16 @@ function buildTFBlock(tf, price, ind, vol, ellSummary, fusionScore, fib) {
   const rsi = typeof ind.RSI === "number" ? ind.RSI.toFixed(1) : "N/A";
   const macd = typeof ind.MACD?.hist === "number" ? ind.MACD.hist.toFixed(4) : "N/A";
   const atr = typeof ind.ATR === "number" ? ind.ATR.toFixed(2) : "N/A";
-  const volTxt = vol?.status || "N/A";
+  const volTxt = esc(vol?.status || "N/A");
   const support = ellSummary?.support ? nf(ellSummary.support, 2) : (fib?.lo ? nf(fib.lo, 2) : "N/A");
   const resistance = ellSummary?.resistance ? nf(ellSummary.resistance, 2) : (fib?.hi ? nf(fib.hi, 2) : "N/A");
 
   return `
-<b>【${tf.toUpperCase()}】 ${fusion.emoji} ${fusion.label}</b>
-💰 Price: <b>${nf(price,2)}</b> | 📊 Vol: ${volTxt}
-RSI: <b>${rsi}</b> | MACD: <b>${macd}</b> | ATR: <b>${atr}</b>
-Structure: support:${support} | resistance:${resistance}
-Fusion Score: ${fusionScore}
+<b>【${esc(tf.toUpperCase())}】 ${fusion.emoji} ${esc(fusion.label)}</b>
+💰 Price: <b>${esc(nf(price,2))}</b> | 📊 Vol: ${volTxt}
+RSI: <b>${esc(rsi)}</b> | MACD: <b>${esc(macd)}</b> | ATR: <b>${esc(atr)}</b>
+Structure: support:${esc(support)} | resistance:${esc(resistance)}
+Fusion Score: ${esc(String(fusionScore))}
 `.trim();
 }
 
@@ -285,9 +302,6 @@ export async function buildAIReport(symbol = "BTCUSDT") {
 
     // =====================================================
     // Adaptive weighting (Option D)
-    // - ML weight stays (0.25)
-    // - News weight: High=>0.40, Moderate=>0.25, Low=>0.10
-    // - news sentiment: 0..1 => convert to -1..1 via (sentiment-0.5)*2
     // =====================================================
     const mlWeight = 0.25;
     let newsWeight = 0.10;
@@ -351,7 +365,7 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     const mlLongTP = pickMLTP(annotatedTargets, "long");
     const mlShortTP = pickMLTP(annotatedTargets, "short");
 
-    // final assembled report
+    // final assembled report object
     return {
       ok: true,
       symbol,
@@ -388,7 +402,7 @@ export async function formatAIReport(report) {
   try {
     if (!report || !report.ok) {
       const txt = `Error building report: ${report?.error || "unknown"}`;
-      // Do NOT auto-send error via Telegram here — return string so caller controls sends.
+      // return string so caller controls sending (avoids duplicates)
       return txt;
     }
 
@@ -423,9 +437,9 @@ export async function formatAIReport(report) {
     );
     if (firstEll && firstEll.ell) {
       const conf = firstEll.ell.confidence ?? firstEll.ell.conf ?? 0;
-      ellSummaryText = `Elliott MultiTF (best): Conf ${conf}% | Patterns: ${
-        firstEll.ell.patterns?.length || 0
-      } | Targets: ${firstEll.ell.targets?.length || 0}`;
+      ellSummaryText = `Elliott MultiTF (best): Conf ${esc(conf)}% | Patterns: ${
+        esc(String(firstEll.ell.patterns?.length || 0))
+      } | Targets: ${esc(String(firstEll.ell.targets?.length || 0))}`;
     }
 
     // Target Lists
@@ -434,9 +448,7 @@ export async function formatAIReport(report) {
         .slice(0, 3)
         .map(
           (t, i) =>
-            `TP${i + 1}: ${nf(getTPval(t), 2)} (${
-              t.source || t.tf || "Elliott"
-            }) [${t.confidence}%]`
+            `TP${i + 1}: ${esc(nf(getTPval(t), 2))} (${esc(t.source || t.tf || "Elliott")}) [${esc(String(t.confidence))}%]`
         )
         .join(" | ") || "n/a";
 
@@ -445,65 +457,52 @@ export async function formatAIReport(report) {
         .slice(0, 3)
         .map(
           (t, i) =>
-            `TP${i + 1}: ${nf(getTPval(t), 2)} (${
-              t.source || t.tf || "Elliott"
-            }) [${t.confidence}%]`
+            `TP${i + 1}: ${esc(nf(getTPval(t), 2))} (${esc(t.source || t.tf || "Elliott")}) [${esc(String(t.confidence))}%]`
         )
         .join(" | ") || "n/a";
 
+    // ML Prob robust extraction (accept multiple field names)
+    const rawMl = report.ml || {};
+    const mlProb = Number(rawMl?.prob ?? rawMl?.probability ?? rawMl?.probability_pct ?? rawMl?.probability_percent ?? 0) || 0;
+    const mlLabel = rawMl?.label || report.mlDirection || "N/A";
+    const mlProbTxt = `${esc(String(Number(mlProb || 0)))}%`;
+
     // ML TP Text
     let mlTPtxt = "n/a";
-    if (report.mlDirection?.toLowerCase().includes("bull")) {
-      mlTPtxt = report.mlLongTP
-        ? `${nf(getTPval(report.mlLongTP), 2)} [${
-            report.mlLongTP.confidence
-          }%]`
-        : "n/a";
-    } else if (report.mlDirection?.toLowerCase().includes("bear")) {
-      mlTPtxt = report.mlShortTP
-        ? `${nf(getTPval(report.mlShortTP), 2)} [${
-            report.mlShortTP.confidence
-          }%]`
-        : "n/a";
+    if ((String(mlLabel).toLowerCase()).includes("bull")) {
+      mlTPtxt = report.mlLongTP ? `${esc(nf(getTPval(report.mlLongTP), 2))} [${esc(String(report.mlLongTP.confidence))}%]` : "n/a";
+    } else if ((String(mlLabel).toLowerCase()).includes("bear")) {
+      mlTPtxt = report.mlShortTP ? `${esc(nf(getTPval(report.mlShortTP), 2))} [${esc(String(report.mlShortTP.confidence))}%]` : "n/a";
     }
 
     // News Section
     let newsTxt = "News: N/A";
     if (report.news) {
       const n = report.news;
-      const sentPct = (typeof n.sentiment === "number")
-        ? Math.round(n.sentiment * 1000) / 10
-        : "N/A";
-      newsTxt = `📰 <b>News</b> | Impact: ${n.impact} | Sentiment: ${sentPct}% | Items: ${n.items?.length || 0}
-Top: ${
-        n.items && n.items[0]
-          ? n.items[0].title ||
-            n.items[0].text ||
-            n.items[0].link ||
-            "—"
-          : "—"
-      }`;
+      const sentPct = (typeof n.sentiment === "number") ? Math.round(n.sentiment * 1000) / 10 : "N/A";
+      const topItem = n.items && n.items[0] ? (n.items[0].title || n.items[0].text || n.items[0].link || "—") : "—";
+      newsTxt = `📰 <b>News</b> | Impact: ${esc(n.impact)} | Sentiment: ${esc(String(sentPct))}% | Items: ${esc(String(n.items?.length || 0))}
+Top: ${esc(topItem)}`;
     }
 
     // SL using ATR(15m)
     const tf15 = mtf.find(x => x.tf === "15m");
     const atr15 = tf15?.indicators?.ATR || (tf15?.price ? Number(tf15.price) * 0.005 : null);
-    let slLong = "n/a",
-      slShort = "n/a";
+    let slLong = "n/a", slShort = "n/a";
     if (atr15) {
-      slLong = nf(price - atr15 * 2, 2);
-      slShort = nf(price + atr15 * 2, 2);
+      slLong = esc(nf(price - atr15 * 2, 2));
+      slShort = esc(nf(price + atr15 * 2, 2));
     }
 
     // Fusion Label
     const overallFusion = Number(report.overallFusion ?? 0);
     const fusionLbl = fusionLabel(overallFusion);
 
-    // Main Output HTML (Premium UI)
+    // Build the final HTML — safely escape all injected dynamic data
     const html = `
-🚀 <b>${report.symbol} — AI Trader (Option-B Premium)</b>
-${new Date(report.generatedAt).toLocaleString()}
-Price: <b>${nf(price, 2)}</b>
+🚀 <b>${esc(report.symbol)} — AI Trader (Option-B Premium)</b>
+${esc(new Date(report.generatedAt).toLocaleString())}
+Price: <b>${esc(nf(price, 2))}</b>
 
 ${heat}
 
@@ -517,10 +516,10 @@ ${tfBlocks}
 
 ────────────────────
 🧠 <b>Fusion Summary</b>
-Overall Bias: ${fusionLbl.emoji} <b>${fusionLbl.label}</b>
-Fusion Score: ${overallFusion}
-Buy Prob: <b>${report.buyProb}%</b> | Sell Prob: <b>${report.sellProb}%</b>
-ML Weight: ${report.mlWeight} | News Weight: ${report.newsWeight}
+Overall Bias: ${fusionLbl.emoji} <b>${esc(fusionLbl.label)}</b>
+Fusion Score: ${esc(String(overallFusion))}
+Buy Prob: <b>${esc(String(report.buyProb))}%</b> | Sell Prob: <b>${esc(String(report.sellProb))}%</b>
+ML Weight: ${esc(String(report.mlWeight))} | News Weight: ${esc(String(report.newsWeight))}
 
 ${newsTxt}
 
@@ -535,28 +534,27 @@ SL (short): ${slShort}
 
 📐 Fib Zone (15m): ${
       tf15?.fib
-        ? nf(tf15.fib.lo, 2) + " - " + nf(tf15.fib.hi, 2)
+        ? esc(nf(tf15.fib.lo, 2)) + " - " + esc(nf(tf15.fib.hi, 2))
         : "N/A"
     }
 
 ────────────────────
 🤖 <b>ML Prediction</b>
-Label: <b>${report.ml?.label || "N/A"}</b>
-Probability: ${report.ml?.prob || 0}%
-Direction: <b>${report.mlDirection}</b>
+Label: <b>${esc(mlLabel)}</b>
+Probability: ${esc(String(mlProb))}%
+Direction: <b>${esc(report.mlDirection)}</b>
 ML Target: ${mlTPtxt}
-Accuracy: ${report.mlAcc}%
-
+Accuracy: ${esc(String(report.mlAcc))}%
 
 <i>AI Engine v3.0 — Elliott + Fusion + ML v8.6 + News AI v3 (Adaptive)</i>
 `.trim();
 
-    // IMPORTANT: do NOT send to Telegram from here.
-    // Return formatted html so caller (aiTraderBot.js) controls sending (avoids duplicates).
+    // IMPORTANT: do NOT auto-send to Telegram here.
+    // Return formatted HTML so caller (aiTraderBot.js) controls sending (avoids duplicates).
     return html;
 
   } catch (e) {
-    const err = `formatAIReport error: ${e.message}`;
+    const err = `formatAIReport error: ${e?.message || String(e)}`;
     console.error(err);
     return err;
   }
