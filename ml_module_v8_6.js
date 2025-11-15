@@ -1,4 +1,4 @@
-// ml_module_v16.js — ML Engine v16 (for main 15m reports + 1m micro reversal watcher)
+// ml_module_v8_6.js — ML Engine v16 (Advanced: 15m + 1m micro-watcher + auto-train + feedback)
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
@@ -24,9 +24,13 @@ const DEFAULTS = {
   epochs: CONFIG.ML?.EPOCHS ?? 25,
   lr: CONFIG.ML?.LEARNING_RATE ?? 0.02,
   lookback: CONFIG.ML?.LOOKBACK ?? 200, // for feature extraction
-  microLookback: 100, // for 1m watcher
-  horizon: 3, // label horizon in candles for training
-  maxSamples: 300
+  microLookback: CONFIG.ML?.MICRO_LOOKBACK ?? 100, // for 1m watcher
+  horizon: CONFIG.ML?.HORIZON ?? 3, // label horizon in candles for training
+  maxSamples: CONFIG.ML?.MAX_SAMPLES ?? 300,
+  autoRetrainHours: CONFIG.ML?.RETRAIN_INTERVAL_HOURS ?? 6,
+  autoTrainOnStart: CONFIG.ML?.AUTO_TRAIN_ON_START ?? true,
+  microWatcherEnabled: CONFIG.ML?.MICRO_WATCHER ?? false,
+  microWatcherIntervalSeconds: CONFIG.ML?.MICRO_WATCHER_INTERVAL_SECONDS ?? 30
 };
 
 // ---------------------------
@@ -38,7 +42,7 @@ function safeJSONLoad(fp, fallback = null) {
     const txt = fs.readFileSync(fp, "utf8");
     return txt ? JSON.parse(txt) : fallback;
   } catch (e) {
-    console.warn("ml_v16: safeJSONLoad err", e.message);
+    console.warn("ml_v16: safeJSONLoad err", e?.message || e);
     return fallback;
   }
 }
@@ -48,7 +52,7 @@ function safeJSONSave(fp, data) {
     fs.writeFileSync(fp, JSON.stringify(data, null, 2));
     return true;
   } catch (e) {
-    console.warn("ml_v16: safeJSONSave err", e.message);
+    console.warn("ml_v16: safeJSONSave err", e?.message || e);
     return false;
   }
 }
@@ -463,7 +467,7 @@ export async function dailyRetrain() {
     ].filter(Boolean);
     if (!markets.length) markets.push(CONFIG.SYMBOL || "BTCUSDT");
     try {
-      const model = await trainModel(markets, { useSlidingDataset: true, epochs: CONFIG.ML?.EPOCHS || DEFAULTS.epochs, lr: CONFIG.ML?.LEARNING_RATE || DEFAULTS.lr, window: 60, horizon: DEFAULTS.horizon, maxSamples: 300 });
+      const model = await trainModel(markets, { useSlidingDataset: true, epochs: CONFIG.ML?.EPOCHS || DEFAULTS.epochs, lr: CONFIG.ML?.LEARNING_RATE || DEFAULTS.lr, window: 60, horizon: DEFAULTS.horizon, maxSamples: DEFAULTS.maxSamples });
       const acc = calculateAccuracy();
       return { ok: true, modelMeta: { trainedAt: model.trainedAt, dim: model.dim }, accuracy: acc };
     } catch (e) {
@@ -495,6 +499,94 @@ export function getMLDashboard() {
 }
 
 // ---------------------------
+// Auto-train scheduler + micro-watcher control
+// ---------------------------
+let _autoRetrainTimer = null;
+let _microWatcherTimer = null;
+let _microWatcherSymbols = [CONFIG.SYMBOL || "BTCUSDT"];
+
+export function startAutoRetrain() {
+  try {
+    const hours = Number(CONFIG.ML?.RETRAIN_INTERVAL_HOURS ?? DEFAULTS.autoRetrainHours) || DEFAULTS.autoRetrainHours;
+    const ms = Math.max(1, hours) * 60 * 60 * 1000;
+    if (_autoRetrainTimer) clearInterval(_autoRetrainTimer);
+    _autoRetrainTimer = setInterval(async () => {
+      try {
+        await dailyRetrain();
+      } catch (e) { console.warn("ml_v16.autoRetrain err", e?.message || e); }
+    }, ms);
+    return true;
+  } catch (e) {
+    console.warn("ml_v16.startAutoRetrain err", e?.message || e);
+    return false;
+  }
+}
+export function stopAutoRetrain() {
+  if (_autoRetrainTimer) {
+    clearInterval(_autoRetrainTimer);
+    _autoRetrainTimer = null;
+  }
+}
+
+// micro watcher: polls micro prediction for symbols list and writes last result to predictions store
+export function startMicroWatcher(symbols = [CONFIG.SYMBOL || "BTCUSDT"], intervalSeconds = DEFAULTS.microWatcherIntervalSeconds) {
+  try {
+    if (_microWatcherTimer) clearInterval(_microWatcherTimer);
+    _microWatcherSymbols = Array.isArray(symbols) ? symbols : [symbols];
+    _microWatcherTimer = setInterval(async () => {
+      try {
+        for (const s of _microWatcherSymbols) {
+          const res = await runMicroPrediction(s, "1m", DEFAULTS.microLookback);
+          if (res && !res.error) {
+            await recordPrediction({ symbol: s, predictedAt: nowISO(), label: res.label, prob: res.prob, features: res.features, meta: { micro: true, patterns: res.patterns }});
+          }
+        }
+      } catch (e) { console.warn("ml_v16.microWatcher err", e?.message || e); }
+    }, Math.max(5, Number(intervalSeconds || DEFAULTS.microWatcherIntervalSeconds)) * 1000);
+    return true;
+  } catch (e) {
+    console.warn("ml_v16.startMicroWatcher err", e?.message || e);
+    return false;
+  }
+}
+export function stopMicroWatcher() {
+  if (_microWatcherTimer) {
+    clearInterval(_microWatcherTimer);
+    _microWatcherTimer = null;
+  }
+}
+
+// ---------------------------
+// Initialize: ensure model exists and start schedulers (best-effort, non-blocking)
+// ---------------------------
+(async function __ml_init_auto() {
+  try {
+    // If model file missing and autoTrainOnStart, kick off a training in background (non-blocking)
+    const model = safeJSONLoad(MODEL_FILE, null);
+    if (!model && DEFAULTS.autoTrainOnStart) {
+      // start background training but don't block module import
+      (async () => {
+        try {
+          await trainModel([CONFIG.SYMBOL || "BTCUSDT"], { useSlidingDataset: true, epochs: DEFAULTS.epochs, lr: DEFAULTS.lr });
+          // compute accuracy after training
+          calculateAccuracy();
+        } catch (e) {
+          console.warn("ml_v16: background initial train failed", e?.message || e);
+        }
+      })();
+    }
+
+    // start auto retrain scheduler if enabled (autoRetrainHours > 0)
+    if (Number(DEFAULTS.autoRetrainHours) > 0) startAutoRetrain();
+
+    // optionally start micro-watcher if configured
+    if (DEFAULTS.microWatcherEnabled) startMicroWatcher(_microWatcherSymbols, DEFAULTS.microWatcherIntervalSeconds);
+  } catch (e) {
+    console.warn("ml_v16.__ml_init_auto err", e?.message || e);
+  }
+})();
+
+// ---------------------------
 // Exports
 // ---------------------------
 export default {
@@ -508,5 +600,10 @@ export default {
   calculateAccuracy,
   evaluateModelOnSymbols,
   dailyRetrain,
-  getMLDashboard
+  getMLDashboard,
+  // extra controls
+  startAutoRetrain,
+  stopAutoRetrain,
+  startMicroWatcher,
+  stopMicroWatcher
 };
