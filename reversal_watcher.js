@@ -1,181 +1,172 @@
 // reversal_watcher.js
-// Standalone Reversal Detector + ML + Sentiment + Telegram Alert + Feedback Tracker
+// Standalone Reversal Watcher + ML v16 + News + Feedback Loop + Telegram Alerts
 
+import fs from "fs";
+import path from "path";
 import axios from "axios";
-import { fetchMarketData } from "./utils.js";
+
 import CONFIG from "./config.js";
-import { getMLScore } from "./ml_module_v8_6.js";
-import { getNewsSentimentScore } from "./news_social.js";
-import TelegramBot from "node-telegram-bot-api";
+import { fetchMarketData } from "./utils.js";
+import { runMicroPrediction } from "./ml_module_v8_6.js";
 
-const bot = new TelegramBot(CONFIG.TELEGRAM.BOT_TOKEN, { polling: false });
+const FEEDBACK_STORE = path.resolve("./cache/reversal_feedback.json");
+if (!fs.existsSync(FEEDBACK_STORE)) fs.writeFileSync(FEEDBACK_STORE, JSON.stringify({ signals: [] }, null, 2));
 
-let intervalHandle = null;
-let lastSignal = null;     // store last reversal call
-let feedbackQueue = [];    // store predictions for later validation
-
-// =============== CORE MATH UTIL ===============
-function calcSlope(a, b) {
-  if (!a || !b) return 0;
-  return (b.close - a.close) / (b.open || a.open || 1);
-}
-
-// =============== REVERSAL DETECTOR ===============
-function detectReversal(candles) {
-  if (!candles || candles.length < 4) return null;
-
-  const c1 = candles[candles.length - 1];
-  const c2 = candles[candles.length - 2];
-  const c3 = candles[candles.length - 3];
-
-  const s1 = calcSlope(c3, c2);
-  const s2 = calcSlope(c2, c1);
-
-  if (s1 < 0 && s2 > 0) {
-    return { type: "BULLISH", price: c1.close };
-  }
-  if (s1 > 0 && s2 < 0) {
-    return { type: "BEARISH", price: c1.close };
-  }
-  return null;
-}
-
-// =============== REVERSAL CONFIRMATION ===============
-async function buildReversalSignal(symbol, reversal, candles) {
-  let mlScore = 0;
-  let sentiment = 0;
-
+// -----------------------------
+// Telegram Sender
+// -----------------------------
+async function sendTelegram(msg) {
   try {
-    mlScore = await getMLScore(symbol, candles);
-  } catch {}
+    if (!CONFIG.TELEGRAM?.BOT_TOKEN || !CONFIG.TELEGRAM?.CHAT_ID) return;
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`;
 
-  try {
-    sentiment = await getNewsSentimentScore(symbol);
-  } catch {}
-
-  const confidence =
-    (mlScore * 0.6) +
-    (sentiment * 0.4) +
-    (reversal.type === "BULLISH" ? 0.3 : -0.3);
-
-  return {
-    symbol,
-    type: reversal.type,
-    price: reversal.price,
-    mlScore,
-    sentiment,
-    confidence: Number(confidence.toFixed(3)),
-    time: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
-  };
-}
-
-// =============== TELEGRAM ALERT ===============
-async function sendReversalAlert(report) {
-  const emoji = report.type === "BULLISH" ? "🟢" : "🔴";
-
-  const msg = `
-${emoji} *REVERSAL DETECTED* ${emoji}
-Symbol: *${report.symbol}*
-Type: *${report.type}*
-Price: *${report.price}*
-ML Score: *${report.mlScore}*
-News Sentiment: *${report.sentiment}*
-Confidence: *${report.confidence}*
-Time: ${report.time}
-  `.trim();
-
-  try {
-    await bot.sendMessage(CONFIG.TELEGRAM.CHAT_ID, msg, { parse_mode: "Markdown" });
+    await axios.post(url, {
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
+      text: msg,
+      parse_mode: "HTML"
+    });
   } catch (e) {
-    console.error("Telegram error:", e.message);
+    console.log("Telegram Send Error:", e.message);
   }
 }
 
-// =============== FEEDBACK ENGINE ===============
-async function checkFeedback() {
-  if (feedbackQueue.length === 0) return;
+// -----------------------------
+// Pattern Detection (Strong Only)
+// -----------------------------
+function detectReversalPatterns(data) {
+  if (!data || data.length < 3) return [];
 
-  const now = Date.now();
+  const p1 = data[data.length - 3];
+  const p2 = data[data.length - 2];
+  const p3 = data[data.length - 1];
 
-  for (let f of feedbackQueue) {
-    if (now - f.ts >= 10 * 60 * 1000) { // 10 min later
-      const data = await fetchMarketData(f.symbol, "5m", 3);
-      const last = data?.data?.slice(-1)[0];
-      if (!last) continue;
+  const patterns = [];
 
-      const actual = last.close;
-      let result = "❓ Uncertain";
+  // Hammers
+  const body3 = Math.abs(p3.close - p3.open);
+  const lowerWick3 = Math.abs(Math.min(p3.open, p3.close) - p3.low);
+  const upperWick3 = Math.abs(p3.high - Math.max(p3.open, p3.close));
+  if (lowerWick3 > body3 * 1.8 && upperWick3 < body3 * 0.5) {
+    patterns.push("Hammer");
+  }
 
-      if (f.type === "BULLISH") {
-        result = actual > f.price ? "✅ Correct" : "❌ Wrong";
-      }
-      if (f.type === "BEARISH") {
-        result = actual < f.price ? "✅ Correct" : "❌ Wrong";
-      }
+  // Shooting Star
+  if (upperWick3 > body3 * 1.8 && lowerWick3 < body3 * 0.5) {
+    patterns.push("Shooting Star");
+  }
 
-      const msg = `
-📊 *Reversal Feedback*
-Prediction: ${f.type}
-Entry Price: ${f.price}
-Now: ${actual}
-Result: *${result}*
-      `.trim();
+  // Engulfing
+  if (p3.close > p3.open && p2.close < p2.open && p3.open < p2.close && p3.close > p2.open) {
+    patterns.push("Bullish Engulfing");
+  }
+  if (p3.close < p3.open && p2.close > p2.open && p3.open > p2.close && p3.close < p2.open) {
+    patterns.push("Bearish Engulfing");
+  }
 
-      try {
-        await bot.sendMessage(CONFIG.TELEGRAM.CHAT_ID, msg, { parse_mode: "Markdown" });
-      } catch {}
+  return patterns;
+}
 
-      // remove from queue
-      feedbackQueue = feedbackQueue.filter(x => x !== f);
-    }
+// -----------------------------
+// Save Signal for Feedback
+// -----------------------------
+function saveSignal(data) {
+  const store = JSON.parse(fs.readFileSync(FEEDBACK_STORE, "utf8"));
+  store.signals.push(data);
+  fs.writeFileSync(FEEDBACK_STORE, JSON.stringify(store, null, 2));
+}
+
+// -----------------------------
+// Feedback Evaluator
+// -----------------------------
+async function checkFeedback(symbol) {
+  const store = JSON.parse(fs.readFileSync(FEEDBACK_STORE, "utf8"));
+  let updated = false;
+
+  for (const s of store.signals) {
+    if (s.checked) continue;
+
+    const candles = await fetchMarketData(symbol, "15m", 10);
+    const last = candles?.data?.at(-1)?.close ?? null;
+
+    if (!last) continue;
+    if (Date.now() - s.ts < 15 * 60 * 1000 * 2) continue; // wait 2 candles
+
+    let correct = false;
+    const ret = (last - s.price) / s.price;
+
+    if (s.direction === "Bullish" && ret > 0) correct = true;
+    if (s.direction === "Bearish" && ret < 0) correct = true;
+
+    s.checked = true;
+    s.correct = correct;
+    s.realized = ret;
+
+    const emoji = correct ? "✅" : "❌";
+
+    await sendTelegram(
+      `${emoji} <b>Reversal Feedback</b>\n` +
+      `Pattern: <b>${s.pattern}</b>\n` +
+      `Direction: ${s.direction}\n` +
+      `Actual Return: <b>${(ret * 100).toFixed(2)}%</b>`
+    );
+
+    updated = true;
+  }
+
+  if (updated) {
+    fs.writeFileSync(FEEDBACK_STORE, JSON.stringify(store, null, 2));
   }
 }
 
-// =============== RUNNER ===============
-async function pollReversal(symbol = CONFIG.SYMBOL) {
+// -----------------------------
+// Main Loop
+// -----------------------------
+export async function runReversalWatcher(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", 50);
-    const candles = m15.data;
+    const candles = m15?.data || [];
+    if (candles.length < 30) return;
 
-    if (!candles?.length) return;
+    const price = candles.at(-1).close;
 
-    const rev = detectReversal(candles);
-    if (!rev) return;
+    const patterns = detectReversalPatterns(candles);
+    if (!patterns.length) {
+      await checkFeedback(symbol);
+      return;
+    }
 
-    if (lastSignal && lastSignal.type === rev.type) return; // avoid duplicates
-    lastSignal = rev;
+    const ml = await runMicroPrediction(symbol);
 
-    const report = await buildReversalSignal(symbol, rev, candles);
+    const dir = ml.label;
+    const prob = ml.prob;
 
-    await sendReversalAlert(report);
+    const msg =
+      `🚨 <b>Reversal Watcher Alert</b>\n` +
+      `Pattern: <b>${patterns.join(", ")}</b>\n` +
+      `Direction: <b>${dir}</b>\n` +
+      `ML Prob: <b>${prob}%</b>\n` +
+      `Price: <b>${price}</b>`;
 
-    // feedback entry
-    feedbackQueue.push({
+    await sendTelegram(msg);
+
+    saveSignal({
+      ts: Date.now(),
       symbol,
-      type: rev.type,
-      price: rev.price,
-      ts: Date.now()
+      pattern: patterns.join(","),
+      direction: dir,
+      prob,
+      price,
+      checked: false
     });
 
+    await checkFeedback(symbol);
+
   } catch (e) {
-    console.log("Reversal Watcher error:", e.message);
+    console.log("Reversal Watcher Err:", e.message);
   }
 }
 
-// =============== START + STOP EXPORTS ===============
-export function startReversalWatcher() {
-  if (intervalHandle) return;
+// Run every 1 minute
+setInterval(() => runReversalWatcher(CONFIG.SYMBOL), 60 * 1000);
 
-  intervalHandle = setInterval(pollReversal, 15000); // every 15 sec
-  setInterval(checkFeedback, 20000); // feedback check
-
-  console.log("✅ Reversal Watcher started");
-}
-
-export function stopReversalWatcher() {
-  try {
-    clearInterval(intervalHandle);
-    intervalHandle = null;
-    console.log("🛑 Reversal Watcher stopped");
-  } catch {}
-}
+console.log("🔄 Reversal Watcher Started…");
