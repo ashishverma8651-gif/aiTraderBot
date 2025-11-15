@@ -66,7 +66,7 @@ export const CONFIG = {
   // =====================================================
   // KEEP-ALIVE PING (Render/Hosting)
   // =====================================================
-  SELF_URL: process.env.SELF_URL || process.env.SELF_PING_URL || null,
+  SELF_PING_URL: process.env.SELF_PING_URL || null,
 
   PATHS: {
     CACHE_DIR
