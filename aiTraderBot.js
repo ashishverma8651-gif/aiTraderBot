@@ -1,140 +1,126 @@
-// aiTraderBot.js — main runner: express server, WS mirror, auto 15m report + KeepAlive
+// aiTraderBot.js — main runner: express server, WS mirror, auto 15m report + KeepAlive + Reversal Watcher
 import express from "express";
 import WebSocket from "ws";
 import axios from "axios";
-
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
 
-// =======================================================
-// CONFIG SAFETY / DEFAULTS
-// =======================================================
-const PORT = Number(process.env.PORT || CONFIG.PORT || 10000);
-const SYMBOL = CONFIG.SYMBOL || "BTCUSDT";
-const REPORT_INTERVAL_MS = Number(CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
-const WS_MIRRORS = CONFIG.WS_MIRRORS || [
-  "wss://data-stream.binance.vision/ws",
-  "wss://stream.binance.com:9443/ws"
-];
-const SELF_PING_URL = CONFIG.SELF_URL || CONFIG.SELF_PING_URL || null;
-const KEEPALIVE_MS = Number(CONFIG.KEEPALIVE_MS || 4 * 60 * 1000); // 4 min
-const MAX_RECENT_EVENTS = Number(CONFIG.MAX_RECENT_EVENTS || 50);
+// Reversal watcher module (standalone file). Should export startReversalWatcher(symbol, opts) and stopReversalWatcher()
+import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
 // =======================================================
 // EXPRESS SERVER
 // =======================================================
 const app = express();
+const PORT = process.env.PORT || CONFIG.PORT || 10000;
+
 app.get("/", (_, res) => res.send("✅ AI Trader is running"));
 app.listen(PORT, () =>
-  console.log(`✅ Server live on port ${PORT} (${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })})`)
+  console.log(
+    `✅ Server live on port ${PORT} (${new Date().toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata"
+    })})`
+  )
 );
 
 // =======================================================
-// SHARED STATE (kept tiny)
+// WEBSOCKET LIVE PRICE - robust mirror list + reconnect/backoff
 // =======================================================
 let lastPrice = null;
 let socketAlive = false;
 let ws = null;
 let mirrorIdx = 0;
-let wsReconnectAttempts = 0;
-let recentEvents = [];
+let wsBackoffMs = 1000;
 
-// helper to keep small buffer
-function pushEvent(msg) {
-  try {
-    recentEvents.push({ ts: Date.now(), msg });
-    if (recentEvents.length > MAX_RECENT_EVENTS) recentEvents.shift();
-  } catch {}
+const WS_MIRRORS = (CONFIG.WS_MIRRORS && CONFIG.WS_MIRRORS.length)
+  ? CONFIG.WS_MIRRORS
+  : [
+      // prefer endpoints known to be stable from Binance
+      "wss://stream.binance.com:9443/ws",
+      "wss://data-stream.binance.vision/ws",
+      "wss://fstream.binance.com/ws"
+    ];
+
+function makeTickerStream(symbol) {
+  // keep classic ticker stream that is widely supported
+  const s = symbol.toLowerCase();
+  return `${s}@ticker`;
 }
 
-// =======================================================
-// WS MIRROR (with backoff & sane timeouts)
-// =======================================================
-function connectWS(symbol = SYMBOL) {
-  const stream = `${symbol.toLowerCase()}@ticker`;
-  const connectInternal = () => {
+function connectWS(symbol = CONFIG.SYMBOL || "BTCUSDT") {
+  const stream = makeTickerStream(symbol);
+  const connectOnce = () => {
     const base = WS_MIRRORS[mirrorIdx % WS_MIRRORS.length];
-    const url = base.endsWith("/") ? base + stream : base + "/" + stream;
+    const url = base.endsWith("/") ? base + stream : `${base}/${stream}`;
 
     try {
       if (ws) {
-        try { ws.removeAllListeners(); ws.terminate(); } catch {}
+        try { ws.terminate(); } catch (_) {}
         ws = null;
       }
 
-      ws = new WebSocket(url, { handshakeTimeout: 10_000 });
+      ws = new WebSocket(url, { handshakeTimeout: 5000 });
 
       ws.on("open", () => {
         socketAlive = true;
-        wsReconnectAttempts = 0;
-        pushEvent(`WS open ${url}`);
+        wsBackoffMs = 1000; // reset backoff
         console.log("🔗 WS Connected:", url);
       });
 
       ws.on("message", (data) => {
         try {
-          const s = typeof data === "string" ? data : data.toString();
-          const j = JSON.parse(s);
-          // Binance ticker uses 'c' for current price; other mirrors may differ
-          const p = parseFloat(j?.c ?? j?.last_price ?? j?.p ?? null);
-          if (!Number.isNaN(p)) lastPrice = p;
-        } catch (_) {}
+          const j = typeof data === "string" ? JSON.parse(data) : JSON.parse(data.toString());
+          // Binance ticker uses 'c' for last price; other endpoints may use 'last_price'
+          if (j && (j.c || j.last_price || j.p)) {
+            lastPrice = parseFloat(j.c || j.last_price || j.p);
+          }
+        } catch (e) {
+          // ignore parse errors
+        }
       });
 
       ws.on("close", (code, reason) => {
         socketAlive = false;
-        pushEvent(`WS closed ${code}`);
-        console.warn("⚠️ WS Closed", code, reason);
+        console.warn("⚠️ WS Closed", code, reason?.toString?.() || reason);
         mirrorIdx++;
-        scheduleReconnect();
+        tryReconnectWithBackoff();
       });
 
       ws.on("error", (e) => {
         socketAlive = false;
-        pushEvent(`WS error ${String(e?.message || e)}`);
         console.warn("⚠️ WS Error:", e?.message || e);
-        try { ws.terminate(); } catch {}
-        scheduleReconnect();
+        try { ws.terminate(); } catch (_) {}
+        mirrorIdx++;
+        tryReconnectWithBackoff();
       });
     } catch (e) {
       socketAlive = false;
-      pushEvent(`WS connect fail ${e?.message || e}`);
       mirrorIdx++;
-      scheduleReconnect();
+      tryReconnectWithBackoff();
     }
   };
 
-  function scheduleReconnect() {
-    wsReconnectAttempts++;
+  function tryReconnectWithBackoff() {
     // exponential backoff capped
-    const delay = Math.min(120000, 5000 + Math.pow(2, Math.min(wsReconnectAttempts, 8)) * 1000);
-    setTimeout(() => {
-      try {
-        connectInternal();
-      } catch (e) {
-        mirrorIdx++;
-        setTimeout(connectInternal, Math.min(60000, delay * 2));
-      }
-    }, delay);
+    const delay = Math.min(wsBackoffMs, 60 * 1000);
+    wsBackoffMs = Math.min(60000, wsBackoffMs * 1.8);
+    setTimeout(connectOnce, delay + Math.floor(Math.random() * 800));
   }
 
-  // Start first connect
-  connectInternal();
+  connectOnce();
 }
 
 // start WS
-connectWS(SYMBOL);
+connectWS(CONFIG.SYMBOL);
 
 // =======================================================
-// GET DATA CONTEXT (lightweight)
-// =======================================================
-async function getDataContext(symbol = SYMBOL) {
+// DATA CONTEXT helper (used by auto report & watcher)
+async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
-    // Use a smaller default limit at call site (utils uses CONFIG.DEFAULT_LIMIT)
-    const m15 = await fetchMarketData(symbol, "15m", Math.max(50, Number(CONFIG.DEFAULT_LIMIT || 120)));
-    const candles = m15?.data || [];
-    const price = (typeof lastPrice === "number" && !Number.isNaN(lastPrice)) ? lastPrice : (m15?.price || 0);
+    const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
+    const candles = m15.data || [];
+    const price = (typeof lastPrice === "number" && !Number.isNaN(lastPrice)) ? lastPrice : (m15.price || 0);
     return { price, candles, socketAlive };
   } catch (e) {
     console.warn("getDataContext error", e?.message || e);
@@ -143,128 +129,153 @@ async function getDataContext(symbol = SYMBOL) {
 }
 
 // =======================================================
-// SEND REPORT (single run, defensive)
+// AUTO REPORT (every 15m) — time in Asia/Kolkata shown
 // =======================================================
 async function sendAutoReport() {
   try {
-    const ctx = await getDataContext(SYMBOL);
-    // buildAIReport may be heavier; guard with timeout in case of hang
-    const report = await buildAIReport(SYMBOL, ctx);
+    const ctx = await getDataContext(CONFIG.SYMBOL);
+    // buildAIReport signature in your project expects symbol (some versions accept ctx, optional)
+    // this call uses only symbol; if your buildAIReport accepts ctx, change accordingly
+    const report = await buildAIReport(CONFIG.SYMBOL);
     await formatAIReport(report);
-    const nowStr = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-    pushEvent(`15m Report sent: ${nowStr}`);
-    console.log("📤 15m Report sent:", nowStr);
+
+    console.log(
+      "📤 15m Report sent:",
+      new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
+    );
   } catch (e) {
-    pushEvent(`Auto report error: ${String(e?.message || e)}`);
     console.error("Auto report error:", e?.message || e);
   }
 }
 
-// =======================================================
-// SAFE SCHEDULER (prevents overlaps)
-// =======================================================
-let reportRunning = false;
-async function safeScheduleReport() {
-  if (reportRunning) {
-    console.log("🕒 Previous report still running — skipping this tick.");
-    return;
-  }
-  reportRunning = true;
+// Use CONFIG.REPORT_INTERVAL_MS if set; else default 15 minutes
+const REPORT_INTERVAL = Number(CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
+let reportTimer = setInterval(sendAutoReport, REPORT_INTERVAL);
+
+// send one immediate report on startup (non-blocking)
+(async () => {
   try {
     await sendAutoReport();
   } catch (e) {
-    // already handled in sendAutoReport
-  } finally {
-    reportRunning = false;
+    console.warn("Startup initial report failed:", e?.message || e);
   }
-}
-
-// schedule (use setInterval but with guard)
-const intervalMs = Number(REPORT_INTERVAL_MS || 15 * 60 * 1000);
-const intervalHandle = setInterval(() => safeScheduleReport().catch(()=>{}), intervalMs);
-
-// also run once immediately but guarded
-(async () => { try { await safeScheduleReport(); } catch (e) {} })();
+})();
 
 // =======================================================
-// KEEP-ALIVE (prevent Render idle sleep + reduce memory)
+// KEEP-ALIVE (Prevent Render from Sleeping)
 // =======================================================
+const SELF_PING_URL = process.env.SELF_PING_URL || CONFIG.SELF_PING_URL || null;
+let keepAliveTimer = null;
+
 function startKeepAlive() {
   if (!SELF_PING_URL) {
     console.log("⚠️ SELF_PING_URL not set — skipping keep-alive pings.");
     return;
   }
-
-  // light ping every KEEPALIVE_MS
-  setInterval(async () => {
+  // ping every ~4 minutes
+  keepAliveTimer = setInterval(async () => {
     try {
-      await axios.get(SELF_PING_URL, { timeout: 8_000 });
-      pushEvent(`KeepAlive ping ok ${new Date().toISOString()}`);
+      await axios.get(SELF_PING_URL, { timeout: 8000 });
       console.log("💓 KeepAlive Ping:", new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }));
     } catch (e) {
-      pushEvent(`KeepAlive ping failed ${String(e?.message || e)}`);
-      console.warn("⚠️ KeepAlive failed:", e?.message || e);
+      console.warn("⚠️ KeepAlive ping failed:", e?.message || e);
     }
-  }, Math.max(60_000, KEEPALIVE_MS)); // not too aggressive
+  }, 4 * 60 * 1000);
+  console.log("✅ KeepAlive started ->", SELF_PING_URL);
 }
+
 startKeepAlive();
 
 // =======================================================
-// MEMORY CLEANER (call GC if exposed, low-frequency)
+// Reversal Watcher integration
+// - expects ./reversal_watcher.js to export startReversalWatcher(symbol, options) and stopReversalWatcher()
+// - we start it with modest poll interval to keep memory low
 // =======================================================
-function startMemoryCleaner() {
-  try {
-    // only attempt if Node allowed explicit GC
-    if (typeof global !== "undefined" && typeof global.gc === "function") {
-      setInterval(() => {
-        try {
-          global.gc();
-          pushEvent("♻️ GC invoked");
-          // lightweight memory logging
-          if (typeof process?.memoryUsage === "function") {
-            const mu = process.memoryUsage();
-            console.log(`♻️ GC run — RSS:${Math.round(mu.rss/1024/1024)}MB HeapUsed:${Math.round(mu.heapUsed/1024/1024)}MB`);
-          }
-        } catch (e) {
-          console.warn("GC error:", e?.message || e);
-        }
-      }, 60 * 1000); // every 60s
-      console.log("♻️ Memory cleaner (GC) started (node --expose-gc recommended).");
-    } else {
-      console.log("⚠️ Global GC not available. Start node with --expose-gc to enable memory cleaner.");
-    }
-  } catch (e) {
-    console.warn("startMemoryCleaner err", e?.message || e);
+try {
+  const watcherOptions = {
+    pollIntervalMs: Number(CONFIG.REVERSAL_WATCHER_POLL_MS || 15 * 1000), // default 15s
+    microLookback: Number(CONFIG.REVERSAL_WATCHER_LOOKBACK || 60),
+    telegramAlert: true, // reversal_watcher should handle sending telegram alerts (or call back)
+    maxMemorySamples: Number(CONFIG.REVERSAL_WATCHER_MAX_SAMPLES || 200)
+  };
+
+  if (typeof startReversalWatcher === "function") {
+    startReversalWatcher(CONFIG.SYMBOL, watcherOptions);
+    console.log("✅ Reversal Watcher started for", CONFIG.SYMBOL, `(poll ${watcherOptions.pollIntervalMs}ms)`);
+  } else {
+    console.warn("⚠️ startReversalWatcher not found in reversal_watcher.js — skipping");
   }
+} catch (e) {
+  console.warn("⚠️ Reversal watcher start failed:", e?.message || e);
 }
-startMemoryCleaner();
 
 // =======================================================
-// GRACEFUL SHUTDOWN
+// ENABLE EXPLICIT GC (if Node started with --expose-gc)
+// - We'll call global.gc periodically if available to help keep memory under control
+// =======================================================
+if (typeof global.gc === "function") {
+  // conservative: run GC every 5 minutes
+  setInterval(() => {
+    try {
+      global.gc();
+      console.log("🧹 Called global.gc()");
+    } catch (e) {
+      // ignore
+    }
+  }, 5 * 60 * 1000);
+} else {
+  console.log("ℹ️ global.gc() not available. To enable, start node with: node --expose-gc aiTraderBot.js");
+}
+
+// =======================================================
+// Graceful shutdown
 // =======================================================
 async function shutdown(signal) {
+  console.log(`\n🛑 Shutdown received (${signal}) — cleaning up...`);
   try {
-    console.log(`\n🛑 Shutdown (${signal}) — cleaning up...`);
-    try { clearInterval(intervalHandle); } catch {}
-    try { if (ws) ws.terminate(); } catch {}
-    // final small GC
-    try { if (global.gc) global.gc(); } catch {}
-    console.log("✅ Shutdown complete.");
-    process.exit(0);
+    if (reportTimer) clearInterval(reportTimer);
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+
+    // stop reversal watcher if available
+    try {
+      if (typeof stopReversalWatcher === "function") {
+        await stopReversalWatcher();
+        console.log("✅ Reversal watcher stopped");
+      }
+    } catch (e) { /* ignore */ }
+
+    // close WS
+    try {
+      if (ws) {
+        ws.terminate();
+        ws = null;
+      }
+    } catch (e) {}
+
+    // Wait a bit for sockets to close
+    setTimeout(() => {
+      console.log("✔️ Shutdown complete — exiting.");
+      process.exit(0);
+    }, 800);
   } catch (e) {
-    console.error("Shutdown error:", e?.message || e);
+    console.error("Shutdown cleanup error:", e?.message || e);
     process.exit(1);
   }
 }
+
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err?.stack || err);
+  // attempt graceful restart
+  shutdown("uncaughtException");
+});
+process.on("unhandledRejection", (reason) => {
+  console.warn("Unhandled Promise Rejection:", reason);
+});
 
 // =======================================================
-// EXPORTS (for tests / external triggers)
-// =======================================================
 export default {
-  sendAutoReport: safeScheduleReport,
-  getDataContext: getDataContext,
-  pushEvent,
-  getRecentEvents: () => recentEvents.slice()
+  sendAutoReport,
+  getDataContext
 };
