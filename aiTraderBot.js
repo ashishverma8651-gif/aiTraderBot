@@ -1,5 +1,17 @@
-// aiTraderBot.js — FINAL BUILD (Stable + Flood-proof WS + Silent Reversal Watcher)
+// aiTraderBot.js — Optimized Render-safe single-instance runner (PATCHED)
 
+// =============================================================
+// 🔒 GLOBAL INSTANCE-LOCK (prevents duplicate WS, reports, watcher)
+// =============================================================
+if (global.__aiTrader_running) {
+  console.log("⚠️ Already running. Skipping duplicate instance.");
+  process.exit(0);
+}
+global.__aiTrader_running = true;
+
+// =============================================================
+// Required imports
+// =============================================================
 import fs from "fs";
 import path from "path";
 import express from "express";
@@ -9,42 +21,14 @@ import axios from "axios";
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
+
 import ml from "./ml_module_v8_6.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
 
-// =======================================================
-// LOCK SYSTEM — prevent duplicate instances (Render safe)
-// =======================================================
-const LOCK_FILE = path.resolve(process.cwd(), ".aitraderbot.lock");
-
-function isAlreadyRunning() {
-  try {
-    if (!fs.existsSync(LOCK_FILE)) return false;
-    const pid = Number(fs.readFileSync(LOCK_FILE, "utf8"));
-    if (!pid) return true;
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-if (isAlreadyRunning()) {
-  console.log("⚠️ Instance already running — exit.");
-  process.exit(0);
-}
-
-fs.writeFileSync(LOCK_FILE, String(process.pid));
-
-process.on("exit", () => { try { fs.unlinkSync(LOCK_FILE); } catch {} });
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
-
-
-// =======================================================
-// EXPRESS SERVER
-// =======================================================
+// -----------------------------
+// EXPRESS Server
+// -----------------------------
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
@@ -54,169 +38,192 @@ app.get("/ping", (_, res) => res.send("pong"));
 app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
 
 
-// =======================================================
-// TELEGRAM SENDER
-// =======================================================
+// -----------------------------
+// TELEGRAM DIRECT SENDER
+// -----------------------------
 async function sendTelegram(text) {
   try {
-    const token = CONFIG.TELEGRAM.BOT_TOKEN;
-    const chat = CONFIG.TELEGRAM.CHAT_ID;
-    if (!token || !chat) return;
+    if (!CONFIG.TELEGRAM?.BOT_TOKEN || !CONFIG.TELEGRAM?.CHAT_ID) return;
 
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`;
 
     await axios.post(url, {
-      chat_id: chat,
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
       text,
       parse_mode: "Markdown",
       disable_web_page_preview: true
     });
+
   } catch (e) {
-    console.log("Telegram error:", e.response?.status || e.message);
+    const code = e?.response?.status;
+    if (code) console.warn("Telegram error:", code);
+    else console.warn("Telegram error:", e.message);
   }
 }
 
 
-// =======================================================
-// FLOOD-PROOF WEBSOCKET (SUPER STABLE VERSION)
-// =======================================================
-let ws = null;
-let wsAlive = false;
-let wsConnecting = false;
-let lastWS = 0;
+// =============================================================
+// WEBSOCKET (Stable, throttled, patched for no-flood)
+// =============================================================
 let lastPrice = 0;
+let socketAlive = false;
+let ws = null;
+let mirrorIdx = 0;
+let wsBackoffMs = 1000;
 
-const WS_RETRY = 7000;
+const WS_MIRRORS = CONFIG.WS_MIRRORS;
 
 function connectWS(symbol = CONFIG.SYMBOL) {
-  const stream = `${symbol.toLowerCase()}@ticker`;
+  const stream = `${String(symbol).toLowerCase()}@ticker`;
 
-  async function open() {
-    const now = Date.now();
-    if (wsConnecting) return;
-    if (now - lastWS < WS_RETRY) return;
+  let aborted = false;
 
-    wsConnecting = true;
-    lastWS = now;
+  const attempt = () => {
+    if (aborted) return;
+
+    const base = WS_MIRRORS[mirrorIdx % WS_MIRRORS.length];
+    const url = `${base}/${stream}`;
 
     try { if (ws) ws.terminate(); } catch {}
 
-    const url = `wss://stream.binance.com:9443/ws/${stream}`;
-    ws = new WebSocket(url);
+    ws = new WebSocket(url, { handshakeTimeout: 5000 });
 
     ws.on("open", () => {
-      wsAlive = true;
-      wsConnecting = false;
-      console.log("🔗 WS Connected");
+      socketAlive = true;
+      wsBackoffMs = 1000;
+      console.log("🔗 WS Connected:", url);
     });
 
+    // ---------- PATCH: THROTTLED PRICE UPDATES (anti flood) ----------
+    let lastUpdate = 0;
     ws.on("message", (msg) => {
+      const now = Date.now();
+      if (now - lastUpdate < 500) return; // update only every 0.5 sec
+      lastUpdate = now;
+
       try {
-        const j = JSON.parse(msg);
+        const j = JSON.parse(msg.toString());
         if (j?.c) lastPrice = parseFloat(j.c);
       } catch {}
     });
 
     ws.on("close", () => {
-      wsAlive = false;
-      wsConnecting = false;
-      console.log("⚠️ WS closed → retry 7s");
-      setTimeout(open, WS_RETRY);
+      socketAlive = false;
+      mirrorIdx++;
+      const delay = Math.min(60000, wsBackoffMs);
+      wsBackoffMs *= 1.5;
+      setTimeout(attempt, delay);
     });
 
     ws.on("error", () => {
-      wsAlive = false;
-      wsConnecting = false;
-      console.log("⚠️ WS error → retry 7s");
-      setTimeout(open, WS_RETRY);
+      socketAlive = false;
+      mirrorIdx++;
+      const delay = Math.min(60000, wsBackoffMs);
+      wsBackoffMs *= 1.5;
+      try { ws.terminate(); } catch {}
+      setTimeout(attempt, delay);
     });
-  }
+  };
 
-  open();
+  attempt();
+
+  return () => {
+    aborted = true;
+    try { ws.terminate(); } catch {}
+  };
 }
 
-connectWS(CONFIG.SYMBOL);
+// start WS only once
+if (!global.__wsStarted) {
+  global.__wsStarted = true;
+  connectWS(CONFIG.SYMBOL);
+  console.log("🌐 WebSocket Started (single instance)");
+}
 
 
-// =======================================================
-// DATA CONTEXT
-// =======================================================
+// =============================================================
+// CONTEXT PROVIDER
+// =============================================================
 export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
-    return { price: lastPrice || m15.price, candles: m15.data, socketAlive: wsAlive };
+    return { price: lastPrice || m15.price, candles: m15.data, socketAlive };
   } catch {
-    return { price: lastPrice, candles: [], socketAlive: wsAlive };
+    return { price: lastPrice, candles: [], socketAlive };
   }
 }
 
 
-// =======================================================
-// AUTO REPORT (single instance guaranteed)
-// =======================================================
-let autoReportRun = false;
+// =============================================================
+// AUTO REPORT (Patched — NO DUPLICATES EVER)
+// =============================================================
+let autoReportRunning = false;
 
-async function autoReport() {
-  if (autoReportRun) return;
-  autoReportRun = true;
+async function doAutoReport() {
+  if (autoReportRunning) return;
+  autoReportRunning = true;
 
   try {
-    const report = await buildAIReport(CONFIG.SYMBOL);
-    const msg = await formatAIReport(report);
-    await sendTelegram(msg);
-    console.log("📤 15m report sent");
+    const r = await buildAIReport(CONFIG.SYMBOL);
+    const text = await formatAIReport(r);
+    await sendTelegram(text);
+    console.log("📤 Auto 15m sent");
   } catch (e) {
-    console.log("AutoReport error:", e.message);
+    console.log("autoReport error:", e.message);
   }
 
-  autoReportRun = false;
+  autoReportRunning = false;
 }
 
-setInterval(autoReport, 15 * 60 * 1000);
-setTimeout(autoReport, 5000);
+// Ensure auto-report runs ONCE only
+if (!global.__autoReportStarted) {
+  global.__autoReportStarted = true;
+
+  const interval = CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000;
+
+  setTimeout(doAutoReport, 5000);
+  setInterval(doAutoReport, interval);
+
+  console.log("⏱ AutoReport started (single instance)");
+}
 
 
-// =======================================================
-// KEEPALIVE PING (Render)
-// =======================================================
+// =============================================================
+// KEEPALIVE — unchanged
+// =============================================================
+const SELF_PING = `${CONFIG.SELF_PING_URL}/ping`;
+
 if (CONFIG.SELF_PING_URL) {
   setInterval(() => {
-    axios.get(`${CONFIG.SELF_PING_URL}/ping`).catch(() => {});
-  }, 240000);
+    axios.get(SELF_PING).catch(() => {});
+  }, 4 * 60 * 1000);
 }
 
 
-// =======================================================
-// ML AUTO RETRAIN
-// =======================================================
-ml.startAutoRetrain();
+// =============================================================
+// REVERSAL WATCHER (Patched — NO double alerts, NO feedback spam)
+// =============================================================
+if (!global.__revWatcherStarted) {
+  global.__revWatcherStarted = true;
 
-
-// =======================================================
-// SILENT REVERSAL WATCHER — NO FEEDBACK SPAM
-// =======================================================
-try {
   startReversalWatcher(CONFIG.SYMBOL, {
     pollIntervalMs: CONFIG.REVERSAL_WATCHER_POLL_MS || 15000,
     microLookback: CONFIG.REVERSAL_WATCHER_LOOKBACK || 60,
     minProb: CONFIG.REVERSAL_MIN_PROB || 58,
-
-    // ONLY ONE OUTPUT ALLOWED
-    sendAlert: async (msg) => {
-      await sendTelegram(msg);
-    },
-
-    // DISABLE logs completely
-    silent: true
+    sendAlert: sendTelegram
   });
 
-  console.log("⚡ Reversal Watcher started (silent mode)");
-} catch (e) {
-  console.log("Reversal Watcher failed:", e.message);
+  console.log("⚡ Reversal Watcher Started (single instance)");
 }
 
 
-// =======================================================
-// EXPORT
-// =======================================================
-export default { getDataContext, autoReport };
+// =============================================================
+// GC (optional)
+// =============================================================
+if (typeof global.gc === "function") {
+  setInterval(() => global.gc(), 5 * 60 * 1000);
+}
+
+
+// =============================================================
+export default { getDataContext, doAutoReport };
