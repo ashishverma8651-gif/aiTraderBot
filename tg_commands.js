@@ -551,6 +551,18 @@ Accuracy: ${report.mlAcc}%
 <i>AI Engine v3.0 — Elliott + Fusion + ML v8.6 + News AI v3 (Adaptive)</i>
 `.trim();
 
-    
+  
+
+// return html;
+} catch (e) {
+    const err = `formatAIReport error: ${e.message}`;
+    console.error(err);
+    return err;
+}
+}
 
 export default { buildAIReport, formatAIReport };
+
+
+  
+
