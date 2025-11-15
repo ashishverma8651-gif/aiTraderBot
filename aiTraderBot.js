@@ -7,7 +7,7 @@ import axios from "axios";
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
-import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
+import { startReversalWatcher } from "./reversal_watcher.js";
 
 
 // =======================================================
@@ -173,16 +173,6 @@ try {
 
 
 // =======================================================
-// CLEAN SHUTDOWN (Render compatible)
-// =======================================================
-function shutdown() {
-  try { stopReversalWatcher(); } catch {}
-  try { if (ws) ws.terminate(); } catch {}
-  process.exit(0);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
 
 
 export default {
