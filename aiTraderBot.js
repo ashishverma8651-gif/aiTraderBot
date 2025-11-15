@@ -1,9 +1,8 @@
-// aiTraderBot.js — FINAL CLEAN BUILD (with Reversal Watcher integrated)
+// aiTraderBot.js — FINAL RENDER-SAFE BUILD
 
 import express from "express";
 import WebSocket from "ws";
 import axios from "axios";
-import TelegramBot from "node-telegram-bot-api";
 
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
@@ -11,180 +10,145 @@ import { buildAIReport, formatAIReport } from "./tg_commands.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
 // =======================================================
-// TELEGRAM BOT
-// =======================================================
-const BOT_TOKEN = CONFIG.TELEGRAM.BOT_TOKEN;
-const CHAT_ID = CONFIG.TELEGRAM.CHAT_ID;
-
-let bot = null;
-
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.warn("⚠️ Telegram not configured — BOT_TOKEN or CHAT_ID missing");
-} else {
-  bot = new TelegramBot(BOT_TOKEN, { polling: false });
-  console.log("🤖 Telegram bot ready");
-}
-
-// =======================================================
-// EXPRESS SERVER
+// EXPRESS SERVER (REQUIRED for Render Keep-Alive)
 // =======================================================
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
-app.get("/", (_, res) => res.send("✅ AI Trader is running"));
-app.listen(PORT, () =>
-  console.log(
-    `✅ Server live on port ${PORT} (${new Date().toLocaleString("en-IN", {
-      timeZone: "Asia/Kolkata"
-    })})`
-  )
-);
+app.get("/", (_, res) => res.send("✅ AI Trader Running"));
+app.get("/ping", (_, res) => res.send("pong"));    // <-- KEEPALIVE ENDPOINT
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server live on port ${PORT}`);
+});
 
 // =======================================================
-// WEBSOCKET LIVE PRICE
+// WEBSOCKET PRICE STREAM
 // =======================================================
-let lastPrice = null;
-let socketAlive = false;
+let lastPrice = 0;
 let ws = null;
-let mirrorIdx = 0;
+let alive = false;
+let wsIndex = 0;
 
 const WS_MIRRORS = CONFIG.WS_MIRRORS;
 
-function wsStream(symbol) {
-  return `${symbol.toLowerCase()}@ticker`;
-}
+function connectWS(sym = CONFIG.SYMBOL) {
+  const stream = `${sym.toLowerCase()}@ticker`;
 
-function connectWS(symbol = CONFIG.SYMBOL) {
-  const stream = wsStream(symbol);
-
-  function connectNow() {
-    const base = WS_MIRRORS[mirrorIdx % WS_MIRRORS.length];
-    const url = base.endsWith("/") ? base + stream : `${base}/${stream}`;
+  function open() {
+    const base = WS_MIRRORS[wsIndex % WS_MIRRORS.length];
+    const url = `${base}/${stream}`;
 
     try {
-      if (ws) try { ws.terminate(); } catch {}
+      if (ws) ws.terminate();
+    } catch {}
 
-      ws = new WebSocket(url);
+    ws = new WebSocket(url);
 
-      ws.on("open", () => {
-        socketAlive = true;
-        console.log("🔗 WebSocket Connected:", url);
-      });
+    ws.on("open", () => {
+      alive = true;
+      console.log("🔗 WS connected:", url);
+    });
 
-      ws.on("message", (data) => {
-        try {
-          const j = JSON.parse(data.toString());
-          if (j.c) lastPrice = parseFloat(j.c);
-        } catch {}
-      });
+    ws.on("message", (d) => {
+      try {
+        const j = JSON.parse(d.toString());
+        if (j.c) lastPrice = parseFloat(j.c);
+      } catch {}
+    });
 
-      ws.on("close", () => {
-        socketAlive = false;
-        mirrorIdx++;
-        setTimeout(connectNow, 3000);
-      });
+    ws.on("close", () => {
+      alive = false;
+      wsIndex++;
+      setTimeout(open, 2500);
+    });
 
-      ws.on("error", () => {
-        socketAlive = false;
-        mirrorIdx++;
-        try { ws.terminate(); } catch {}
-        setTimeout(connectNow, 3000);
-      });
-    } catch {
-      mirrorIdx++;
-      setTimeout(connectNow, 3000);
-    }
+    ws.on("error", () => {
+      alive = false;
+      wsIndex++;
+      try { ws.terminate(); } catch {}
+      setTimeout(open, 2500);
+    });
   }
 
-  connectNow();
+  open();
 }
 
 connectWS(CONFIG.SYMBOL);
 
 // =======================================================
-// MARKET DATA CONTEXT
+// DATA CONTEXT
 // =======================================================
 async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
-    const candles = m15.data || [];
-    const price = lastPrice || m15.price || 0;
-
-    return { price, candles, socketAlive };
+    return {
+      price: lastPrice || m15.price || 0,
+      candles: m15.data || [],
+      socketAlive: alive
+    };
   } catch {
-    return { price: lastPrice || 0, candles: [], socketAlive };
+    return { price: lastPrice, candles: [], socketAlive: alive };
   }
 }
 
 // =======================================================
-// AUTO 15m REPORT
+// AUTO REPORT (EVERY 15m SAFE)
 // =======================================================
-async function sendAutoReport() {
+async function autoReport() {
   try {
-    const report = await buildAIReport(CONFIG.SYMBOL);
-    await formatAIReport(report);
-
-    console.log(
-      "📤 Auto Report Sent:",
-      new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
-    );
+    const rpt = await buildAIReport(CONFIG.SYMBOL);
+    await formatAIReport(rpt);
+    console.log("📤 15m report sent");
   } catch (e) {
-    console.error("Auto report error:", e.message);
+    console.log("Auto report error:", e.message);
   }
 }
 
-setInterval(sendAutoReport, CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
-
-(async () => {
-  try { await sendAutoReport(); } catch {}
-})();
+setInterval(autoReport, 15 * 60 * 1000);
 
 // =======================================================
-// KEEP ALIVE (Render fix)
+// KEEP ALIVE — FIXED FOR RENDER
 // =======================================================
-const SELF_URL = CONFIG.SELF_PING_URL;
-if (SELF_URL) {
-  setInterval(async () => {
-    try {
-      await axios.get(SELF_URL);
-      console.log("💓 KeepAlive Ping");
-    } catch {}
-  }, 4 * 60 * 1000);
-}
+const SELF_URL = `${CONFIG.SELF_PING_URL}/ping`;
+
+setInterval(async () => {
+  try {
+    await axios.get(SELF_URL, { timeout: 4000 });
+    console.log("💓 KEEPALIVE SUCCESS");
+  } catch {
+    console.log("⚠️ KEEPALIVE FAIL");
+  }
+}, 240000);
 
 // =======================================================
-// REVERSAL WATCHER INTEGRATION (FINAL)
+// REVERSAL WATCHER
 // =======================================================
 try {
   startReversalWatcher(CONFIG.SYMBOL, {
-    bot,
-    chatId: CHAT_ID,
     pollIntervalMs: CONFIG.REVERSAL_WATCHER_POLL_MS || 15000,
-    lookback: CONFIG.REVERSAL_WATCHER_LOOKBACK || 60,
+    microLookback: CONFIG.REVERSAL_WATCHER_LOOKBACK || 60,
   });
-
-  console.log("🚀 Reversal Watcher ACTIVE");
+  console.log("⚡ Reversal watcher started");
 } catch (e) {
-  console.log("⚠️ Reversal Watcher failed:", e.message);
+  console.log("🚫 Reversal watcher error:", e.message);
 }
 
 // =======================================================
-// SHUTDOWN HANDLER
+// CLEAN SHUTDOWN
 // =======================================================
-async function shutdown() {
+function shutdown() {
   try {
     stopReversalWatcher();
     if (ws) ws.terminate();
-    process.exit(0);
-  } catch {
-    process.exit(1);
-  }
+  } catch {}
+  process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 export default {
-  sendAutoReport,
-  getDataContext
+  getDataContext,
+  autoReport
 };
