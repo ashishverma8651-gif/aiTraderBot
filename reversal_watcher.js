@@ -1,468 +1,292 @@
-// reversal_watcher.js — Reversal Watcher v2 (Standalone)
-// Part 1/3: imports, config, helpers, persistence
+// reversal_watcher.js
+// Standalone Reversal Watcher (memory-safe, ML+News confirm, Telegram alerts, feedback recorder)
+// Usage: node --expose-gc reversal_watcher.js
+// Recommended: fork this file from aiTraderBot.js (child_process.fork) so it runs in separate memory space.
 
-import fs from "fs";
-import path from "path";
+import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
-import { analyzeElliott } from "./elliott_module.js";
+import newsModule from "./news_social.js"; // provides fetchNewsBundle
 import {
   runMicroPrediction,
+  runMLPrediction,
   recordPrediction,
-  recordOutcome,
-  startMicroWatcher,
-  stopMicroWatcher,
-  calculateAccuracy
+  recordOutcome
 } from "./ml_module_v8_6.js";
-import newsModule from "./news_social.js";
-import TelegramBot from "node-telegram-bot-api";
 
-// ---------------------------
-// Basic config / storage
-// ---------------------------
-const SYMBOL = CONFIG.SYMBOL || "BTCUSDT";
-const INTERVAL = CONFIG.REVERSAL_WATCHER?.INTERVAL || "1m"; // micro watcher default
-const POLL_INTERVAL_MS = Number(CONFIG.REVERSAL_WATCHER?.POLL_MS || 15 * 1000); // poll every 15s
-const CONFIRM_CANDLES = Number(CONFIG.REVERSAL_WATCHER?.CONFIRM_CANDLES || 5); // confirm window
-const REVERSAL_SCORE_THRESHOLD = Number(CONFIG.REVERSAL_WATCHER?.SCORE_THRESHOLD || 0.65); // detection threshold (0..1)
-const NEWS_WEIGHT = Number(CONFIG.REVERSAL_WATCHER?.NEWS_WEIGHT ?? 0.2); // 0..1
-const ML_WEIGHT = Number(CONFIG.REVERSAL_WATCHER?.ML_WEIGHT ?? 0.35); // 0..1
-const ELL_WEIGHT = Number(CONFIG.REVERSAL_WATCHER?.ELL_WEIGHT ?? 0.25); // 0..1
-const IND_WEIGHT = Number(CONFIG.REVERSAL_WATCHER?.IND_WEIGHT ?? 0.2); // 0..1
+// ---------- Configuration (tweak via env or config.js) ----------
+const SYMBOL = process.env.SYMBOL || CONFIG.SYMBOL || "BTCUSDT";
+const INTERVAL = process.env.RW_INTERVAL || "1m";           // candles for pattern detection
+const POLL_MS = Number(process.env.RW_POLL_MS || 15_000);   // default 15s poll
+const LOOKBACK = Number(process.env.RW_LOOKBACK || 30);     // only fetch last N candles (keeps mem low)
+const MIN_VOL_CHANGE = Number(process.env.RW_MIN_VOL_CHANGE || 0.1); // optional filter
+const ML_CONFIRM_ONLY_IF_STRONG = true; // call ML only on strong signals
+const ML_CONF_THRESHOLD = Number(process.env.RW_ML_CONF_THRESHOLD || 0.6); // ml probability cutoff (0..1)
+const OUTCOME_CHECK_MIN = Number(process.env.RW_OUTCOME_MIN || 3); // minutes after signal to check outcome
+const TELEGRAM_BOT_TOKEN = CONFIG.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN || null;
+const TELEGRAM_CHAT = CONFIG.TELEGRAM?.CHAT_ID || process.env.CHAT_ID || null;
+const ENABLE_TELEGRAM = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT);
 
-const CACHE_DIR = path.resolve(process.cwd(), "cache");
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
-const STATE_FILE = path.join(CACHE_DIR, "reversal_watcher_state.json");
+// ---------- Setup Telegram (optional) ----------
+const bot = ENABLE_TELEGRAM ? new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false }) : null;
 
-// Telegram init (optional)
-const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
-const CHAT_ID = CONFIG?.TELEGRAM?.CHAT_ID || process.env.CHAT_ID;
-const bot = BOT_TOKEN ? new TelegramBot(BOT_TOKEN, { polling: false }) : null;
+// ---------- Internal state, small and bounded ----------
+let _timer = null;
+let _pendingSignals = new Map(); // id -> {time, symbol, direction, price, checkAt, predId}
+const MAX_PENDING = 200; // safety cap
 
-// internal timers
-let _watcherTimer = null;
-let _isRunning = false;
+// ---------- Helpers ----------
+const nowISO = () => new Date().toISOString();
+const nf = (v, d = 2) => (typeof v === "number" && Number.isFinite(v) ? v.toFixed(d) : "N/A");
 
-// outstanding alerts store (keeps alerts waiting for confirmation)
-let outstandingAlerts = safeJSONLoad(STATE_FILE, { alerts: [] }).alerts || [];
-
-// ---------------------------
-// helpers: safe json
-// ---------------------------
-function safeJSONLoad(fp, fallback = null) {
+async function safeFetchCandles(symbol = SYMBOL, interval = INTERVAL, limit = LOOKBACK) {
   try {
-    if (!fs.existsSync(fp)) return fallback;
-    const txt = fs.readFileSync(fp, "utf8");
-    return txt ? JSON.parse(txt) : fallback;
+    const resp = await fetchMarketData(symbol, interval, limit);
+    return resp?.data || [];
   } catch (e) {
-    console.warn("reversal_watcher: safeJSONLoad err", e?.message || e);
-    return fallback;
+    console.warn("reversal_watcher: fetchMarketData err", e?.message || e);
+    return [];
   }
 }
-function safeJSONSave(fp, data) {
+
+async function safeFetchPrice(symbol = SYMBOL) {
   try {
-    fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, JSON.stringify(data, null, 2));
+    const resp = await fetchMarketData(symbol, "1m", 1);
+    return resp?.price || (resp?.data?.at(-1)?.close ?? null);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function sendTelegram(text, opts = {}) {
+  if (!ENABLE_TELEGRAM || !bot) return false;
+  try {
+    await bot.sendMessage(TELEGRAM_CHAT, text, { parse_mode: "HTML", disable_web_page_preview: true, ...opts });
     return true;
   } catch (e) {
-    console.warn("reversal_watcher: safeJSONSave err", e?.message || e);
+    console.warn("reversal_watcher: telegram send failed", e?.message || e);
     return false;
   }
 }
-function persistState() {
-  try {
-    safeJSONSave(STATE_FILE, { alerts: outstandingAlerts.slice(-200) });
-  } catch (_) {}
-}
 
-// ---------------------------
-// time formatting (India)
-function nowIST() {
-  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-}
-function nowISO() { return new Date().toISOString(); }
+// tiny candlestick pattern checks (lightweight)
+function detectReversalPatterns(candles = []) {
+  // expects array of candles with {open,high,low,close,vol}
+  if (!Array.isArray(candles) || candles.length < 3) return { found: false };
 
-// ---------------------------
-// small numeric helpers
-const nf = (v, d = 2) => (typeof v === "number" && Number.isFinite(v)) ? v.toFixed(d) : "N/A";
+  const last = candles.at(-1);
+  const prev = candles.at(-2);
+  const prev2 = candles.at(-3);
 
-// ---------------------------
-// quick indicator heuristics (simple) - accepts candles array with {open,high,low,close,vol}
-function computeIndicatorSignal(candles) {
-  // returns -1..1 where negative = bearish reversal, positive = bullish reversal
-  try {
-    if (!Array.isArray(candles) || candles.length < 5) return 0;
-    const last = candles.at(-1);
-    const prev = candles.at(-2);
-    const closeChange = (last.close - prev.close) / Math.max(1, prev.close);
-    // momentum flip: if last candle reverses direction heavily
-    const momentum = Math.max(-1, Math.min(1, -closeChange * 10)); // flip sign so big down-> potential bullish
-    // volume spike
-    const avgVol = candles.slice(-10).reduce((a,c)=>a+(c.volume||c.v||0),0)/Math.max(1,Math.min(10,candles.length));
-    const volLast = last.volume || last.v || 0;
-    const volSpike = avgVol ? Math.max(-1, Math.min(1, (volLast - avgVol)/avgVol)) : 0;
-    // combine
-    const sig = (momentum * 0.6) + (volSpike * 0.4);
-    return Number(Math.max(-1, Math.min(1, sig)).toFixed(3));
-  } catch (e) {
-    return 0;
+  const body = Math.abs(last.close - last.open);
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  const upperWick = last.high - Math.max(last.open, last.close);
+
+  const prevBody = Math.abs(prev.close - prev.open);
+  const prev2Body = Math.abs(prev2.close - prev2.open);
+
+  // hammer (bullish) heuristic
+  const isHammer = lowerWick > body * 1.8 && upperWick < body * 0.6 && last.close > last.open;
+  // shooting star (bearish)
+  const isShooting = upperWick > body * 1.8 && lowerWick < body * 0.6 && last.close < last.open;
+  // bullish engulfing
+  const isBullEngulfing =
+    last.close > last.open && prev.close < prev.open && last.open < prev.close && last.close > prev.open;
+  // bearish engulfing
+  const isBearEngulfing =
+    last.close < last.open && prev.close > prev.open && last.open > prev.close && last.close < prev.open;
+
+  let direction = null;
+  let strength = 0;
+
+  if (isHammer || isBullEngulfing) {
+    direction = "long";
+    strength = 70 + (isBullEngulfing ? 15 : 0);
   }
-}
-
-// Part 2/3: Core detection loop, scoring, ML + news integration, alert send
-
-// ---------------------------
-// compute Elliott summary quick
-async function computeElliottSignal(candles) {
-  try {
-    const res = await analyzeElliott(candles);
-    if (!res || !res.ok) return { score: 0, text: null, details: null };
-    // use res.sentiment (if present) normalized -1..1; else attempt pattern-based
-    const sent = typeof res.sentiment === "number" ? Number(res.sentiment) : 0;
-    // additional confidence factor
-    const conf = Math.min(1, (res.confidence ?? res.conf ?? 0) / 100);
-    const score = sent * conf; // -1..1
-    return { score: Number(Number(score).toFixed(3)), text: res.patterns?.join?.(",") || null, details: res };
-  } catch (e) {
-    return { score: 0, text: null, details: null };
+  if (isShooting || isBearEngulfing) {
+    direction = "short";
+    strength = 70 + (isBearEngulfing ? 15 : 0);
   }
+
+  // additional volume check (if available)
+  const vol = last.volume ?? last.vol ?? last.v ?? 0;
+  const avgVol = candles.slice(-10).reduce((a, c) => a + (c.volume ?? c.vol ?? c.v ?? 0), 0) / Math.max(1, Math.min(10, candles.length));
+  const volBoost = avgVol ? Math.min(1.2, Math.max(0, vol / avgVol)) : 1;
+  strength = Math.round(Math.min(100, strength * volBoost));
+
+  return { found: Boolean(direction), direction, strength, vol, avgVol };
 }
 
-// ---------------------------
-// compute news sentiment (0..1)
-async function computeNewsSentiment(symbol) {
+// schedule an outcome check for a signal
+async function scheduleOutcomeCheck(signalObj) {
   try {
-    if (!newsModule || typeof newsModule.fetchNewsBundle !== "function") return 0.5;
-    const news = await newsModule.fetchNewsBundle(symbol);
-    if (!news || !news.ok) return 0.5;
-    // news.sentiment is 0..1
-    return Number(news.sentiment || 0.5);
-  } catch (e) {
-    return 0.5;
-  }
-}
+    const id = `rw_${Date.now()}_${Math.floor(Math.random() * 9999)}`;
+    const checkAt = Date.now() + OUTCOME_CHECK_MIN * 60 * 1000;
 
-// ---------------------------
-// compute ml micro prediction (prob 0..100)
-async function computeMLPrediction(symbol) {
-  try {
-    const res = await runMicroPrediction(symbol, INTERVAL, CONFIG.ML?.MICRO_LOOKBACK || 100);
-    if (!res || res.error) return { prob: 50, label: "Neutral", details: res };
-    return { prob: Number(res.prob || 50), label: res.label || "Neutral", details: res };
-  } catch (e) {
-    return { prob: 50, label: "Neutral", details: null };
-  }
-}
-
-// ---------------------------
-// compute final reversal score (0..1) for either 'bull' or 'bear'
-// direction: "bull" (expect bullish reversal) or "bear"
-async function computeReversalScore(direction, symbol = SYMBOL) {
-  // fetch recent candles (we'll use 15 candles min)
-  const resp = await fetchMarketData(symbol, INTERVAL, 30);
-  const candles = resp?.data || [];
-  if (!Array.isArray(candles) || candles.length < 3) return { score: 0, breakdown: {} };
-
-  // indicators signal (-1..1)
-  const indSig = computeIndicatorSignal(candles); // positive means bullish reversal potential
-  const indForDir = direction === "bull" ? Math.max(0, indSig) : Math.max(0, -indSig); // 0..1
-
-  // elliot
-  const ell = await computeElliottSignal(candles);
-  const ellForDir = direction === "bull" ? Math.max(0, ell.score) : Math.max(0, -ell.score); // 0..1
-
-  // ml
-  const ml = await computeMLPrediction(symbol);
-  // convert ml.prob (0..100) to -1..1 bias (above 55 bullish, below 45 bearish)
-  let mlBiasRaw = 0;
-  if (ml.prob >= 55) mlBiasRaw = (ml.prob - 50) / 50; // 0.1..1
-  else if (ml.prob <= 45) mlBiasRaw = (ml.prob - 50) / 50; // -1..-0.1
-  // ml direction factor
-  const mlForDir = direction === "bull" ? Math.max(0, mlBiasRaw) : Math.max(0, -mlBiasRaw); // 0..1
-
-  // news
-  const newsSent = await computeNewsSentiment(symbol); // 0..1
-  // map to direction: if newsSent > 0.55 -> bullish, <0.45 -> bearish
-  const newsForDir = direction === "bull" ? Math.max(0, (newsSent - 0.5) * 2) : Math.max(0, (0.5 - newsSent) * 2); // 0..1
-
-  // combine with weights
-  const wInd = IND_WEIGHT, wEll = ELL_WEIGHT, wML = ML_WEIGHT, wNews = NEWS_WEIGHT;
-  const raw = (indForDir * wInd) + (ellForDir * wEll) + (mlForDir * wML) + (newsForDir * wNews);
-  const totalW = wInd + wEll + wML + wNews || 1;
-  const norm = Math.max(0, Math.min(1, raw / totalW)); // 0..1
-
-  const breakdown = {
-    ind: Number(indForDir.toFixed(3)),
-    ell: Number(ellForDir.toFixed(3)),
-    ml: Number(mlForDir.toFixed(3)),
-    news: Number(newsForDir.toFixed(3)),
-    weights: { ind: wInd, ell: wEll, ml: wML, news: wNews }
-  };
-
-  return { score: Number(norm.toFixed(3)), breakdown, ml, ell, newsSent, candles };
-}
-
-// ---------------------------
-// Compose alert payload & send telegram
-async function sendAlert(alert) {
-  try {
-    const { direction, symbol, score, breakdown, price, id, ml, ell, newsSent } = alert;
-    const when = nowIST();
-    const title = `${symbol} — Reversal Watcher Alert`;
-    const text = `
-⏰ ${when}
-⚠️ <b>${direction.toUpperCase()} REVERSAL</b> detected for <b>${symbol}</b>
-Score: <b>${nf(score * 100,1)}%</b> (threshold ${nf(REVERSAL_SCORE_THRESHOLD*100,1)}%)
-Price: <b>${nf(price)}</b>
-
-Breakdown:
-• Indicators: ${breakdown.ind}
-• Elliott: ${breakdown.ell} (${ell?.text || "—"})
-• ML: ${breakdown.ml} (label: ${ml?.label || "N/A"}, prob: ${ml?.prob || "N/A"}%)
-• News: ${nf(newsSent,3)}
-
-Action ID: <code>${id}</code>
-Confirm window: ${CONFIRM_CANDLES} candles (interval ${INTERVAL})
-`.trim();
-
-    // send to telegram if configured; also console.log
-    console.log("Reversal Alert:", title, `Score=${score}`, breakdown);
-    if (bot && CHAT_ID) {
-      try {
-        await bot.sendMessage(CHAT_ID, text, { parse_mode: "HTML", disable_web_page_preview: true });
-      } catch (e) { console.warn("reversal_watcher: telegram send failed", e?.message || e); }
+    // record small pending entry
+    _pendingSignals.set(id, { ...signalObj, id, checkAt });
+    // cap map size
+    if (_pendingSignals.size > MAX_PENDING) {
+      // remove oldest
+      const firstKey = _pendingSignals.keys().next().value;
+      _pendingSignals.delete(firstKey);
     }
-  } catch (e) {
-    console.warn("reversal_watcher.sendAlert err", e?.message || e);
-  }
-}
 
-// ---------------------------
-// create alert object and persist
-function createAlertObject({ direction, symbol, score, breakdown, ml, ell, newsSent, candles }) {
-  const id = `rev_${Date.now()}_${Math.floor(Math.random()*9999)}`;
-  const price = candles?.at(-1)?.close ?? null;
-  const alert = {
-    id,
-    symbol,
-    direction, // 'bull' or 'bear'
-    score,
-    breakdown,
-    ml,
-    ell,
-    newsSent,
-    price,
-    createdAt: nowISO(),
-    createdAtIST: nowIST(),
-    confirmCandles: CONFIRM_CANDLES,
-    checked: false // will be set true after confirmation
-  };
-  outstandingAlerts.push(alert);
-  persistState();
-  return alert;
-}
-
-// ---------------------------
-// check outstanding alerts after confirm window
-async function confirmAlerts() {
-  try {
-    const nowAlerts = outstandingAlerts.filter(a=>!a.checked);
-    if (!nowAlerts.length) return;
-    // for each, sample candles from created time to now to see if reversal realized
-    for (const a of nowAlerts) {
+    // schedule setTimeout (non-blocking; will be short-lived)
+    setTimeout(async () => {
       try {
-        // fetch candles since alert creation: we'll fetch (confirmCandles + 2) candles to be safe
-        const resp = await fetchMarketData(a.symbol, INTERVAL, a.confirmCandles + 4);
-        const candles = resp?.data || [];
-        if (candles.length < a.confirmCandles + 1) {
-          // not enough candles yet — skip
-          continue;
+        const entry = _pendingSignals.get(id);
+        if (!entry) return;
+        // fetch current price
+        const nowPrice = await safeFetchPrice(entry.symbol);
+        const realizedReturn = nowPrice && entry.price ? (nowPrice - entry.price) / Math.max(1, entry.price) : null;
+        // decide correctness: for long, realizedReturn > 0 ; for short, < 0
+        const correct = entry.direction === "long" ? (realizedReturn > 0) : (realizedReturn < 0);
+        // if prediction id exists, record outcome in ML feedback
+        if (entry.predId) {
+          try { recordOutcome(entry.predId, { correct, realizedReturn, realizedPrice: nowPrice, note: "auto-feedback from reversal_watcher" }); } catch (e) {}
         }
-        // evaluate outcome:
-        // for bullish reversal: price after confirm window must be >= alert.price * (1 + minMove)
-        // for bearish reversal: price after confirm window must be <= alert.price * (1 - minMove)
-        // minMove is relative threshold; small moves may be noise. default 0.002 (0.2%)
-        const minMove = Number(CONFIG.REVERSAL_WATCHER?.MIN_MOVE ?? 0.002);
-        const idx = candles.length - 1; // latest
-        const confirmIndex = Math.max(0, candles.length - 1 - (a.confirmCandles - 1)); // candle at or just after window
-        const confirmPrice = candles[confirmIndex]?.close ?? candles[idx]?.close;
-        const realized = (a.direction === "bull")
-          ? (confirmPrice >= (a.price * (1 + minMove)))
-          : (confirmPrice <= (a.price * (1 - minMove)));
-
-        // mark checked and record outcome
-        a.checked = true;
-        a.confirmedAt = nowISO();
-        a.confirmedAtIST = nowIST();
-        a.confirmPrice = confirmPrice;
-        a.realized = !!realized;
-        a.realizedReturn = a.realized ? ((confirmPrice - a.price) / a.price) * (a.direction === "bull" ? 1 : -1) : 0;
-
-        // record outcome into ML feedback store if we have prediction id (we store recordPrediction id at alert.recordId)
-        if (a.recordId) {
-          try {
-            recordOutcome(a.recordId, {
-              correct: !!realized,
-              realizedReturn: Number(a.realizedReturn || 0),
-              realizedPrice: Number(confirmPrice || 0),
-              note: `ReversalWatcher confirm (${a.direction})`
-            });
-          } catch (e) { console.warn("reversal_watcher: recordOutcome failed", e?.message || e); }
-        }
-
-        // send Telegram summary
-        const summary = `
-✅ Reversal Confirmed? <b>${a.realized ? "YES" : "NO"}</b>
-ID: <code>${a.id}</code>
-Symbol: ${a.symbol}
-Direction: <b>${a.direction}</b>
-Alert Price: ${nf(a.price)}
-Confirm Price: ${nf(confirmPrice)}
-Realized Return (signed): ${nf(a.realizedReturn*100,2)}%
-`;
-        if (bot && CHAT_ID) {
-          try { await bot.sendMessage(CHAT_ID, summary, { parse_mode: "HTML" }); } catch (_){}
-        }
+        // send telegram feedback summary
+        const msg = `<b>Reversal Outcome</b>\nSymbol: ${entry.symbol}\nSignal: ${entry.direction}\nSignal Price: ${nf(entry.price)}\nNow: ${nf(nowPrice)}\nReturn: ${realizedReturn === null ? "N/A" : ( (realizedReturn*100).toFixed(2) + "%" )}\nCorrect: ${correct ? "YES ✅" : "NO ❌"}\nDetectedAt: ${entry.detectedAt}`;
+        await sendTelegram(msg);
       } catch (e) {
-        console.warn("reversal_watcher.confirmAlerts err for", a.id, e?.message || e);
+        console.warn("reversal_watcher: outcome check err", e?.message || e);
+      } finally {
+        // free memory
+        _pendingSignals.delete(id);
+        global.gc && global.gc();
       }
-    }
-    persistState();
+    }, Math.max(10_000, OUTCOME_CHECK_MIN * 60 * 1000));
+
+    return id;
   } catch (e) {
-    console.warn("reversal_watcher.confirmAlerts err", e?.message || e);
+    console.warn("reversal_watcher: scheduleOutcomeCheck err", e?.message || e);
+    return null;
   }
 }
 
-// Part 3/3: main loop, start/stop, API functions, exports
-
-// ---------------------------
-// main tick: compute both bull + bear scores and create alerts
-async function watcherTick() {
+// main detection loop (keeps memory low)
+async function pollOnce() {
   try {
-    // compute bull and bear
-    const bull = await computeReversalScore("bull", SYMBOL);
-    const bear = await computeReversalScore("bear", SYMBOL);
+    const candles = await safeFetchCandles(SYMBOL, INTERVAL, LOOKBACK);
+    if (!candles || !candles.length) return;
 
-    // choose stronger side
-    const bestDir = (bull.score >= bear.score) ? { direction: "bull", data: bull } : { direction: "bear", data: bear };
-    const bestScore = bestDir.data.score;
+    const lastC = candles.at(-1);
+    const detect = detectReversalPatterns(candles);
 
-    // fetch last price for alert payload
-    const priceResp = await fetchMarketData(SYMBOL, INTERVAL, 3);
-    const lastPrice = priceResp?.data?.at(-1)?.close ?? priceResp?.price ?? null;
-
-    // if exceeds threshold, create alert
-    if (bestScore >= REVERSAL_SCORE_THRESHOLD) {
-      // create alert object
-      const alert = createAlertObject({
-        direction: bestDir.direction,
-        symbol: SYMBOL,
-        score: bestScore,
-        breakdown: bestDir.data.breakdown,
-        ml: bestDir.data.ml,
-        ell: bestDir.data.ell,
-        newsSent: bestDir.data.newsSent,
-        candles: bestDir.data.candles
-      });
-
-      // store recordPrediction id if possible: we will call recordPrediction to tie alert with ML record
-      try {
-        const recId = await recordPrediction({
-          symbol: SYMBOL,
-          predictedAt: nowISO(),
-          label: (bestDir.direction === "bull" ? "ReversalBull" : "ReversalBear"),
-          prob: Math.round(bestScore*100),
-          features: { breakdown: bestDir.data.breakdown, ml: bestDir.data.ml?.prob },
-          meta: { source: "reversal_watcher", interval: INTERVAL }
-        });
-        if (recId) alert.recordId = recId;
-      } catch (e) {
-        console.warn("reversal_watcher: recordPrediction failed", e?.message || e);
-      }
-
-      // send alert immediately
-      await sendAlert(alert);
-      persistState();
+    // small heuristic filter: require some movement
+    if (!detect.found || detect.strength < 60) {
+      // nothing strong found — lightweight ML micro could still run for micro signals if configured.
+      // free references
+      global.gc && global.gc();
+      return;
     }
 
-    // attempt to confirm outstanding alerts (some may not have reached confirm window)
-    await confirmAlerts();
+    // optional news check (light)
+    let newsBundle = null;
+    try { newsBundle = (typeof newsModule.fetchNewsBundle === "function") ? await newsModule.fetchNewsBundle(SYMBOL) : null; } catch (e) { newsBundle = null; }
 
-  } catch (e) {
-    console.warn("reversal_watcher.tick err", e?.message || e);
-  }
-}
+    // build signal summary
+    const signal = {
+      symbol: SYMBOL,
+      interval: INTERVAL,
+      direction: detect.direction,
+      strength: detect.strength,
+      price: Number(lastC.close ?? lastC.c ?? lastC.closePrice ?? 0),
+      vol: detect.vol,
+      avgVol: detect.avgVol,
+      detectedAt: nowISO(),
+      news: newsBundle ? { sentiment: newsBundle.sentiment, impact: newsBundle.impact } : null
+    };
 
-// ---------------------------
-// start/stop functions
-export function startReversalWatcher({ symbol = SYMBOL, intervalMs = POLL_INTERVAL_MS } = {}) {
-  if (_isRunning) return false;
-  _isRunning = true;
-  // optionally start micro-watcher in ML module so its internal micro predictions keep fresh
-  try { startMicroWatcher([symbol], Number(CONFIG.ML?.MICRO_WATCHER_INTERVAL_SECONDS || 30)); } catch (_) {}
-
-  // initial tick immediately
-  (async()=>{ try { await watcherTick(); } catch(_){} })();
-
-  _watcherTimer = setInterval(async () => {
+    // ML confirmation (light): call micro prediction first
+    let mlDecision = null;
     try {
-      await watcherTick();
-    } catch (e) { console.warn("reversal_watcher.interval err", e?.message || e); }
-  }, Math.max(5, Number(intervalMs || POLL_INTERVAL_MS)));
+      // only call ML when signal strong OR news supports it
+      const newsOk = signal.news && (signal.news.sentiment > 0.6 || signal.news.sentiment < 0.4);
+      if (!ML_CONFIRM_ONLY_IF_STRONG || detect.strength >= 80 || newsOk) {
+        const micro = await runMicroPrediction(SYMBOL, "1m", Math.min(100, LOOKBACK));
+        if (micro && !micro.error) {
+          mlDecision = { label: micro.label, prob: (micro.prob || micro.probability || 50) / 100, features: micro.features };
+        }
+      }
+    } catch (e) {
+      mlDecision = null;
+    }
 
-  console.log(`✅ Reversal Watcher started for ${symbol} (poll ${intervalMs}ms)`);
+    // quick decision logic: require either ML bullishity for 'long' or neutral (user can tune)
+    let pass = true;
+    if (mlDecision) {
+      const p = mlDecision.prob ?? 0.5;
+      if (signal.direction === "long" && p < ML_CONF_THRESHOLD) pass = false;
+      if (signal.direction === "short" && p > (1 - ML_CONF_THRESHOLD)) pass = false;
+    }
 
-  return true;
-}
+    if (!pass) {
+      // not confirmed by ML => skip
+      global.gc && global.gc();
+      return;
+    }
 
-export function stopReversalWatcher() {
-  if (_watcherTimer) {
-    clearInterval(_watcherTimer);
-    _watcherTimer = null;
+    // record prediction into ML store (light)
+    let predId = null;
+    try {
+      const rec = await recordPrediction({ symbol: SYMBOL, predictedAt: nowISO(), label: signal.direction === "long" ? "Bullish" : "Bearish", prob: mlDecision?.prob ? Math.round(mlDecision.prob*10000)/100 : detect.strength, features: mlDecision?.features || [], meta: { source: "reversal_watcher", interval: INTERVAL }});
+      predId = rec || null;
+    } catch (e) {
+      predId = null;
+    }
+
+    // schedule outcome check and keep id
+    const schedId = await scheduleOutcomeCheck({ ...signal, predId });
+
+    // prepare telegram message
+    const newsTxt = signal.news ? `NewsSentiment: ${signal.news.sentiment} | Impact: ${signal.news.impact}\n` : "";
+    const mlTxt = mlDecision ? `ML: ${mlDecision.label} (${Math.round((mlDecision.prob||0)*100)}%)\n` : "";
+    const msg = `<b>Reversal Watcher</b>\n${SYMBOL} | ${INTERVAL}\nSignal: <b>${signal.direction.toUpperCase()}</b> (${signal.strength}%)\nPrice: <b>${nf(signal.price)}</b>\nVol: ${Math.round(signal.vol || 0)} (avg ${Math.round(signal.avgVol||0)})\n${newsTxt}${mlTxt}Scheduled outcome check in ${OUTCOME_CHECK_MIN} min.\nDetectedAt: ${signal.detectedAt}`;
+
+    // send telegram alert
+    await sendTelegram(msg);
+
+    // housekeeping
+    global.gc && global.gc();
+
+    console.log("ReversalWatcher: signal ->", signal.direction, "price", signal.price, "strength", signal.strength, "predId", predId, "schedId", schedId, nowISO());
+    // free local heavy references
+    // (candles remains referenced by function only; allow GC)
+  } catch (e) {
+    console.warn("reversal_watcher: pollOnce err", e?.message || e);
   }
-  _isRunning = false;
-  try { stopMicroWatcher(); } catch (_) {}
-  console.log("🛑 Reversal Watcher stopped");
+}
+
+// public start/stop
+export function startWatcher({ pollMs = POLL_MS, immediate = true } = {}) {
+  if (_timer) return false;
+  console.log(`✅ Reversal Watcher started for ${SYMBOL} (poll ${pollMs}ms, lookback ${LOOKBACK})`);
+  if (immediate) pollOnce().catch(()=>{});
+  _timer = setInterval(() => { pollOnce().catch(()=>{}); }, Math.max(5_000, pollMs));
   return true;
 }
 
-// ---------------------------
-// utilities
-export function listOutstandingAlerts() {
-  return outstandingAlerts.slice().reverse();
-}
-
-export function clearOutstandingAlerts() {
-  outstandingAlerts = [];
-  persistState();
+export function stopWatcher() {
+  if (_timer) {
+    clearInterval(_timer);
+    _timer = null;
+    console.log("🛑 Reversal Watcher stopped");
+  }
   return true;
 }
 
-// ---------------------------
-// quick health
-export function getWatcherStatus() {
-  return {
-    running: _isRunning,
-    symbol: SYMBOL,
-    interval: INTERVAL,
-    pollMs: POLL_INTERVAL_MS,
-    outstanding: outstandingAlerts.length,
-    lastUpdated: nowISO()
-  };
+// If run directly, start automatically
+if (process.argv[1] && process.argv[1].endsWith("reversal_watcher.js")) {
+  (async () => {
+    startWatcher();
+    // log a small heartbeat to help debugging
+    setInterval(() => {
+      console.log("ReversalWatcher heartbeat", nowISO());
+    }, 60_000);
+  })();
 }
 
-// ---------------------------
-// auto-start if configured
-if (CONFIG.REVERSAL_WATCHER?.AUTO_START === true) {
-  try { startReversalWatcher({ symbol: CONFIG.SYMBOL, intervalMs: POLL_INTERVAL_MS }); } catch (_) {}
-}
-
-// ---------------------------
-// default export
-export default {
-  startReversalWatcher,
-  stopReversalWatcher,
-  getWatcherStatus,
-  listOutstandingAlerts,
-  clearOutstandingAlerts
-};
+// export default
+export default { startWatcher, stopWatcher };
