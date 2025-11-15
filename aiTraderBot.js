@@ -48,11 +48,11 @@ async function sendTelegram(text) {
     const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`;
 
     await axios.post(url, {
-      chat_id: CONFIG.TELEGRAM.CHAT_ID,
-      text,
-      parse_mode: "Markdown",
-      disable_web_page_preview: true
-    });
+  chat_id: CONFIG.TELEGRAM.CHAT_ID,
+  text,
+  parse_mode: "HTML",
+  disable_web_page_preview: true
+});
 
   } catch (e) {
     const code = e?.response?.status;
