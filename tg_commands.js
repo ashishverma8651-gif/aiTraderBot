@@ -551,25 +551,6 @@ Accuracy: ${report.mlAcc}%
 <i>AI Engine v3.0 — Elliott + Fusion + ML v8.6 + News AI v3 (Adaptive)</i>
 `.trim();
 
-    // Telegram Send
-    if (bot && CHAT_ID) {
-      try {
-        await bot.sendMessage(CHAT_ID, html, {
-          parse_mode: "HTML",
-          disable_web_page_preview: true,
-        });
-      } catch (e) {
-        console.error("Telegram send failed:", e.message);
-      }
-    }
-
-    return html;
-  } catch (e) {
-    const err = `formatAIReport error: ${e.message}`;
-    console.error(err);
-    if (bot && CHAT_ID) try { await bot.sendMessage(CHAT_ID, err); } catch {}
-    return err;
-  }
-}
+    
 
 export default { buildAIReport, formatAIReport };
