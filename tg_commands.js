@@ -20,7 +20,7 @@ import {
 import newsModule from "./news_social.js";
 
 // ==========================
-// Telegram Init
+// Telegram Init (kept for external use but NOT used to auto-send here)
 // ==========================
 const BOT_TOKEN = CONFIG?.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
 const CHAT_ID = CONFIG?.TELEGRAM?.CHAT_ID || process.env.CHAT_ID;
@@ -388,7 +388,7 @@ export async function formatAIReport(report) {
   try {
     if (!report || !report.ok) {
       const txt = `Error building report: ${report?.error || "unknown"}`;
-      if (bot && CHAT_ID) try { await bot.sendMessage(CHAT_ID, txt); } catch {}
+      // Do NOT auto-send error via Telegram here — return string so caller controls sends.
       return txt;
     }
 
@@ -551,18 +551,15 @@ Accuracy: ${report.mlAcc}%
 <i>AI Engine v3.0 — Elliott + Fusion + ML v8.6 + News AI v3 (Adaptive)</i>
 `.trim();
 
-  
+    // IMPORTANT: do NOT send to Telegram from here.
+    // Return formatted html so caller (aiTraderBot.js) controls sending (avoids duplicates).
+    return html;
 
-// return html;
-} catch (e) {
+  } catch (e) {
     const err = `formatAIReport error: ${e.message}`;
     console.error(err);
     return err;
-}
+  }
 }
 
 export default { buildAIReport, formatAIReport };
-
-
-  
-
