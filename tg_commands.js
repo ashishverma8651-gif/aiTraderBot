@@ -176,7 +176,7 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     const tfs = ["1m","5m","15m","30m","1h"];
     const mtfRaw = await fetchMultiTF(symbol, tfs);
     const mtf = [];
-// per-TF analysis
+    // per-TF analysis
     for (const tf of tfs) {
       const entry = mtfRaw[tf] || { data: [], price: 0 };
       const candles = entry.data || [];
@@ -251,28 +251,22 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       (m.targets || []).map(t => ({ ...t, tf: m.tf }))
     );
 
+    // --- ML Prediction (15m) ---
+    let ml = null;
+    try {
+      ml = await runMLPrediction(symbol, "15m");
+    } catch (e) {
+      ml = { error: (e && e.message) ? e.message : "ml_error" };
+    }
 
-// --- ML Prediction (15m) ---
-let ml = null;
-try {
-    ml = await runMLPrediction(symbol, "15m");
-} catch (e) {
-    ml = { error: e.message || "ml_error" };
-}
-
-// --- ML Accuracy ---
-let mlAcc = 0;
-try {
-    const acc = calculateAccuracy();
-    mlAcc = acc?.accuracy ?? 0;
-} catch (e) {
-    mlAcc = 0;
-}
-
-// attach into report
-report.ml = ml;
-report.mlAcc = mlAcc;
-
+    // --- ML Accuracy ---
+    let mlAcc = 0;
+    try {
+      const acc = calculateAccuracy();
+      mlAcc = acc?.accuracy ?? 0;
+    } catch (e) {
+      mlAcc = 0;
+    }
 
     // Dedupe
     const uniqMap = new Map();
@@ -342,6 +336,8 @@ report.mlAcc = mlAcc;
       annotatedTargets,
       longs,
       shorts,
+      ml,       // include ml prediction object
+      mlAcc,    // include ml accuracy %
       generatedAt: new Date().toISOString()
     };
 
@@ -441,7 +437,7 @@ export async function formatAIReport(report) {
     // Compose HTML message
     const html = `
 🚀 <b>${report.symbol} — AI Trader (Option-B, merged)</b>
-${new Date(report.generatedAt || report.generatedAt || Date.now()).toLocaleString()}
+${new Date(report.generatedAt || Date.now()).toLocaleString()}
 Source: Multi (Binance Vision + Backups)
 Price: <b>${nf(price,2)}</b>
 
@@ -469,10 +465,9 @@ SL (long): ${slLong}
 ${topShortsTxt}
 SL (short): ${slShort}
 
-📐 Fib Zone (15m): ${ (tf15?.fib) ? `${nf(tf15.fib.lo,2)} - ${nf(tf15.fib.hi,2)}` : "N/A" }
+📐 Fib Zone (15m): ${ (tf15?.fib) ? `${nf(tf15.fib?.lo,2)} - ${nf(tf15.fib?.hi,2)}` : "N/A" }
 
-//📰 News Impact: Placeholder (hook your news module)
-
+\n//📰 News Impact: Placeholder (hook your news module)\n\n
 
 🤖 <b>ML Prediction</b>
 Label: <b>${report.ml?.label || "N/A"}</b>
@@ -507,5 +502,4 @@ ML Note: ${report.ml?.error ? report.ml.error : "OK"}
 }
 
 // final exports (keep named + default for compatibility)
-
 export default { buildAIReport, formatAIReport };
