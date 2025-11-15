@@ -1,5 +1,5 @@
-// aiTraderBot.js — Patched single-instance runner (lightweight + safe + HTML reports)
-// Assumes: ./config.js, ./utils.js, ./tg_commands.js, ./ml_module_v8_6.js, ./reversal_watcher.js exist
+// aiTraderBot.js — FINAL PATCHED (single-instance, sanitized Telegram send, WS throttled/backoff)
+
 import fs from "fs";
 import path from "path";
 import express from "express";
@@ -9,84 +9,118 @@ import axios from "axios";
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
+
 import ml from "./ml_module_v8_6.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
-// ---------------------------
-// GLOBAL SINGLE-INSTANCE GUARD
-// ---------------------------
-if (global.__aiTrader_running) {
-  console.log("⚠️ aiTrader already running — exiting duplicate instance.");
+// -----------------------------
+// SINGLE-INSTANCE GUARD (global + lockfile)
+// -----------------------------
+const LOCK_FILE = path.resolve(process.cwd(), ".aitraderbot.lock");
+
+function alreadyRunning() {
+  // global guard (Render restarts same process sometimes)
+  if (global.__aiTrader_running) return true;
+  // lockfile guard (multi-process)
+  try {
+    if (!fs.existsSync(LOCK_FILE)) return false;
+    const pidText = fs.readFileSync(LOCK_FILE, "utf8").trim();
+    if (!pidText) return true;
+    const pid = Number(pidText);
+    if (!Number.isFinite(pid) || pid <= 0) return true;
+    try {
+      process.kill(pid, 0);
+      return true; // alive
+    } catch (e) {
+      return false; // stale
+    }
+  } catch (e) {
+    return true;
+  }
+}
+
+if (alreadyRunning()) {
+  console.log("⚠️ aiTraderBot: another instance detected — exiting.");
   process.exit(0);
+}
+
+// create lock file
+try {
+  fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: "w" });
+} catch (e) {
+  console.warn("⚠️ Could not write lock file:", e?.message || e);
 }
 global.__aiTrader_running = true;
 
-// optional file lock to help debugging across restarts
-const LOCK_FILE = path.resolve(process.cwd(), ".aitrader.lock");
-try {
-  fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: "w" });
-} catch (_) {}
-
-// ensure lock cleanup on exit
-function cleanupAndExit(code = 0) {
-  try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch (_) {}
+// cleanup on exit
+function cleanExit(code = 0) {
+  try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch {}
+  try { global.__aiTrader_running = false; } catch {}
   process.exit(code);
 }
-process.on("SIGINT", () => cleanupAndExit(0));
-process.on("SIGTERM", () => cleanupAndExit(0));
+process.on("SIGINT", () => cleanExit(0));
+process.on("SIGTERM", () => cleanExit(0));
 process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err?.stack || err);
-  cleanupAndExit(1);
+  console.error("Uncaught Exception:", err && err.stack ? err.stack : err);
+  cleanExit(1);
 });
 process.on("unhandledRejection", (r) => {
   console.warn("Unhandled Rejection:", r);
 });
 
-// ---------------------------
-// EXPRESS (Render keep-alive endpoint)
-// ---------------------------
+// -----------------------------
+// EXPRESS server (keepalive ping endpoint)
+// -----------------------------
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
-app.get("/", (_, res) => res.send("✅ AI Trader Running"));
+app.get("/", (_, res) => res.send("✅ AI Trader is running"));
 app.get("/ping", (_, res) => res.send("pong"));
 
 app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
 
-// ---------------------------
-// TELEGRAM SENDER (HTML mode)
-// ---------------------------
-async function sendTelegramHTML(htmlText) {
+// -----------------------------
+// TELEGRAM SENDER (sanitizes separators; sends HTML so tags render)
+// -----------------------------
+async function sendTelegram(text) {
   try {
-    const token = CONFIG.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN;
-    const chatId = CONFIG.TELEGRAM?.CHAT_ID || process.env.CHAT_ID;
-    if (!token || !chatId) {
-      console.warn("⚠️ Telegram not configured (BOT_TOKEN/CHAT_ID). Skipping send.");
-      return { ok: false, reason: "not_configured" };
+    if (!CONFIG.TELEGRAM?.BOT_TOKEN || !CONFIG.TELEGRAM?.CHAT_ID) {
+      console.warn("⚠️ Telegram not configured (BOT_TOKEN/CHAT_ID missing)");
+      return { ok: false, msg: "telegram_not_configured" };
     }
 
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    const payload = {
-      chat_id: chatId,
-      text: htmlText,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    };
+    // sanitize: remove long separator lines and reduce repeated separators to a blank line
+    let payloadText = String(text || "");
+    // Replace Unicode long lines like ▬ or ─ with double newlines
+    payloadText = payloadText.replace(/(─|━|▬|—){3,}/g, "\n\n");
+    // Replace sequences of hyphens or equal signs
+    payloadText = payloadText.replace(/[-=]{3,}/g, "\n\n");
+    // Trim extra spaces
+    payloadText = payloadText.trim();
 
-    const resp = await axios.post(url, payload, { timeout: 8000 });
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`;
+
+    const resp = await axios.post(url, {
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
+      text: payloadText,
+      parse_mode: "HTML", // keep HTML so tg_commands' <b>/<i> render correctly
+      disable_web_page_preview: true
+    }, { timeout: 10000 });
+
     if (resp?.data?.ok) return { ok: true };
-    return { ok: false, reason: resp?.data || "unknown" };
+    return { ok: false, msg: resp?.data || "unknown" };
+
   } catch (e) {
     const code = e?.response?.status;
-    if (code) console.warn("Telegram HTTP error:", code);
+    if (code) console.warn("Telegram error:", code, e?.response?.data || "");
     else console.warn("Telegram error:", e?.message || e);
-    return { ok: false, reason: e?.message || String(e) };
+    return { ok: false, msg: e?.message || String(e) };
   }
 }
 
-// ---------------------------
-// WEBSOCKET — stable + throttled updates
-// ---------------------------
+// -----------------------------
+// WEBSOCKET (single stable connection, backoff, throttled updates)
+// -----------------------------
 let lastPrice = 0;
 let socketAlive = false;
 let ws = null;
@@ -97,21 +131,26 @@ const WS_MIRRORS = Array.isArray(CONFIG.WS_MIRRORS) && CONFIG.WS_MIRRORS.length
   ? CONFIG.WS_MIRRORS
   : ["wss://stream.binance.com:9443/ws", "wss://data-stream.binance.vision/ws"];
 
-function makeTickerStream(symbol = CONFIG.SYMBOL) {
+function makeStream(symbol = CONFIG.SYMBOL) {
   return `${String(symbol).toLowerCase()}@ticker`;
 }
 
 function connectWS(symbol = CONFIG.SYMBOL) {
-  const stream = makeTickerStream(symbol);
   let aborted = false;
+  let lastUpdateTs = 0;
 
-  const tryConnect = () => {
+  async function attempt() {
     if (aborted) return;
     const base = WS_MIRRORS[mirrorIdx % WS_MIRRORS.length];
+    const stream = makeStream(symbol);
     const url = base.endsWith("/") ? base + stream : `${base}/${stream}`;
 
     try {
-      if (ws) try { ws.terminate(); } catch (_) {}
+      if (ws) {
+        try { ws.removeAllListeners(); ws.terminate(); } catch {}
+        ws = null;
+      }
+
       ws = new WebSocket(url, { handshakeTimeout: 5000 });
 
       ws.on("open", () => {
@@ -120,51 +159,51 @@ function connectWS(symbol = CONFIG.SYMBOL) {
         console.log("🔗 WS Connected:", url);
       });
 
-      // throttle updates to avoid flood (0.5s)
-      let lastUpdate = 0;
-      ws.on("message", (data) => {
+      ws.on("message", (msg) => {
+        const now = Date.now();
+        // throttle updates (0.5s)
+        if (now - lastUpdateTs < 500) return;
+        lastUpdateTs = now;
         try {
-          const now = Date.now();
-          if (now - lastUpdate < 500) return;
-          lastUpdate = now;
-          const j = (typeof data === "string") ? JSON.parse(data) : JSON.parse(data.toString());
-          if (j && (j.c || j.last_price || j.p)) {
-            lastPrice = parseFloat(j.c || j.last_price || j.p) || lastPrice;
-          }
-        } catch (_) { /* ignore parse errors */ }
+          const j = (typeof msg === "string") ? JSON.parse(msg) : JSON.parse(msg.toString());
+          const p = parseFloat(j?.c || j?.last_price || j?.p);
+          if (!Number.isNaN(p) && p !== 0) lastPrice = p;
+        } catch (_) {}
       });
 
       ws.on("close", (code, reason) => {
         socketAlive = false;
         mirrorIdx++;
-        const delay = Math.min(60000, wsBackoffMs + Math.floor(Math.random() * 800));
+        const delay = Math.min(60000, Math.max(1000, wsBackoffMs));
         wsBackoffMs = Math.min(60000, Math.floor(wsBackoffMs * 1.6));
-        console.warn("⚠️ WS closed", code, (reason && reason.toString) ? reason.toString() : reason, "reconnect in", delay);
-        setTimeout(tryConnect, delay);
+        console.warn("⚠️ WS closed", code || "", (reason && reason.toString) ? reason.toString() : "", " — reconnect in", delay, "ms");
+        setTimeout(attempt, delay);
       });
 
       ws.on("error", (err) => {
         socketAlive = false;
         mirrorIdx++;
-        console.warn("⚠️ WS error:", err?.message || err);
-        try { ws.terminate(); } catch (_) {}
-        const delay = Math.min(60000, wsBackoffMs + Math.floor(Math.random() * 800));
+        const delay = Math.min(60000, Math.max(1000, wsBackoffMs));
         wsBackoffMs = Math.min(60000, Math.floor(wsBackoffMs * 1.6));
-        setTimeout(tryConnect, delay);
+        try { ws.terminate(); } catch {}
+        console.warn("⚠️ WS error:", err?.message || err);
+        setTimeout(attempt, delay);
       });
+
     } catch (e) {
       mirrorIdx++;
-      const delay = Math.min(60000, wsBackoffMs + Math.floor(Math.random() * 800));
+      const delay = Math.min(60000, Math.max(1000, wsBackoffMs));
       wsBackoffMs = Math.min(60000, Math.floor(wsBackoffMs * 1.6));
-      setTimeout(tryConnect, delay);
+      console.warn("⚠️ WS connect exception:", e?.message || e, "reconnect in", delay);
+      setTimeout(attempt, delay);
     }
-  };
+  }
 
-  tryConnect();
+  attempt();
 
   return () => {
     aborted = true;
-    try { if (ws) ws.terminate(); } catch (_) {}
+    try { if (ws) { ws.removeAllListeners(); ws.terminate(); ws = null; } } catch {}
   };
 }
 
@@ -175,133 +214,134 @@ if (!global.__wsStarted) {
   console.log("🌐 WebSocket Started (single instance)");
 }
 
-// ---------------------------
-// Data context helper
-// ---------------------------
+// -----------------------------
+// Data provider (external use)
+// -----------------------------
 export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
-    return { price: lastPrice || m15.price || 0, candles: m15.data || [], socketAlive };
+    return {
+      price: lastPrice || m15.price || 0,
+      candles: m15.data || [],
+      socketAlive
+    };
   } catch (e) {
     return { price: lastPrice || 0, candles: [], socketAlive };
   }
 }
 
-// ---------------------------
-// AUTO REPORT (single guarded runner)
-// ---------------------------
-let _autoReportRunning = false;
+// -----------------------------
+// AUTO REPORT (single timer, no duplicates)
+// -----------------------------
+let autoReportTimer = null;
+let autoReportRunning = false;
+
 async function doAutoReport() {
-  if (_autoReportRunning) {
-    console.log("ℹ️ autoReport already running — skipping tick.");
+  if (autoReportRunning) {
+    console.log("ℹ️ autoReport already running — skipping this tick.");
     return;
   }
-  _autoReportRunning = true;
+  autoReportRunning = true;
   try {
-    // build + format
     const report = await buildAIReport(CONFIG.SYMBOL);
-    const formatted = await formatAIReport(report); // returns HTML/text
-    // send HTML via our single sender
-    const res = await sendTelegramHTML(formatted);
-    if (!res.ok) console.warn("AutoReport: telegram send failed", res.reason);
-    else console.log("📤 AutoReport sent at", new Date().toLocaleString());
+    const formatted = await formatAIReport(report); // returns HTML string
+    // sanitized and send
+    const res = await sendTelegram(formatted);
+    if (!res.ok) console.warn("Telegram send failed for autoReport:", res.msg);
+    else console.log("📤 Auto report sent");
   } catch (e) {
     console.error("autoReport error:", e?.message || e);
   } finally {
-    _autoReportRunning = false;
+    autoReportRunning = false;
   }
 }
 
-// schedule auto report only once
-if (!global.__autoReportStarted) {
-  global.__autoReportStarted = true;
-  const intervalMs = Number(CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
-  // initial small delay so process stabilizes
+function startAutoReport() {
+  if (autoReportTimer) return;
+  const ms = Number(CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
   setTimeout(doAutoReport, 5000);
-  setInterval(doAutoReport, Math.max(30_000, intervalMs));
-  console.log("⏱ AutoReport scheduled every", Math.round(intervalMs/1000), "sec");
+  autoReportTimer = setInterval(doAutoReport, ms);
+  console.log("⏱ AutoReport scheduled every", ms / 1000, "sec");
 }
 
-// ---------------------------
-// KEEPALIVE for Render (ping /ping)
-// ---------------------------
+// start
+startAutoReport();
+
+// -----------------------------
+// KEEPALIVE (optional — Render friendly)
+// -----------------------------
+const SELF_PING = (CONFIG.SELF_PING_URL || "").replace(/\/+$/, "") + "/ping";
 if (CONFIG.SELF_PING_URL) {
-  const SELF_PING = String(CONFIG.SELF_PING_URL).replace(/\/+$/,"") + "/ping";
   setInterval(async () => {
     try {
       await axios.get(SELF_PING, { timeout: 4000 });
-      console.log("💓 KEEPALIVE success");
-    } catch (e) {
-      console.warn("⚠️ KEEPALIVE fail", e?.message || (e?.response && e.response.status));
+      // minimal log
+      // console.log("💓 KEEPALIVE OK");
+    } catch {
+      console.warn("⚠️ KEEPALIVE FAIL");
     }
   }, 4 * 60 * 1000);
 } else {
   console.log("ℹ️ SELF_PING_URL not set — keepalive disabled");
 }
 
-// ---------------------------
-// Reversal watcher integration (lightweight)
-// pass our send function to keep watcher minimal (so watcher won't call Telegram directly)
-// ---------------------------
+// -----------------------------
+// REVERSAL WATCHER (single instance, lightweight)
+// -----------------------------
 try {
-  if (typeof startReversalWatcher === "function") {
-    // watcher is expected to accept { sendAlert: fn } option to notify
+  if (!global.__revWatcherStarted) {
+    global.__revWatcherStarted = true;
+    // provide minimal send wrapper to ensure sanitized messages
+    const sendWrapper = async (msg) => {
+      // small sanitize before send
+      const txt = String(msg || "").replace(/[-=]{3,}/g, "\n\n").trim();
+      await sendTelegram(txt);
+    };
+
     startReversalWatcher(CONFIG.SYMBOL, {
       pollIntervalMs: Number(CONFIG.REVERSAL_WATCHER_POLL_MS || 15000),
-      microLookback: Number(CONFIG.REVERSAL_WATCHER_LOOKBACK || 60),
+      lookback: Number(CONFIG.REVERSAL_WATCHER_LOOKBACK || 60),
       minProb: Number(CONFIG.REVERSAL_MIN_PROB || 58),
-      // watcher can call this to send alert — we keep HTML mode consistent
-      sendAlert: async (txt) => {
-        // watcher may pass plain text; convert to simple HTML-safe message
-        if (!txt) return;
-        // keep small: send as preformatted HTML (escape minimal)
-        const safe = String(txt)
-          .replace(/&/g,"&amp;")
-          .replace(/</g,"&lt;")
-          .replace(/>/g,"&gt;")
-          .replace(/\n/g,"\n");
-        await sendTelegramHTML(`<pre>${safe}</pre>`);
-      }
+      sendAlert: sendWrapper
     });
-    console.log("⚡ Reversal Watcher started (lightweight)");
-  } else {
-    console.log("ℹ️ No reversal watcher exported — skipping");
+
+    console.log("⚡ Reversal Watcher started (single instance)");
   }
 } catch (e) {
-  console.warn("⚠️ startReversalWatcher error:", e?.message || e);
+  console.warn("⚠️ Reversal watcher failed to start:", e?.message || e);
 }
 
-// ---------------------------
-// Optional periodic GC if enabled
-// ---------------------------
+// -----------------------------
+// Optional GC (if Node started with --expose-gc)
+// -----------------------------
 if (typeof global.gc === "function") {
   setInterval(() => {
-    try { global.gc(); console.log("🧹 global.gc() called"); } catch (_) {}
+    try { global.gc(); } catch {}
   }, 5 * 60 * 1000);
 }
 
-// ---------------------------
-// Graceful shutdown wrapper
-// ---------------------------
-async function gracefulShutdown() {
+// -----------------------------
+// Shutdown/cleanup helper
+// -----------------------------
+async function shutdown(code = 0) {
   try {
-    console.log("🛑 Shutdown requested — cleaning...");
-    // stop scheduled stuff
-    try { if (typeof stopReversalWatcher === "function") await stopReversalWatcher(); } catch (_) {}
-    try { if (ws) ws.terminate(); } catch (_) {}
-    try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch (_) {}
+    console.log("🛑 Shutdown initiated...");
+    if (autoReportTimer) clearInterval(autoReportTimer);
+    try { if (typeof stopReversalWatcher === "function") await stopReversalWatcher(); } catch {}
+    try { if (ws) { ws.removeAllListeners(); ws.terminate(); ws = null; } } catch {}
+    if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
   } catch (e) {
-    console.warn("Shutdown warning:", e?.message || e);
+    console.error("Error during shutdown:", e?.message || e);
   } finally {
-    process.exit(0);
+    process.exit(code);
   }
 }
-process.on("SIGINT", gracefulShutdown);
-process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(0));
 
-// ---------------------------
-// Exports (so tests/commands can call doAutoReport/getDataContext)
-// ---------------------------
+// -----------------------------
+// Exports
+// -----------------------------
 export default {
   getDataContext,
   doAutoReport
