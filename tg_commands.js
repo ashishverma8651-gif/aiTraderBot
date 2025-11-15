@@ -425,7 +425,7 @@ export async function formatAIReport(report) {
           m.fib || null
         )
       )
-      .join("\n\n──────────────\n\n");
+      .join("\n\\n\n");
 
     // Elliott Summary
     let ellSummaryText = "Elliott: N/A";
