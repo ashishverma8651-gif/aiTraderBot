@@ -1,4 +1,4 @@
-// aiTraderBot.js — FINAL RENDER-SAFE BUILD
+// aiTraderBot.js — FINAL RENDER-SAFE + TELEGRAM FIX + KEEPALIVE FIX
 
 import express from "express";
 import WebSocket from "ws";
@@ -9,21 +9,26 @@ import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
+
 // =======================================================
-// EXPRESS SERVER (REQUIRED for Render Keep-Alive)
+// EXPRESS SERVER (Render requires active server)
 // =======================================================
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
-app.get("/", (_, res) => res.send("✅ AI Trader Running"));
-app.get("/ping", (_, res) => res.send("pong"));    // <-- KEEPALIVE ENDPOINT
+// Root endpoint
+app.get("/", (_, res) => res.send("✅ AI Trader is running"));
+
+// A simple PING endpoint for KeepAlive
+app.get("/ping", (_, res) => res.send("pong"));
 
 app.listen(PORT, () => {
   console.log(`🚀 Server live on port ${PORT}`);
 });
 
+
 // =======================================================
-// WEBSOCKET PRICE STREAM
+// WEBSOCKET PRICE STREAM (Stable reconnect)
 // =======================================================
 let lastPrice = 0;
 let ws = null;
@@ -47,7 +52,7 @@ function connectWS(sym = CONFIG.SYMBOL) {
 
     ws.on("open", () => {
       alive = true;
-      console.log("🔗 WS connected:", url);
+      console.log("🔗 WS Connected:", url);
     });
 
     ws.on("message", (d) => {
@@ -76,10 +81,11 @@ function connectWS(sym = CONFIG.SYMBOL) {
 
 connectWS(CONFIG.SYMBOL);
 
+
 // =======================================================
 // DATA CONTEXT
 // =======================================================
-async function getDataContext(symbol = CONFIG.SYMBOL) {
+export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
     return {
@@ -92,34 +98,64 @@ async function getDataContext(symbol = CONFIG.SYMBOL) {
   }
 }
 
+
 // =======================================================
-// AUTO REPORT (EVERY 15m SAFE)
+// TELEGRAM DIRECT SENDER (no polling bot needed)
 // =======================================================
-async function autoReport() {
+async function sendTelegram(msg) {
   try {
-    const rpt = await buildAIReport(CONFIG.SYMBOL);
-    await formatAIReport(rpt);
+    if (!CONFIG.TELEGRAM?.BOT_TOKEN || !CONFIG.TELEGRAM?.CHAT_ID) return;
+
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`;
+
+    await axios.post(url, {
+      chat_id: CONFIG.TELEGRAM.CHAT_ID,
+      text: msg,
+      parse_mode: "Markdown"
+    });
+  } catch (e) {
+    console.log("Telegram error:", e.message);
+  }
+}
+
+
+// =======================================================
+// FIXED AUTO 15m REPORT
+// =======================================================
+export async function autoReport() {
+  try {
+    const report = await buildAIReport(CONFIG.SYMBOL);
+    const text = await formatAIReport(report);
+
+    await sendTelegram(text);   // ← FIXED: REAL TELEGRAM SEND
+
     console.log("📤 15m report sent");
   } catch (e) {
     console.log("Auto report error:", e.message);
   }
 }
 
+// interval (15 mins)
 setInterval(autoReport, 15 * 60 * 1000);
 
+// send first report after start (wait 5 seconds)
+setTimeout(autoReport, 5000);
+
+
 // =======================================================
-// KEEP ALIVE — FIXED FOR RENDER
+// KEEP ALIVE (Render fix)
 // =======================================================
-const SELF_URL = `${CONFIG.SELF_PING_URL}/ping`;
+const SELF_URL = CONFIG.SELF_PING_URL;  // MUST be https://your-app.onrender.com/ping
 
 setInterval(async () => {
   try {
     await axios.get(SELF_URL, { timeout: 4000 });
     console.log("💓 KEEPALIVE SUCCESS");
   } catch {
-    console.log("⚠️ KEEPALIVE FAIL");
+    console.log("⚠ KEEPALIVE FAIL");
   }
-}, 240000);
+}, 240000); // 4 minutes
+
 
 // =======================================================
 // REVERSAL WATCHER
@@ -127,26 +163,27 @@ setInterval(async () => {
 try {
   startReversalWatcher(CONFIG.SYMBOL, {
     pollIntervalMs: CONFIG.REVERSAL_WATCHER_POLL_MS || 15000,
-    microLookback: CONFIG.REVERSAL_WATCHER_LOOKBACK || 60,
+    microLookback: CONFIG.REVERSAL_WATCHER_LOOKBACK || 60
   });
-  console.log("⚡ Reversal watcher started");
+
+  console.log("⚡ Reversal Watcher STARTED");
 } catch (e) {
-  console.log("🚫 Reversal watcher error:", e.message);
+  console.log("❌ Reversal watcher failed:", e.message);
 }
 
+
 // =======================================================
-// CLEAN SHUTDOWN
+// CLEAN SHUTDOWN (Render compatible)
 // =======================================================
 function shutdown() {
-  try {
-    stopReversalWatcher();
-    if (ws) ws.terminate();
-  } catch {}
+  try { stopReversalWatcher(); } catch {}
+  try { if (ws) ws.terminate(); } catch {}
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
 
 export default {
   getDataContext,
