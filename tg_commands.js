@@ -16,8 +16,8 @@ import {
 } from "./ml_module_v8_6.js";
 
 // NEWS MODULE (YOUR ORIGINAL)
-import { fetchNews } from "./news_social.js";
-
+import newsService from "./news_social.js";
+const { fetchNews } = newsService;
 
 // ==========================
 // Telegram Init
