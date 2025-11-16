@@ -1,9 +1,5 @@
 // ml_module_v8_6.js — ML Engine v16 (Balanced, low-memory defaults)
-// - Auto retrain default: 12 hours
-// - Sliding dataset (lightweight): maxSamples default 300
-// - Micro watcher: disabled by default (available to enable)
-// - News integration (best-effort)
-// - Minimal memory allocations, synchronous JSON small writes
+// Corrected & hardened version
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
@@ -28,9 +24,9 @@ const DEFAULTS = {
   microLookback: Number(CONFIG.ML?.MICRO_LOOKBACK ?? 80),
   horizon: Number(CONFIG.ML?.HORIZON ?? 3),
   maxSamples: Number(CONFIG.ML?.MAX_SAMPLES ?? 300),
-  autoRetrainHours: Number(CONFIG.ML?.RETRAIN_INTERVAL_HOURS ?? 12), // balanced: 12h
+  autoRetrainHours: Number(CONFIG.ML?.RETRAIN_INTERVAL_HOURS ?? 12),
   autoTrainOnStart: CONFIG.ML?.AUTO_TRAIN_ON_START ?? true,
-  microWatcherEnabled: CONFIG.ML?.MICRO_WATCHER ?? false, // disabled by default (balanced)
+  microWatcherEnabled: CONFIG.ML?.MICRO_WATCHER ?? false,
   microWatcherIntervalSeconds: Number(CONFIG.ML?.MICRO_WATCHER_INTERVAL_SECONDS ?? 30),
   newsFeatureEnabled: CONFIG.ML?.NEWS_FEATURES ?? true,
   newsTopicFromSymbol: CONFIG.ML?.NEWS_TOPIC_FROM_SYMBOL ?? true
@@ -69,16 +65,31 @@ function initModel(dim) {
   return { w, b, dim, trainedAt: nowISO() };
 }
 function predictRaw(model, x) {
-  if (!model || !Array.isArray(model.w)) return 0.5;
-  let s = model.b || 0;
-  for (let i = 0; i < model.w.length && i < x.length; i++) s += (model.w[i] || 0) * (x[i] || 0);
-  return sigmoid(s);
+  try {
+    if (!model || !Array.isArray(model.w)) return 0.5;
+    let s = Number(model.b || 0);
+    for (let i = 0; i < model.w.length && i < (x?.length || 0); i++) {
+      s += (model.w[i] || 0) * (x[i] || 0);
+    }
+    // clamp to avoid overflow
+    if (!isFinite(s)) s = Math.max(-100, Math.min(100, s));
+    return sigmoid(s);
+  } catch (e) {
+    console.warn("ml_v16.predictRaw err", e?.message || e);
+    return 0.5;
+  }
 }
 function updateSGD(model, x, y, lr = 0.02) {
-  const p = predictRaw(model, x);
-  const e = p - y;
-  for (let i = 0; i < model.w.length && i < x.length; i++) model.w[i] -= lr * e * (x[i] || 0);
-  model.b -= lr * e;
+  try {
+    const p = predictRaw(model, x);
+    const e = p - y;
+    for (let i = 0; i < model.w.length && i < (x?.length || 0); i++) {
+      model.w[i] -= lr * e * (x[i] || 0);
+    }
+    model.b -= lr * e;
+  } catch (e) {
+    // swallow - training should be robust
+  }
 }
 
 // ---------- news helper (best-effort, lightweight) ----------
@@ -89,8 +100,7 @@ async function safeFetchNewsFeatures(symbol) {
     if (DEFAULTS.newsTopicFromSymbol) topic = topic.length > 3 ? topic.slice(0,3) : (topic || "BTC");
     const n = await newsModule.fetchNewsBundle(topic);
     if (!n || !n.ok) return { newsScore: 0, newsAbs: 0, raw: n };
-    // fetch returns sentiment 0..1 → center to -1..1
-    const newsScore = ( (typeof n.sentiment === "number") ? (n.sentiment * 2 - 1) : 0 );
+    const newsScore = (typeof n.sentiment === "number") ? (n.sentiment * 2 - 1) : 0; // -1..1
     const newsAbs = Math.min(1, Math.abs(newsScore));
     return { newsScore, newsAbs, raw: n };
   } catch (e) {
@@ -127,22 +137,22 @@ export async function extractFeatures(symbol, interval = "15m", lookback = DEFAU
 
     let ell = null;
     try { ell = await analyzeElliott(data); } catch(e){ ell = null; }
-    const ellSent = ell?.sentiment ?? 0;
-    const ellConf = (ell?.confidence ?? 0) / 100;
+    const ellSent = Number(ell?.sentiment ?? 0);
+    const ellConf = Number((ell?.confidence ?? 0) / 100);
 
     const newsFeat = await safeFetchNewsFeatures(symbol);
 
-    // feature ordering MUST be stable
+    // stable ordering
     const features = [
-      avgRet || 0,
-      volChange || 0,
-      (rsi || 50)/100,
-      (macdHist || 0),
-      (atr || 0),
-      ellSent || 0,
-      ellConf || 0,
-      newsFeat.newsScore || 0,
-      newsFeat.newsAbs || 0
+      avgRet || 0,                // 0
+      volChange || 0,            // 1
+      (rsi || 50)/100,           // 2 -> normalized 0..1
+      (macdHist || 0),           // 3 (may be small)
+      (atr || 0),                // 4
+      ellSent || 0,              // 5 (-1..1)
+      ellConf || 0,              // 6 (0..1)
+      newsFeat.newsScore || 0,   // 7 (-1..1)
+      newsFeat.newsAbs || 0      // 8 (0..1)
     ];
 
     return { symbol, interval, features, close: lastClose, vol: lastVol, ell, news: newsFeat.raw || null, fetchedAt: nowISO() };
@@ -160,7 +170,6 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
     const data = resp?.data || [];
     if (!Array.isArray(data) || data.length < window + horizon) return null;
 
-    // fetch news once to avoid repeated network I/O
     const newsGlobal = await safeFetchNewsFeatures(symbol);
     const X = [], Y = [], meta = [];
 
@@ -187,8 +196,8 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
 
       let ell = null;
       try { ell = await analyzeElliott(w); } catch(e){ ell=null; }
-      const ellSent = ell?.sentiment ?? 0;
-      const ellConf = (ell?.confidence ?? 0)/100;
+      const ellSent = Number(ell?.sentiment ?? 0);
+      const ellConf = Number((ell?.confidence ?? 0)/100);
 
       const features = [
         avgRet || 0,
@@ -213,6 +222,7 @@ export async function buildSlidingDataset(symbol, interval = "15m", window = 60,
       if (X.length >= maxSamples) break;
     }
 
+    if (!X.length) return null;
     return { X, Y, meta };
 
   } catch (e) {
@@ -232,8 +242,15 @@ export async function trainModel(symbols = [CONFIG.SYMBOL || "BTCUSDT"], options
         const ds = await buildSlidingDataset(s, opts.interval || "15m", opts.window || 60, opts.horizon || DEFAULTS.horizon, opts.maxSamples || DEFAULTS.maxSamples);
         if (ds && ds.X && ds.X.length) { allX.push(...ds.X); allY.push(...ds.Y); }
       } else {
+        // safe fallback: extract one feature sample, but such single-sample training is weak.
+        // prefer useSlidingDataset:true when calling trainModel.
         const f = await extractFeatures(s, opts.interval || "15m", opts.lookback || DEFAULTS.lookback);
-        if (f && f.features) { allX.push(f.features); allY.push(f.features[0] > 0 ? 1 : 0); }
+        if (f && f.features) {
+          // naive heuristic label: ell sentiment > 0 => 1 else 0
+          const label = (f.ell?.sentiment ?? 0) > 0 ? 1 : 0;
+          allX.push(f.features);
+          allY.push(label);
+        }
       }
     } catch (e) {
       console.warn("ml_v16.trainModel sample build failed for", s, e?.message || e);
@@ -249,11 +266,10 @@ export async function trainModel(symbols = [CONFIG.SYMBOL || "BTCUSDT"], options
   const epochs = opts.epochs || DEFAULTS.epochs;
   const lr = opts.lr || DEFAULTS.lr;
 
-  // small, memory-friendly training loop
   for (let ep=0; ep<epochs; ep++) {
     for (let i=0;i<allX.length;i++) {
       const idx = Math.floor(Math.random() * allX.length);
-      updateSGD(model, allX[idx], allY[idx], lr);
+      try { updateSGD(model, allX[idx], allY[idx], lr); } catch(e){}
     }
   }
 
@@ -266,21 +282,32 @@ export async function trainModel(symbols = [CONFIG.SYMBOL || "BTCUSDT"], options
 // ---------- prediction (15m) ----------
 export async function runMLPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", interval = "15m") {
   try {
-    const model = safeJSONLoad(MODEL_FILE, null);
-    if (!model) return { error: "model_not_found" };
-
     const f = await extractFeatures(symbol, interval, DEFAULTS.lookback);
     if (!f) return { error: "no_features" };
 
-    let p = predictRaw(model, f.features);
+    let model = safeJSONLoad(MODEL_FILE, null);
+    let p = 0.5;
 
-    // small news nudge (±5%) and ell confidence nudge
+    if (model) {
+      p = predictRaw(model, f.features);
+    } else {
+      // fallback heuristic (no trained model) — use ell sentiment + simple features
+      const s = Number(f.ell?.sentiment ?? 0);
+      // base p from ell sentiment, rsi and macd: small influences
+      const rsi = (f.features?.[2] ?? 0); // 0..1
+      const macdHist = (f.features?.[3] ?? 0);
+      p = 0.5 + s * 0.25 + (rsi - 0.5) * 0.05 + Math.sign(macdHist) * 0.02;
+      p = Math.max(0, Math.min(1, p));
+    }
+
+    // news and ell-confidence nudges (small)
     try {
       const newsScore = f.news ? ( (typeof f.news.sentiment === "number") ? (f.news.sentiment) : (f.features?.[7] ?? 0) ) : 0;
       p = Math.max(0, Math.min(1, p + (newsScore * 0.05) + ((f.ell?.confidence ?? 0)/100 * 0.02)));
     } catch(e){}
 
-    const pct = Math.round(p * 10000)/100;
+    // final pct and label
+    const pct = Math.round(p * 10000) / 100; // two decimals
     const label = pct > 55 ? "Bullish" : pct < 45 ? "Bearish" : "Neutral";
 
     const predId = await recordPrediction({
@@ -308,7 +335,7 @@ export async function runMicroPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", in
     const pModel = model ? predictRaw(model, f.features) : 0.5;
     let p = pModel;
 
-    // minor news & simple pattern nudges (cheap)
+    // cheap candle pattern nudges
     const resp = await fetchMarketData(symbol, interval, 6);
     const candles = resp?.data || [];
     const last = candles.at(-1), prev = candles.at(-2);
@@ -318,10 +345,10 @@ export async function runMicroPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", in
         const body = Math.abs(last.close - last.open);
         const lowerWick = Math.abs(Math.min(last.open, last.close) - last.low);
         const upperWick = Math.abs(last.high - Math.max(last.open, last.close));
-        if (lowerWick > body * 1.8 && upperWick < body * 0.5) patterns.push("Hammer");
-        if (upperWick > body * 1.8 && lowerWick < body * 0.5) patterns.push("Shooting Star");
-        if ((last.close > last.open) && (prev.close < prev.open) && (last.open < prev.close)) patterns.push("Bullish Engulfing");
-        if ((last.close < last.open) && (prev.close > prev.open) && (last.open > prev.close)) patterns.push("Bearish Engulfing");
+        if (body > 0 && lowerWick > body * 1.8 && upperWick < body * 0.5) patterns.push("Hammer");
+        if (body > 0 && upperWick > body * 1.8 && lowerWick < body * 0.5) patterns.push("Shooting Star");
+        if ((last.close > last.open) && (prev.close < prev.open) && (last.open < prev.close)) patterns.push("BullishEngulfing");
+        if ((last.close < last.open) && (prev.close > prev.open) && (last.open > prev.close)) patterns.push("BearishEngulfing");
       }
     } catch(e){}
 
@@ -329,8 +356,8 @@ export async function runMicroPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", in
       p = Math.max(0, Math.min(1, p + ((f.news?.sentiment ?? (f.features?.[7]??0)) * 0.03)));
       if (patterns.includes("Hammer")) p = Math.min(1, p + 0.04);
       if (patterns.includes("Shooting Star")) p = Math.max(0, p - 0.04);
-      if (patterns.includes("Bullish Engulfing")) p = Math.min(1, p + 0.06);
-      if (patterns.includes("Bearish Engulfing")) p = Math.max(0, p - 0.06);
+      if (patterns.includes("BullishEngulfing")) p = Math.min(1, p + 0.06);
+      if (patterns.includes("BearishEngulfing")) p = Math.max(0, p - 0.06);
     } catch(e){}
 
     const pct = Math.round(p * 10000)/100;
@@ -346,7 +373,7 @@ export async function runMicroPrediction(symbol = CONFIG.SYMBOL || "BTCUSDT", in
 export async function recordPrediction(obj = {}) {
   try {
     const store = safeJSONLoad(PREDICTIONS_FILE, { preds: [] }) || { preds: [] };
-    const id = `mlpred_v16_${Date.now()}_${Math.floor(Math.random()*9999)}`;
+    const id = `mlpred_v16_${Date.now()}_${Math.floor(Math.random()*90000+10000)}`;
     const entry = Object.assign({ id, ts: Date.now() }, obj);
     store.preds = store.preds || [];
     store.preds.push(entry);
@@ -363,7 +390,17 @@ export function recordOutcome(predictionId, outcome = {}) {
     const preds = safeJSONLoad(PREDICTIONS_FILE, { preds: [] });
     const pred = (preds.preds || []).find(x => x.id === predictionId) || null;
     const fb = safeJSONLoad(FEEDBACK_FILE, { outcomes: [] }) || { outcomes: [] };
-    const rec = { predictionId, ts: Date.now(), predicted: pred, outcome: { correct: !!outcome.correct, realizedReturn: typeof outcome.realizedReturn === "number" ? outcome.realizedReturn : null, realizedPrice: typeof outcome.realizedPrice === "number" ? outcome.realizedPrice : null, note: outcome.note || null } };
+    const rec = {
+      predictionId,
+      ts: Date.now(),
+      predicted: pred,
+      outcome: {
+        correct: !!outcome.correct,
+        realizedReturn: typeof outcome.realizedReturn === "number" ? outcome.realizedReturn : null,
+        realizedPrice: typeof outcome.realizedPrice === "number" ? outcome.realizedPrice : null,
+        note: outcome.note || null
+      }
+    };
     fb.outcomes.push(rec);
     if (fb.outcomes.length > 10000) fb.outcomes = fb.outcomes.slice(-10000);
     safeJSONSave(FEEDBACK_FILE, fb);
@@ -436,7 +473,7 @@ export function getMLDashboard() {
   } catch(e) { return { modelAge:"err", modelDim:0, accuracy:0, feedbackSamples:0, lastUpdated: nowISO() }; }
 }
 
-// ---------- schedulers (balanced setup) ----------
+// ---------- schedulers ----------
 let _autoRetrainTimer = null;
 let _microWatcherTimer = null;
 let _microWatcherSymbols = [CONFIG.SYMBOL || "BTCUSDT"];
@@ -454,7 +491,6 @@ export function startAutoRetrain() {
 }
 export function stopAutoRetrain() { if (_autoRetrainTimer) { clearInterval(_autoRetrainTimer); _autoRetrainTimer = null; } }
 
-// micro watcher (disabled by default; available)
 export function startMicroWatcher(symbols = [CONFIG.SYMBOL || "BTCUSDT"], intervalSeconds = DEFAULTS.microWatcherIntervalSeconds) {
   try {
     if (_microWatcherTimer) clearInterval(_microWatcherTimer);
@@ -477,7 +513,6 @@ export function stopMicroWatcher() { if (_microWatcherTimer) { clearInterval(_mi
   try {
     const model = safeJSONLoad(MODEL_FILE, null);
     if (!model && DEFAULTS.autoTrainOnStart) {
-      // start lightweight background training (non-blocking)
       (async () => {
         try {
           await trainModel([CONFIG.SYMBOL || "BTCUSDT"], { useSlidingDataset: true, epochs: Math.min(20, DEFAULTS.epochs), lr: DEFAULTS.lr, maxSamples: Math.min(200, DEFAULTS.maxSamples) });
@@ -485,9 +520,7 @@ export function stopMicroWatcher() { if (_microWatcherTimer) { clearInterval(_mi
         } catch(e) { console.warn("ml_v16: background initial train failed", e?.message || e); }
       })();
     }
-    // start auto retrain scheduler
     if (Number(DEFAULTS.autoRetrainHours) > 0) startAutoRetrain();
-    // micro watcher remains disabled by default for balanced memory usage
     if (DEFAULTS.microWatcherEnabled) startMicroWatcher(_microWatcherSymbols, DEFAULTS.microWatcherIntervalSeconds);
   } catch(e){ console.warn("ml_v16.__ml_init_auto err", e?.message || e); }
 })();
