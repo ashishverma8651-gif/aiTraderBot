@@ -581,7 +581,12 @@ async function checkPostOutcome(pending, windowSec) {
   try {
     const resp = await fetchMarketData(pending.symbol, "1m", Math.max(3, Math.ceil(windowSec/60) + 2));
     const newPrice = resp?.price ?? null;
-    const priceAtSend = pending.priceAtDetect ?? (pending.perTfResults && pending.perTfResults[0]?.price) || 0;
+
+    const priceAtSend = (
+  pending.priceAtDetect ??
+  ((pending.perTfResults && pending.perTfResults[0]?.price) ?? 0)
+);
+
     if (newPrice == null) return { success: false, reason: "no_price" };
     const ret = ((newPrice - priceAtSend) / Math.max(1, Math.abs(priceAtSend))) * 100;
     const success = (pending.side === "Bullish") ? (ret > 0) : (ret < 0);
