@@ -430,118 +430,123 @@ function detectMarketStructure(candles, pivots) {
   return ms;
 }
 
-// ----------------------
-// TP/SL generator (fixed ordering & side-aware)
-// ----------------------
 
+// ----------------------
+// TP/SL generator (RESTORED BOTH-SIDE MODE)
+// ----------------------
 function generateTargets({ price, atr, patterns = [], fib = null, channels = [], orderBlocks = [] }) {
-  // Combine pattern targets (if present) and ATR/fib fallback
-  const rawTps = [];
-  const rawSls = [];
+  const tps = [];
+  const sls = [];
 
-  // pattern-based (collect)
+  // --- pattern based targets (ALWAYS BOTH SIDES) ---
   (patterns || []).forEach(p => {
-    if (p.target == null) return;
-    const tp = Number(p.target);
-    const side = (p.side === 'Bullish') ? 'BUY' : (p.side === 'Bearish' ? 'SELL' : 'BOTH');
+    if (!p.target) return;
 
-    // SL: use neckline/structure +/- ATR if available
-    let sl = null;
-    if (p.type === 'HeadAndShoulders' || p.type === 'InverseHeadAndShoulders') {
-      // use neckline +/- ATR (use pivot center)
-      sl = p.side === 'Bullish' ? (p.pivots[2].price - (atr * 1.2)) : (p.pivots[2].price + (atr * 1.2));
+    const tpValue = Number(p.target);
+    const conf = p.confidence || 50;
+
+    // LONG TP (always)
+    tps.push({
+      source: p.type,
+      side: "LONG",
+      tp: tpValue,
+      confidence: conf
+    });
+
+    // SHORT TP (always)
+    tps.push({
+      source: p.type,
+      side: "SHORT",
+      tp: tpValue,
+      confidence: conf
+    });
+
+    // SL for long
+    let slLong;
+    if (p.type === "HeadAndShoulders" || p.type === "InverseHeadAndShoulders") {
+      slLong = p.pivots[2].price - atr * 1.2;
     } else {
-      sl = p.side === 'Bullish'
-        ? Math.min(...p.pivots.map(x => x.price)) - (atr * 1.5)
-        : Math.max(...p.pivots.map(x => x.price)) + (atr * 1.5);
+      slLong = Math.min(...p.pivots.map(x => x.price)) - atr * 1.5;
     }
+    sls.push({
+      source: p.type,
+      side: "LONG",
+      sl: slLong,
+      confidence: conf
+    });
 
-    rawTps.push({ source: p.type, side, tp: Number(tp), confidence: p.confidence || 50 });
-    rawSls.push({ source: p.type, side, sl: Number(sl), confidence: p.confidence || 50 });
+    // SL for short
+    let slShort;
+    if (p.type === "HeadAndShoulders" || p.type === "InverseHeadAndShoulders") {
+      slShort = p.pivots[2].price + atr * 1.2;
+    } else {
+      slShort = Math.max(...p.pivots.map(x => x.price)) + atr * 1.5;
+    }
+    sls.push({
+      source: p.type,
+      side: "SHORT",
+      sl: slShort,
+      confidence: conf
+    });
   });
 
-  // harmonics/fib/ATR fallback if no pattern TPs
-  if (!rawTps.length) {
-    if (fib && fib.ext) {
-      rawTps.push({ source: 'FIB_1.272', side: 'BOTH', tp: Number(fib.ext['1.272']) });
-      rawTps.push({ source: 'FIB_1.618', side: 'BOTH', tp: Number(fib.ext['1.618']) });
-      rawSls.push({ source: 'ATR_SL', side: 'BOTH', sl: Number(price - atr * 2) });
+  // --- If no pattern targets, fallback to fib/atr ---
+  if (!tps.length) {
+    if (fib?.ext) {
+      tps.push(
+        { source: "FIB_1.272", side: "LONG", tp: fib.ext["1.272"], confidence: 50 },
+        { source: "FIB_1.272", side: "SHORT", tp: fib.ext["1.272"], confidence: 50 },
+        { source: "FIB_1.618", side: "LONG", tp: fib.ext["1.618"], confidence: 50 },
+        { source: "FIB_1.618", side: "SHORT", tp: fib.ext["1.618"], confidence: 50 }
+      );
+      sls.push(
+        { source: "ATR_SL", side: "LONG", sl: price - atr * 2 },
+        { source: "ATR_SL", side: "SHORT", sl: price + atr * 2 }
+      );
     } else {
-      rawTps.push({ source: 'ATR_MULT', side: 'BOTH', tp: Number(price + atr * 3) });
-      rawSls.push({ source: 'ATR_SL', side: 'BOTH', sl: Number(price - atr * 2) });
+      tps.push(
+        { source: "ATR_MULT", side: "LONG", tp: price + atr * 3, confidence: 50 },
+        { source: "ATR_MULT", side: "SHORT", tp: price - atr * 3, confidence: 50 }
+      );
+      sls.push(
+        { source: "ATR_SL", side: "LONG", sl: price - atr * 2 },
+        { source: "ATR_SL", side: "SHORT", sl: price + atr * 2 }
+      );
     }
   }
 
-  // orderblock based nearest levels
-  if (orderBlocks && orderBlocks.length) {
-    orderBlocks.slice(-3).forEach(ob => {
-      const tpVal = ob.side === 'Bullish' ? (ob.levelHigh + atr * 2) : (ob.levelLow - atr * 2);
-      rawTps.push({ source: 'OrderBlock', side: ob.side === 'Bullish' ? 'BUY' : 'SELL', tp: Number(tpVal), confidence: ob.confidence || 50 });
+  // --- ORDERBLOCK add-ons ---
+  (orderBlocks || []).slice(-3).forEach(ob => {
+    const conf = ob.confidence || 50;
+
+    // Both side targets
+    tps.push({
+      source: "OrderBlock",
+      side: "LONG",
+      tp: ob.levelHigh + atr * 2,
+      confidence: conf
     });
+
+    tps.push({
+      source: "OrderBlock",
+      side: "SHORT",
+      tp: ob.levelLow - atr * 2,
+      confidence: conf
+    });
+  });
+
+  // --- Clean duplicates ---
+  const uniqueTP = [];
+  const seen = new Set();
+  for (const t of tps) {
+    const k = `${t.side}_${Math.round(t.tp)}`;
+    if (!seen.has(k)) { seen.add(k); uniqueTP.push(t); }
   }
 
-  // Dedupe by exact numeric value (keep last occurrence)
-  const tpMap = new Map(); // key -> tpObj
-  for (const r of rawTps) tpMap.set(Number(r.tp).toFixed(6), r);
-  const deduped = Array.from(tpMap.values());
-
-  // Partition by side to sort properly relative to price
-  const bullish = deduped.filter(x => x.side === 'BUY');
-  const bearish = deduped.filter(x => x.side === 'SELL');
-  const both = deduped.filter(x => x.side === 'BOTH');
-
-  // Helper: distance
-  const dist = (v) => Math.abs(Number(v) - Number(price || 0));
-
-  // For bullish: keep only tps > price (if none, keep all and sort by distance)
-  function sortBull(list) {
-    const above = list.filter(x => Number(x.tp) > Number(price));
-    if (above.length) return above.sort((a,b) => Number(a.tp) - Number(b.tp)); // ascending -> nearest above first
-    return list.sort((a,b) => dist(a.tp) - dist(b.tp)); // fallback
-  }
-
-  // For bearish: keep only tps < price (if none, keep all and sort by distance)
-  function sortBear(list) {
-    const below = list.filter(x => Number(x.tp) < Number(price));
-    if (below.length) return below.sort((a,b) => Number(b.tp) - Number(a.tp)); // descending -> nearest below first
-    return list.sort((a,b) => dist(a.tp) - dist(b.tp)); // fallback
-  }
-
-  // For BOTH: sort by absolute distance (closest first)
-  function sortBoth(list) {
-    return list.sort((a,b) => dist(a.tp) - dist(b.tp));
-  }
-
-  const sortedTps = [
-    ...sortBull(bullish),
-    ...sortBear(bearish),
-    ...sortBoth(both)
-  ];
-
-  // final formatting: attach rank (TP1, TP2...) and round numbers to sensible decimals
-  const targets = sortedTps.map((t, idx) => ({
-    rank: idx + 1,
-    source: t.source,
-    side: t.side,
-    tp: Number(Number(t.tp).toFixed(2)),
-    confidence: t.confidence || null,
-    distance: Number(dist(t.tp).toFixed(2))
-  }));
-
-  // dedupe stops (keep last for same rounded SL)
-  const slMap = new Map();
-  for (const s of rawSls) {
-    if (s.sl == null) continue;
-    slMap.set(Number(s.sl).toFixed(6), s);
-  }
-  const stops = Array.from(slMap.values()).map(s => ({
-    source: s.source,
-    side: s.side,
-    sl: Number(Number(s.sl).toFixed(2)),
-    confidence: s.confidence || null
-  }));
-
-  return { targets, stops };
+  return {
+    targets: uniqueTP.sort((a, b) => a.tp - b.tp),
+    stops: sls
+  };
 }
 
 
