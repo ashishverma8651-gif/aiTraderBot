@@ -349,11 +349,3 @@ export function calculateAccuracy() {
   } catch(e) { return { accuracy: 0, samples: 0 }; }
 }
 
-// Export default
-export {
-  runMLPrediction,
-  runMicroPrediction,
-  recordPrediction,
-  recordOutcome,
-  calculateAccuracy
-};
