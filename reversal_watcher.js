@@ -427,26 +427,9 @@ export async function evaluateSymbol(symbol, opts = {}, sendAlert = null) {
 // reversal_watcher_part2.js — Part 2 (Confirmed Alerts + ML gating + cooldown + feedback)
 // Replaces previous reversal_watcher. Keep existing auxiliary modules (ml_module_v8_6, elliott_module, utils, etc.)
 
-import fs from "fs";
-import path from "path";
-import CONFIG from "./config.js";
-import { fetchMultiTF, fetchMarketData } from "./utils.js";
-import { analyzeElliott } from "./elliott_module.js";
-import * as indicators from "./core_indicators.js";
-import {
-  runMLPrediction,
-  runMicroPrediction,
-  recordPrediction,
-  recordOutcome,
-  calculateAccuracy
-} from "./ml_module_v8_6.js";
 
-// Storage
-const DATA_DIR = path.resolve(process.cwd(), "cache");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const ALERT_STORE = path.join(DATA_DIR, "reversal_alerts.json");        // historical alerts + pending
-const WATCHER_LOG = path.join(DATA_DIR, "reversal_watcher_log.txt");
+
 
 // Safe JSON helpers
 function safeLoad(fp, def = {}) {
