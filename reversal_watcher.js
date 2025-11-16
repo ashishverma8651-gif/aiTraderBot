@@ -1,12 +1,12 @@
-// reversal_watcher.js — Option D (Multi-TF Reversal Watcher + ML + Feedback)
-// Usage: startReversalWatcher(symbol, options)
-// Exports: startReversalWatcher, stopReversalWatcher
+// reversal_watcher.js — Optimized Multi-TF Reversal Watcher (memory-friendly, consensus-driven)
+// Exports: startReversalWatcher(symbol, options, sendAlert), stopReversalWatcher, getWatcherState
+// Designed to be dropped into your project and used with aiTraderBot.sendTelegram as sendAlert.
 
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
-import { analyzeElliott } from "./elliott_module.js";
+import { analyzeElliott } from "./elliott_module.js"; // used only on 15m (opt-in)
 import * as indicators from "./core_indicators.js";
 import {
   runMLPrediction,
@@ -16,73 +16,75 @@ import {
   calculateAccuracy
 } from "./ml_module_v8_6.js";
 
-// -------------------------
-// Storage & defaults
-// -------------------------
+// -------------- small helpers --------------
 const DATA_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const ALERT_STORE = path.join(DATA_DIR, "reversal_alerts.json");
-const WATCHER_LOG = path.join(DATA_DIR, "reversal_watcher_log.txt");
+const STATE_STORE = path.join(DATA_DIR, "reversal_state.json");
+
+function nowIST() {
+  return new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
+}
 
 function safeLoad(fp, def = {}) {
-  try { if (!fs.existsSync(fp)) return def; return JSON.parse(fs.readFileSync(fp,"utf8") || "{}"); }
-  catch (e) { return def; }
+  try {
+    if (!fs.existsSync(fp)) return def;
+    const s = fs.readFileSync(fp, "utf8");
+    if (!s) return def;
+    return JSON.parse(s);
+  } catch (e) {
+    return def;
+  }
 }
 function safeSave(fp, obj) {
-  try { fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); return true; }
-  catch (e) { return false; }
+  try { fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); return true; } catch { return false; }
 }
-function log(...args) {
-  const line = `[${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true })}] ${args.join(" ")}`;
-  try { fs.appendFileSync(WATCHER_LOG, line + "\n"); } catch {}
-  console.log(line);
+function slog(...args) {
+  // Minimal logging so Render logs don't explode
+  console.log(`[Reverser ${nowIST()}]`, ...args);
 }
 
-// -------------------------
-// Configuration (tunable via options or CONFIG.REVERSAL_WATCHER)
-// -------------------------
-const GLOBAL_DEFAULTS = Object.assign({
-  tfs: ["1m","5m","15m"],
+// -------------- defaults (tunable via options) --------------
+const DEFAULTS = Object.assign({
+  tfs: ["1m", "5m", "15m"],
   weights: { "1m": 0.25, "5m": 0.35, "15m": 0.4 },
-  pollIntervalMs: 20000,
-  patternScoreBoost: 50,   // base score for detected pattern
-  minAlertConfidence: 65,  // threshold to send alert
-  mlWeight: 0.18,
-  requireVolumeConfirm: false,
-  volumeMultiplierThreshold: 1.0, // vol/current > avg*X
-  debounceSeconds: 120, // don't repeat same-side alert within this for same symbol
-  feedbackWindowsSec: [60, 300], // windows to check outcomes (1m, 5m)
-  maxSavedAlerts: 1000
+  pollIntervalMs: 20_000,
+  minAlertConfidence: 65,
+  debounceSeconds: 120,
+  maxAlertsSaved: 300,
+  requireElliottOn15m: true,   // run Elliott only on 15m (saves memory)
+  mlWeight: 0.18,              // main ml boost weight
+  microML: true,               // run micro ML on 1m/5m
+  volumeConfirm: false,        // optional volume confirmation
+  allowBothSideTPs: true,      // generate both-side tps if no pattern based
 }, CONFIG.REVERSAL_WATCHER || {});
 
-// -------------------------
-// Internal state
-// -------------------------
-let _watcherTimers = new Map(); // symbol->intervalId
+// -------------- internal state --------------
+let _watchers = new Map(); // symbol -> intervalId
 let _running = false;
-let _recentAlerts = safeLoad(ALERT_STORE, { alerts: [] });
 
-// prune recent alerts on load
-_recentAlerts.alerts = (_recentAlerts.alerts || []).slice(-GLOBAL_DEFAULTS.maxSavedAlerts);
+// Load recent alerts and trim
+const _store = safeLoad(ALERT_STORE, { alerts: [] });
+_store.alerts = (_store.alerts || []).slice(-DEFAULTS.maxAlertsSaved);
 
-// -------------------------
-// Helpers: simple pattern detectors
-// (uses last 3 candles per TF; cheap heuristics)
-// -------------------------
+// Persist state occasionally
+function persistState() {
+  safeSave(STATE_STORE, { running: _running, symbols: Array.from(_watchers.keys()), savedAt: new Date().toISOString() });
+}
+
+// -------------- cheap pattern detections (keep tiny) --------------
 function detectSimplePatternsFromCandles(candles = []) {
-  // expects candles sorted oldest->newest
   const out = [];
   if (!Array.isArray(candles) || candles.length < 3) return out;
   const last = candles.at(-1);
   const prev = candles.at(-2);
   const prev2 = candles.at(-3);
+  const body = Math.abs(last.close - last.open) || 1;
+  const upperWick = (last.high - Math.max(last.close, last.open)) || 0;
+  const lowerWick = (Math.min(last.close, last.open) - last.low) || 0;
 
-  const body = Math.abs(last.close - last.open);
-  const upperWick = last.high - Math.max(last.close, last.open);
-  const lowerWick = Math.min(last.close, last.open) - last.low;
-
-  // Hammer-like (long lower wick)
+  // Hammer-like
   if (lowerWick > body * 1.6 && upperWick < body * 0.6 && last.close > last.open) {
     out.push({ name: "Hammer", side: "Bullish", strength: Math.min(90, 40 + (lowerWick/body)*10) });
   }
@@ -93,389 +95,328 @@ function detectSimplePatternsFromCandles(candles = []) {
   // Engulfing
   const isBullEngulf = (prev.close < prev.open) && (last.close > last.open) && (last.close > prev.open) && (last.open < prev.close);
   if (isBullEngulf) out.push({ name: "BullishEngulfing", side: "Bullish", strength: 60 });
-
   const isBearEngulf = (prev.close > prev.open) && (last.close < last.open) && (last.open > prev.close) && (last.close < prev.open);
   if (isBearEngulf) out.push({ name: "BearishEngulfing", side: "Bearish", strength: 60 });
 
-  // Tweezer tops/bottoms (simple)
+  // Tweezer approximate
   if (prev.high === last.high && last.close < last.open) out.push({ name: "TweezerTop", side: "Bearish", strength: 45 });
   if (prev.low === last.low && last.close > last.open) out.push({ name: "TweezerBottom", side: "Bullish", strength: 45 });
 
   return out;
 }
 
-// -------------------------
-// Score builder per TF
-// -------------------------
-function computeTFScore({ candles, ell, mlMicro, tf, tfWeight }) {
-  // base 0..100
-  let score = 0;
-  let reasons = [];
-
-  // pattern
+// -------------- core scoring per TF (lightweight) --------------
+function computeTFScore({ candles, tf, weight, ell }) {
+  // Score 0..100
+  let score = 50; // neutral starting point
+  const reasons = [];
   const patterns = detectSimplePatternsFromCandles(candles);
+
   if (patterns.length) {
     const p = patterns[0];
-    const pscore = Math.min(80, p.strength || GLOBAL_DEFAULTS.patternScoreBoost);
-    score += pscore;
-    reasons.push(`pattern:${p.name}(${p.side})`);
+    // pattern pushes score up/down proportional to strength
+    const delta = Math.round((p.strength || 50) / 2);
+    score += (p.side === "Bullish") ? delta : -delta;
+    reasons.push(`pattern:${p.name}`);
   }
 
-  // indicators
+  // indicators (cheap)
   try {
     const rsi = indicators.computeRSI(candles);
-    const macd = indicators.computeMACD(candles);
-    const atr = indicators.computeATR(candles);
-    if (macd && typeof macd.hist === "number") {
-      if (macd.hist > 0) { score += 6; reasons.push("macd_pos"); }
-      else if (macd.hist < 0) { score -= 6; reasons.push("macd_neg"); }
-    }
     if (rsi && rsi < 30) { score += 6; reasons.push("rsi_oversold"); }
     if (rsi && rsi > 70) { score -= 6; reasons.push("rsi_overbought"); }
-  } catch (e) {}
+    const macd = indicators.computeMACD(candles);
+    if (macd && typeof macd.hist === "number") {
+      if (macd.hist > 0) { score += 4; reasons.push("macd_pos"); }
+      else if (macd.hist < 0) { score -= 4; reasons.push("macd_neg"); }
+    }
+  } catch (e) { /* ignore indicator errors */ }
 
-  // ell sentiment
+  // Elliott sentiment if present (15m typically)
   if (ell && typeof ell.sentiment === "number") {
-    const s = ell.sentiment * 10; // -10..10
-    score += s;
-    reasons.push(`ell_sent:${ell.sentiment.toFixed(2)}`);
-  }
-
-  // micro ML nudge (1m/5m predictions) -> mlMicro.prob is percent number
-  if (mlMicro && typeof mlMicro.prob === "number") {
-    const p = (mlMicro.prob - 50) / 100 * 20; // ±10 points max
-    score += p;
-    reasons.push(`ml:${mlMicro.label || ""}:${mlMicro.prob}`);
+    // ell.sentiment is -1..1, scale to ±10
+    score += Math.round(ell.sentiment * 10);
+    reasons.push("elliott");
   }
 
   // clamp 0..100
-  let raw = Math.max(-100, Math.min(100, score));
-  // normalize to 0..100 by shifting
-  const norm = Math.round((raw + 100) / 2); // -100..100 -> 0..100
-  // weighted by tfWeight
-  const weighted = norm * (tfWeight || 1);
-
-  return { score: norm, weighted, reasons, patterns };
+  score = Math.max(0, Math.min(100, score));
+  const weighted = Math.round(score * (weight || 1));
+  return { tf, score, weighted, reasons, patterns };
 }
 
-// -------------------------
-// Consensus builder
-// -------------------------
-function buildConsensus(perTfResults, weights = GLOBAL_DEFAULTS.weights, mlMain = null) {
-  let sumW = 0, sumS = 0;
+// -------------- consensus builder --------------
+function buildConsensus(results, mlMain = null, weights = DEFAULTS.weights) {
+  // results: [{tf, score, weighted, patterns, reasons}]
+  let weightedSum = 0, weightTotal = 0;
   const breakdown = [];
-  for (const r of perTfResults) {
+  for (const r of results) {
     const w = weights[r.tf] || 0.1;
-    sumW += w;
-    sumS += (r.score || 0) * w;
+    weightedSum += (r.score || 50) * w;
+    weightTotal += w;
     breakdown.push({ tf: r.tf, score: r.score, patterns: r.patterns || [], reasons: r.reasons || [] });
   }
-  const avg = sumW ? (sumS / sumW) : 50;
-  // ML main boost
-  let boost = 0;
+  let avg = weightTotal ? (weightedSum / weightTotal) : 50;
+  // apply mlMain boost (if available)
   if (mlMain && typeof mlMain.prob === "number") {
-    boost = ((mlMain.prob - 50) / 100) * (GLOBAL_DEFAULTS.mlWeight * 100); // convert to points
+    const boost = ((mlMain.prob - 50) / 100) * (DEFAULTS.mlWeight * 100);
+    avg = avg + boost;
   }
-  const final = Math.round(Math.max(0, Math.min(100, avg + boost)));
-  // label mapping
-  const label = final >= 75 ? "STRONG" : final >= 60 ? "MODERATE" : final >= 45 ? "WEAK" : "NONE";
-  return { final, label, breakdown, mlBoost: boost };
+  const final = Math.round(Math.max(0, Math.min(100, avg)));
+  const label = final >= 80 ? "STRONG" : final >= 65 ? "MODERATE" : final >= 50 ? "WEAK" : "NONE";
+  return { final, label, breakdown };
 }
 
-// -------------------------
-// TP/SL suggestions (use ell targets & ATR fallback)
-// -------------------------
-function makeTPsAndSLs({ ellSummary, ellTargets, atr, price }) {
+// -------------- TP/SL suggestions (safe and symmetric) --------------
+function suggestTPsAndSLs({ ellResult15 = null, price = 0, atr = 0 }) {
   const tps = [];
   const sls = [];
   try {
-    // Use Elliott targets first
-    if (Array.isArray(ellTargets) && ellTargets.length) {
-      for (const t of ellTargets.slice(0,4)) {
-        const tp = Number(t.tp || t.target || t.price || 0);
-        if (tp && !Number.isNaN(tp)) tps.push({ source: "Elliott", tp, confidence: t.confidence || 50 });
+    // If Elliott provided pattern targets (structured), use them; else create symmetric targets both sides
+    if (ellResult15 && Array.isArray(ellResult15.targets) && ellResult15.targets.length) {
+      for (const t of ellResult15.targets.slice(0, 4)) {
+        const tpVal = Number(t.tp || t.target || t.price || 0);
+        if (tpVal) tps.push({ source: "Elliott", tp: tpVal, confidence: t.confidence || 50 });
       }
     }
-    // If none, fallback to fib ext or ATR multiples
-    if (!tps.length && ellSummary && ellSummary.support && ellSummary.resistance) {
-      // create both side TPs (conservative)
-      tps.push({ source: "fibZone_hi", tp: ellSummary.resistance, confidence: 40 });
-      tps.push({ source: "fibZone_lo", tp: ellSummary.support, confidence: 40 });
-    }
+
     if (!tps.length) {
-      tps.push({ source: "ATR1", tp: price + Math.max(1, atr) * 2, confidence: 30 });
-      tps.push({ source: "ATR2", tp: price + Math.max(1, atr) * 4, confidence: 25 });
+      // fallback: symmetric ATR-based picks
+      const a = Math.max(1, atr || 1);
+      tps.push({ source: "ATR", tp: Number((price + a * 2).toFixed(2)), confidence: 30 });
+      tps.push({ source: "ATR", tp: Number((price - a * 2).toFixed(2)), confidence: 30 });
     }
 
-    // SL: use ATR
-    const slLong = Number((price - Math.max(1, atr) * 2).toFixed(2));
-    const slShort = Number((price + Math.max(1, atr) * 2).toFixed(2));
-    sls.push({ side: "LONG", sl: slLong });
-    sls.push({ side: "SHORT", sl: slShort });
-  } catch (e) {}
+    // stops: simple ATR stops
+    sls.push({ side: "LONG", sl: Number((price - Math.max(1, atr) * 2).toFixed(2)) });
+    sls.push({ side: "SHORT", sl: Number((price + Math.max(1, atr) * 2).toFixed(2)) });
+  } catch (e) { /* ignore */ }
   return { tps, sls };
 }
 
-// -------------------------
-// Debounce check (avoid duplicate alerts)
-// -------------------------
-function recentlyAlerted(symbol, side) {
-  const now = Date.now();
-  const cutoff = now - (GLOBAL_DEFAULTS.debounceSeconds * 1000);
-  _recentAlerts.alerts = (_recentAlerts.alerts || []).filter(a => a.ts >= cutoff);
-  return (_recentAlerts.alerts || []).some(a => a.symbol === symbol && a.side === side);
+// -------------- debounce helpers --------------
+function trimmedAlerts() {
+  _store.alerts = (_store.alerts || []).slice(-DEFAULTS.maxAlertsSaved);
+  return _store.alerts;
 }
-function recordAlert(symbol, side, payload) {
-  _recentAlerts.alerts = _recentAlerts.alerts || [];
-  _recentAlerts.alerts.push({ symbol, side, ts: Date.now(), payload });
-  // trim
-  _recentAlerts.alerts = _recentAlerts.alerts.slice(-GLOBAL_DEFAULTS.maxSavedAlerts);
-  safeSave(ALERT_STORE, _recentAlerts);
+function recentlyAlerted(symbol, side) {
+  const cutoff = Date.now() - DEFAULTS.debounceSeconds * 1000;
+  _store.alerts = (_store.alerts || []).filter(a => a.ts >= cutoff);
+  return (_store.alerts || []).some(a => a.symbol === symbol && a.side === side);
+}
+function recordAlert(symbol, side, meta = {}) {
+  _store.alerts = _store.alerts || [];
+  _store.alerts.push({ symbol, side, ts: Date.now(), meta });
+  _store.alerts = _store.alerts.slice(-DEFAULTS.maxAlertsSaved);
+  safeSave(ALERT_STORE, _store);
 }
 
-// -------------------------
-// Outcome check (feedback) - will call recordOutcome from ml module if predictionId present
-// -------------------------
-async function checkOutcome(predId, symbol, side, priceAtSend, windowSec) {
+// -------------- outcome check (lightweight) --------------
+async function checkOutcomeAndRecord(predId, symbol, side, sentPrice, windowSec = 60) {
   try {
-    const resp = await fetchMarketData(symbol, "1m", 5);
-    const newPrice = resp?.price || priceAtSend;
-    const movedUp = newPrice > priceAtSend;
-    const success = (side === "Bullish") ? movedUp : !movedUp;
-    const realizedReturn = priceAtSend ? ((newPrice - priceAtSend)/Math.max(1,Math.abs(priceAtSend)))*100 : null;
-    // call ml_module.recordOutcome if predId exists
-    if (predId && typeof recordOutcome === "function") {
-      try {
-        recordOutcome(predId, { correct: !!success, realizedReturn: typeof realizedReturn === "number" ? realizedReturn : null, realizedPrice: newPrice });
-      } catch (e) {}
+    const resp = await fetchMarketData(symbol, "1m", 3);
+    const newPrice = resp?.price || sentPrice;
+    const success = (side === "Bullish") ? (newPrice > sentPrice) : (newPrice < sentPrice);
+    const realizedReturn = sentPrice ? ((newPrice - sentPrice) / Math.max(1, Math.abs(sentPrice))) * 100 : null;
+    if (typeof recordOutcome === "function" && predId) {
+      try { recordOutcome(predId, { correct: !!success, realizedReturn, realizedPrice: newPrice }); } catch {}
     }
-    // return summary
-    return { ok: true, predId, windowSec, priceAtSend, newPrice, success, realizedReturn };
+    return { ok: true, predId, windowSec, sentPrice, newPrice, success, realizedReturn };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   }
 }
 
-// -------------------------
-// Main tick (per symbol)
-// -------------------------
-async function evaluateSymbol(symbol, opts = {}, sendAlert = null) {
+// -------------- main evaluator (single tick for a symbol) --------------
+async function evaluateSymbol(symbol, options = {}, sendAlert = null) {
   try {
-    // fetch multi-TF candles
-    const tfs = opts.tfs || GLOBAL_DEFAULTS.tfs;
+    const opts = Object.assign({}, DEFAULTS, options);
+    const tfs = opts.tfs || DEFAULTS.tfs;
+
+    // fetch all TFs in one go (fetchMultiTF should return { "1m":{data,price}, ... })
     const multi = await fetchMultiTF(symbol, tfs);
 
-    // run ML main pred for 15m (best-effort)
+    // run main ML (15m) best-effort
     let mlMain = null;
-    try { mlMain = await runMLPrediction(symbol, "15m"); } catch (e) { mlMain = null; }
+    try { mlMain = await runMLPrediction(symbol, "15m"); } catch {}
 
-    const perTfResults = [];
+    const perTf = [];
 
+    // iterate TFs
     for (const tf of tfs) {
       const entry = multi[tf] || { data: [], price: 0 };
       const candles = entry.data || [];
       const price = entry.price || (candles.at(-1)?.close ?? 0);
 
-      // ell for TF (cheap)
+      // cheap ell only for 15m if enabled
       let ell = null;
-      try { const er = await analyzeElliott(candles); ell = er && er.ok ? er : null; } catch (e) { ell = null; }
-
-      // micro ML (1m/5m) for TFs shorter than or equal 5m
-      let mlMicro = null;
-      if (["1m","5m"].includes(tf)) {
-        try { mlMicro = await runMicroPrediction(symbol, tf, opts.microLookback || 60); } catch (e) { mlMicro = null; }
+      if (tf === "15m" && opts.requireElliottOn15m) {
+        try {
+          const er = await analyzeElliott(candles, { pivotLeft: 3, pivotRight: 3 });
+          if (er && er.ok) ell = er;
+        } catch (e) { ell = null; }
       }
 
-      // compute score
-      const weight = opts.weights && opts.weights[tf] ? opts.weights[tf] : GLOBAL_DEFAULTS.weights[tf] || 0.1;
-      const sc = computeTFScore({ candles, ell, mlMicro, tf, tfWeight: weight });
-      perTfResults.push({
-        tf,
-        price,
-        candles,
-        ell,
-        mlMicro,
-        score: sc.score,
-        weighted: sc.weighted,
-        reasons: sc.reasons,
-        patterns: sc.patterns
-      });
+      // compute TF score (light)
+      const w = (opts.weights && opts.weights[tf]) ? opts.weights[tf] : DEFAULTS.weights[tf] || 0.1;
+      const sc = computeTFScore({ candles, tf, weight: w, ell });
+      perTf.push({ tf, candles, price, ell, score: sc.score, weighted: sc.weighted, reasons: sc.reasons, patterns: sc.patterns });
     }
 
-    // consensus
-    const consensus = buildConsensus(perTfResults, opts.weights || GLOBAL_DEFAULTS.weights, mlMain);
+    // build consensus
+    const consensus = buildConsensus(perTf, mlMain, opts.weights);
 
-    // trend context detection (use 1h/4h if available else 15m)
-    let trendTF = "15m";
-    const higherTF = "1h";
-    let trend = "FLAT";
+    // if below threshold -> no alert
+    if (consensus.final < (opts.minAlertConfidence || DEFAULTS.minAlertConfidence)) {
+      return { alerted: false, score: consensus.final, reason: "below_threshold" };
+    }
+
+    // decide side: majority of TF pattern sides, else mlMain, else based on avg score
+    const bullPatternCount = perTf.filter(r => (r.patterns || []).some(p => p.side === "Bullish")).length;
+    const bearPatternCount = perTf.filter(r => (r.patterns || []).some(p => p.side === "Bearish")).length;
+    let side = "Bullish";
+    if (bullPatternCount > bearPatternCount) side = "Bullish";
+    else if (bearPatternCount > bullPatternCount) side = "Bearish";
+    else if (mlMain && mlMain.label) side = mlMain.label;
+    else side = (consensus.final >= 50) ? "Bullish" : "Bearish";
+
+    // debounce duplicates
+    if (recentlyAlerted(symbol, side)) {
+      slog("debounced duplicate alert", symbol, side, "score:", consensus.final);
+      return { alerted: false, reason: "debounced" };
+    }
+
+    // prepare TPs/SLs from 15m ell or ATR fallback
+    const tf15 = perTf.find(p => p.tf === "15m") || perTf[perTf.length - 1];
+    const price = tf15.price || perTf[0].price || 0;
+    const atr = (tf15.candles && tf15.candles.length) ? indicators.computeATR(tf15.candles) : 0;
+    const ell15 = tf15.ell && tf15.ell.ok ? tf15.ell : null;
+    const { tps, sls } = suggestTPsAndSLs({ ellResult15: ell15, price, atr });
+
+    // compose message (clean)
+    const breakdownTxt = consensus.breakdown.map(b => `${b.tf.toUpperCase()}:${Math.round(b.score)}${(b.patterns && b.patterns.length) ? `(${b.patterns.map(p=>p.name).join(",")})` : ""}`).join(" | ");
+    const mlMainTxt = mlMain ? `${mlMain.label} ${mlMain.prob}%` : "N/A";
+
+    const lines = [
+      `⚡ <b>REVERSAL ALERT</b> — <b>${side}</b> (${consensus.label})`,
+      `Symbol: <b>${symbol}</b> | Confidence: <b>${consensus.final}%</b> | ML(15m): ${mlMainTxt}`,
+      `Trend: ${tf15 ? "15m-based" : "n/a"} | Time: ${nowIST()}`,
+      `Breakdown: ${breakdownTxt}`,
+      `TPs: ${tps.map(x => `${Number(x.tp).toFixed(2)} (${x.source})`).join(" / ")}`,
+      `SLs: ${sls.map(x => `${x.side}:${Number(x.sl).toFixed(2)}`).join(" / ")}`,
+      `Patterns: ${perTf.flatMap(r => (r.patterns || []).map(p => `${r.tf}:${p.name}`)).join(" , ") || "N/A"}`,
+      `ID: pending`
+    ];
+
+    const message = lines.join("\n");
+
+    // recordPrediction if available
+    let predId = null;
     try {
-      const hc = multi[higherTF] || multi["15m"];
-      const closes = (hc?.data || []).map(c => c.close).slice(-10);
-      if (closes.length >= 2) {
-        const last = Number(closes.at(-1)), prev = Number(closes.at(-3) || closes.at(-2));
-        if (last > prev) trend = "UP";
-        else if (last < prev) trend = "DOWN";
+      if (typeof recordPrediction === "function") {
+        predId = await recordPrediction({
+          source: "reversal_watcher_opt",
+          symbol,
+          predictedAt: new Date().toISOString(),
+          label: side,
+          prob: consensus.final,
+          meta: { perTf: perTf.map(p => ({ tf: p.tf, score: p.score })) }
+        });
       }
-    } catch (e) {}
+    } catch (e) { predId = null; }
 
-    // build alert payload if final confidence >= threshold
-    const finalScore = consensus.final; // 0..100
-    if (finalScore >= (opts.minAlertConfidence || GLOBAL_DEFAULTS.minAlertConfidence)) {
-      // decide side: majority of TFs patterns
-      const bullCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bullish")).length;
-      const bearCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bearish")).length;
-      const side = bullCount > bearCount ? "Bullish" : (bearCount > bullCount ? "Bearish" : (mlMain && mlMain.label ? mlMain.label : "Bullish"));
+    // attach predId to message
+    const msgWithId = message.replace("ID: pending", `ID: ${predId || "none"}`);
 
-      // debounce
-      if (recentlyAlerted(symbol, side)) {
-        log("debounced duplicate alert", symbol, side, finalScore);
-        return { alerted: false, reason: "debounced" };
-      }
-
-      // prepare TP/SL using best 15m ell or average ATR
-      const tf15 = perTfResults.find(r => r.tf === "15m") || perTfResults[perTfResults.length-1];
-      const price = tf15.price || perTfResults[0].price || 0;
-      const atr = tf15 && tf15.candles ? indicators.computeATR(tf15.candles) : 0;
-      const ellSummary = tf15.ell && tf15.ell.ok ? { support: tf15.ell.support, resistance: tf15.ell.resistance } : null;
-      const ellTargets = (tf15.ell && tf15.ell.targets) ? tf15.ell.targets : (tf15.ell && tf15.ell.targets) ? tf15.ell.targets : [];
-
-      const { tps, sls } = makeTPsAndSLs({ ellSummary, ellTargets, atr, price });
-
-      // Compose message
-      const breakdownTxt = consensus.breakdown.map(b => `${b.tf.toUpperCase()}:${Math.round(b.score)}${(b.patterns && b.patterns.length) ? `(${b.patterns.map(p=>p.name).join(",")})` : ""}`).join(" | ");
-
-      const mlMainTxt = mlMain ? `${mlMain.label} ${mlMain.prob}%` : "N/A";
-
-      const msgLines = [
-        `⚡ <b>REVERSAL ALERT</b> — <b>${side}</b> (${consensus.label})`,
-        `Symbol: <b>${symbol}</b> | Confidence: <b>${finalScore}%</b> | ML(15m): ${mlMainTxt}`,
-        `Trend: ${trend} | Time: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true })}`,
-        `Breakdown: ${breakdownTxt}`,
-        `TPs: ${tps.map(tp=>`${tp.tp ? Number(tp.tp).toFixed(2) : "n/a"} (${tp.source})`).join(" / ")}`,
-        `SLs: ${sls.map(s=>`${s.side}:${s.sl ? Number(s.sl).toFixed(2) : "n/a"}`).join(" / ")}`,
-        `Patterns: ${perTfResults.flatMap(r => (r.patterns || []).map(p => `${r.tf}:${p.name}`)).join(" , ") || "N/A"}`,
-        `ID: pending`
-      ];
-
-      const text = msgLines.join("\n");
-
-      // send via sendAlert if provided else fallback to console.log
-      let sendRes = null;
+    // send alert (callback) or log
+    if (typeof sendAlert === "function") {
       try {
-        if (typeof sendAlert === "function") {
-          // include meta with recordPrediction
-          const predMeta = {
-            source: "reversal_watcher_vD",
-            consensusScore: finalScore,
-            consensusLabel: consensus.label,
-            perTf: perTfResults.map(r => ({ tf: r.tf, score: r.score, patterns: (r.patterns||[]).map(p=>p.name) })),
-            mlMain
-          };
-          // record prediction in ML store to allow feedback linking
-          let predId = null;
-          try { predId = await recordPrediction({ symbol, predictedAt: new Date().toISOString(), label: side, prob: finalScore, features: predMeta }); } catch (e) { predId = null; }
-          // attach predId to message
-          const withIdText = msgLines.slice(0, -1).concat([`ID: ${predId || "none"}`]).join("\n");
-          sendRes = await sendAlert(withIdText); // user code will sanitize/send to Telegram
-          // record to recent alerts store
-          recordAlert(symbol, side, { ts: Date.now(), score: finalScore, predId, payload: perTfResults });
-          log("alert sent", symbol, side, finalScore, "predId:", predId);
-          // schedule feedback checks
-          (opts.feedbackWindowsSec || GLOBAL_DEFAULTS.feedbackWindowsSec).forEach(async (win) => {
-            setTimeout(async () => {
-              const outcome = await checkOutcome(predId, symbol, side, price, win);
-              log("feedback", symbol, side, "windowSec", win, "outcome:", JSON.stringify(outcome));
-            }, win * 1000);
-          });
-        } else {
-          log("No sendAlert provided — would send:", text);
-          recordAlert(symbol, side, { ts: Date.now(), score: finalScore, payload: perTfResults });
-        }
+        await sendAlert(msgWithId);
       } catch (e) {
-        log("Error sending alert:", e?.message || e);
+        slog("sendAlert failed:", e?.message || e);
       }
-
-      return { alerted: true, score: finalScore, predId: (sendRes && sendRes.predId) || null };
+    } else {
+      slog("ALERT (no sendAlert):", msgWithId);
     }
 
-    // nothing to alert
-    return { alerted: false, score: finalScore, reason: "below_threshold" };
+    // record local alert and persist
+    recordAlert(symbol, side, { score: consensus.final, predId, price, t: new Date().toISOString() });
 
-  } catch (e) {
-    log("evaluateSymbol error:", e?.message || e);
-    return { alerted: false, error: e?.message || String(e) };
+    // schedule lightweight feedback windows (only if predId and recordOutcome exist)
+    if (predId && typeof recordOutcome === "function") {
+      const windows = opts.feedbackWindowsSec || [60, 300]; // 1m, 5m
+      for (const w of windows) {
+        setTimeout(async () => {
+          const out = await checkOutcomeAndRecord(predId, symbol, side, price, w);
+          slog("feedback:", symbol, "window", w, out.ok ? `success:${out.success}` : `err:${out.error}`);
+        }, w * 1000);
+      }
+    }
+
+    persistState();
+    return { alerted: true, score: consensus.final, predId };
+
+  } catch (err) {
+    slog("evaluateSymbol error:", err?.message || err);
+    return { alerted: false, error: err?.message || String(err) };
   }
 }
 
-// -------------------------
-// Public API: start/stop
-// -------------------------
-/**
- * startReversalWatcher(symbol, options, sendAlert)
- * options: { tfs, pollIntervalMs, weights, minAlertConfidence, microLookback, feedbackWindowsSec }
- * sendAlert: async function(text) -> should send (e.g. via aiTraderBot.sendTelegram wrapper)
- */
+// -------------- start / stop --------------
 export function startReversalWatcher(symbol = CONFIG.SYMBOL, options = {}, sendAlert = null) {
-  if (_watcherTimers.has(symbol)) {
-    log("Watcher already running for", symbol);
+  if (_watchers.has(symbol)) {
+    slog("Watcher already running for", symbol);
     return false;
   }
-  const opts = Object.assign({}, GLOBAL_DEFAULTS, options);
-  log("Starting Reversal Watcher for", symbol, "opts:", JSON.stringify({ tfs: opts.tfs, pollIntervalMs: opts.pollIntervalMs, minAlertConfidence: opts.minAlertConfidence }));
+  const opts = Object.assign({}, DEFAULTS, options);
 
-  // tick function
+  slog(`Starting Reversal Watcher for ${symbol} tfs:${JSON.stringify(opts.tfs)} interval:${opts.pollIntervalMs}ms minConf:${opts.minAlertConfidence}`);
+
+  // tick wrapper
   const tick = async () => {
     try {
-      const res = await evaluateSymbol(symbol, opts, sendAlert);
-      if (res && res.error) log("Watcher tick error:", res.error);
+      await evaluateSymbol(symbol, opts, sendAlert);
     } catch (e) {
-      log("Watcher tick exception:", e?.message || e);
+      slog("Tick error:", e?.message || e);
     }
   };
 
-  // immediate run + interval
+  // initial immediate run, then interval
   tick();
-  const id = setInterval(tick, opts.pollIntervalMs || GLOBAL_DEFAULTS.pollIntervalMs);
-  _watcherTimers.set(symbol, id);
+  const id = setInterval(tick, opts.pollIntervalMs || DEFAULTS.pollIntervalMs);
+  _watchers.set(symbol, { id, opts });
   _running = true;
+  persistState();
   return true;
 }
 
 export async function stopReversalWatcher(symbol = null) {
-  try {
-    if (symbol) {
-      const id = _watcherTimers.get(symbol);
-      if (id) { clearInterval(id); _watcherTimers.delete(symbol); }
-    } else {
-      for (const [s, id] of _watcherTimers.entries()) {
-        clearInterval(id);
-        _watcherTimers.delete(s);
-      }
+  if (symbol) {
+    const st = _watchers.get(symbol);
+    if (st) {
+      clearInterval(st.id);
+      _watchers.delete(symbol);
+      slog("Stopped watcher for", symbol);
     }
-    _running = _watcherTimers.size > 0;
-    log("Stopped watcher for", symbol || "ALL");
-    return true;
-  } catch (e) {
-    log("stopReversalWatcher error:", e?.message || e);
-    return false;
+  } else {
+    for (const [s, st] of _watchers.entries()) {
+      clearInterval(st.id);
+      _watchers.delete(s);
+      slog("Stopped watcher for", s);
+    }
   }
+  _running = _watchers.size > 0;
+  persistState();
+  return true;
 }
 
-// -------------------------
-// small export for debug/metrics
-// -------------------------
 export function getWatcherState() {
   return {
     running: _running,
-    symbols: Array.from(_watcherTimers.keys()),
-    recentAlerts: (_recentAlerts.alerts || []).slice(-30),
+    symbols: Array.from(_watchers.keys()),
+    recentAlerts: (_store.alerts || []).slice(-20),
     accuracy: (typeof calculateAccuracy === "function") ? calculateAccuracy() : { accuracy: 0 }
   };
 }
 
-export default {
-  startReversalWatcher,
-  stopReversalWatcher,
-  getWatcherState
-};
+export default { startReversalWatcher, stopReversalWatcher, getWatcherState };
