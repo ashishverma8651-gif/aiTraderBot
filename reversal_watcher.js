@@ -1,237 +1,110 @@
-// ======================================================
-// reversal_watcher.js — FINAL STABLE NON-SPAM EDITION
-// ======================================================
+// reversal_watcher_v9.js (FINAL)
+// Fully compatible with ml_module_v8_6.js
 
-import axios from "axios";
-import CONFIG from "./config.js";
-import { fetchMarketData } from "./utils.js";
+import {
+  runMicroPrediction,
+  runMLPrediction,
+  recordPrediction,
+  recordOutcome
+} from "./ml_module_v8_6.js";
 
-// STATIC ML IMPORT (BEST + MOST STABLE)
-import * as ML from "./ml_module_v8_6.js";
+import { fetchCandleData1m } from "./utils.js";
+import { sendTelegram } from "./telegram.js";
 
-// =============================
-// GLOBAL STATE
-// =============================
-let active = false;
-let pollInterval = null;
+// Memory
+let lastPending = null;
+let lastSignalTime = 0;
 
-let lastAlertSide = null;      // bullish / bearish
-let lastAlertTime = 0;
-let lastConfirmedID = null;
-let lastPendingID = null;
+// ----------- Trend Detector (SUPER IMPORTANT) ----------- //
+function detectTrend(candles) {
+  const closes = candles.slice(-20).map(c => c.close);
+  const slope = closes.at(-1) - closes[0];
+  const pct = slope / closes[0];
 
-const MIN_GAP_MS = 45 * 1000;  // 45 sec anti-spam
-const CONFIRM_GAP_MS = 8 * 1000;
-
-// =============================
-// Multi-TF Weighted Score
-// =============================
-function computeScore(tfData, weights) {
-  let score = 0;
-  for (const tf of Object.keys(weights)) {
-    if (!tfData[tf]) continue;
-    score += tfData[tf].signal * weights[tf];
-  }
-  return Math.round(score);
+  if (pct > 0.003) return "UP";
+  if (pct < -0.003) return "DOWN";
+  return "FLAT";
 }
 
-// =============================
-// Fetch TF Blocks
-// =============================
-async function getTFBlocks(symbol, tfs, lookback = 100) {
-  const out = {};
-  for (let tf of tfs) {
-    try {
-      const d = await fetchMarketData(symbol, tf, lookback);
-      out[tf] = {
-        candles: d?.data || [],
-        price: d?.price || 0,
-        signal: detectTFSignal(d?.data || [])
-      };
-    } catch {
-      out[tf] = null;
+// ----------- Pattern Detector (Stronger than your old one) ----------- //
+function detectReversalPattern(candles) {
+  const c = candles.slice(-3);
+
+  const c1 = c[0];
+  const c2 = c[1];
+  const c3 = c[2];
+
+  const bullEngulf = (c2.close < c2.open) &&
+                     (c3.close > c3.open) &&
+                     (c3.close > c2.open);
+
+  const bearEngulf = (c2.close > c2.open) &&
+                     (c3.close < c3.open) &&
+                     (c3.close < c2.open);
+
+  if (bullEngulf) return "Bullish";
+  if (bearEngulf) return "Bearish";
+
+  return null;
+}
+
+// ----------- VALID REVERSAL FILTERS ----------- //
+function allowReversal(pattern, mlLabel, trend) {
+  if (!pattern) return false;
+
+  // Trend conflict protection (BIG FIX)
+  if (pattern === "Bullish" && trend === "UP") return false;
+  if (pattern === "Bearish" && trend === "DOWN") return false;
+
+  // ML conflict protection
+  if (mlLabel && mlLabel !== pattern && mlLabel !== "Neutral") return false;
+
+  return true;
+}
+
+// ----------- Reversal Watcher Start ----------- //
+export async function runReversalWatcher(symbol = "BTCUSDT") {
+  try {
+    const now = Date.now();
+
+    // TOO FAST LIMITER (NO SPAM)
+    if (now - lastSignalTime < 4000) return;
+
+    // 1m candles
+    const candles = await fetchCandleData1m(symbol, 30);
+    if (!candles || candles.length < 5) return;
+
+    const trend = detectTrend(candles);
+    const pattern = detectReversalPattern(candles);
+
+    // ML CALL SAFE
+    let ml = await runMLPrediction(symbol);
+    if (!ml || ml.error) {
+      ml = { label: "Neutral", prob: 0 };
     }
-  }
-  return out;
-}
 
-// VERY STABLE SIGNAL DETECTOR
-function detectTFSignal(candles) {
-  if (!candles || candles.length < 5) return 0;
+    // Combine
+    const ok = allowReversal(pattern, ml.label, trend);
 
-  const c = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
+    if (!ok) return; // reject low quality signals
 
-  const green = c.close > c.open;
-  const red = c.close < c.open;
+    // Build message
+    const price = candles.at(-1).close;
 
-  const bodyRatio = Math.abs(c.close - c.open) / (c.high - c.low + 1);
-
-  if (green && bodyRatio > 0.35 && c.close > prev.close) return +1;
-  if (red && bodyRatio > 0.35 && c.close < prev.close) return -1;
-
-  return 0;
-}
-
-// =============================
-// Main Reversal Detection
-// =============================
-function detectReversal(score, price, zones) {
-  // entry-zone based reversal
-  for (const z of zones) {
-    if (price >= z.low && price <= z.high) {
-      return {
-        detected: true,
-        side: z.side,
-        zone: z,
-        reason: "Zone-based entry"
-      };
-    }
-  }
-
-  // score-based reversal
-  if (score <= -60) return { detected: true, side: "Bearish", zone: null, reason: "Score Bearish" };
-  if (score >= 60) return { detected: true, side: "Bullish", zone: null, reason: "Score Bullish" };
-
-  return { detected: false };
-}
-
-// Hardcoded clean zones
-function buildZones(tfBlocks) {
-  const zones = [];
-
-  const p = tfBlocks["1m"]?.price || 0;
-  if (!p) return [];
-
-  zones.push({
-    tf: "1m",
-    low: p * 0.9965,
-    high: p * 1.0035,
-    side: "Bearish"
-  });
-
-  zones.push({
-    tf: "1m",
-    low: p * 0.9965,
-    high: p * 1.0035,
-    side: "Bullish"
-  });
-
-  return zones;
-}
-
-// =============================
-// FORMAT PENDING ALERT
-// =============================
-function formatPendingAlert(r, price, score, microML, pendingID) {
-  return `
-⚡ <b>REVERSAL DETECTED (PENDING)</b> — <b>${r.side}</b>
-Symbol: ${CONFIG.SYMBOL}
-Zone: ${r.zone ? `${r.zone.tf} ${r.zone.low.toFixed(2)} - ${r.zone.high.toFixed(2)}` : "—"}
-Score: ${score}% | Price: ${price}
-MicroML: ${microML.label} (${microML.confidence}%)
-PendingID: <code>${pendingID}</code>
+    const msg = 
+`⚡ *REVERSAL DETECTED* (${pattern})
+Symbol: ${symbol}
+Price: ${price}
+Trend: ${trend}
+Pattern: ${pattern}
+MicroML: ${ml.label} (${ml.prob || 0}%)
 `;
-}
 
-// =============================
-// FORMAT CONFIRMED ALERT
-// =============================
-function formatConfirmAlert(r, price, microML, id) {
-  return `
-🟢 <b>REVERSAL CONFIRMED</b> — <b>${r.side}</b>
-Symbol: ${CONFIG.SYMBOL} | Price: ${price}
-MicroML: ${microML.label} (${microML.confidence}%)
-ID: <code>${id}</code>
-`;
-}
+    lastSignalTime = now;
+    lastPending = { id: "pend_" + now };
 
-// =============================
-// START WATCHER
-// =============================
-export function startReversalWatcher(symbol, opts, onAlert) {
-  if (active) return;
-  active = true;
-
-  const {
-    pollIntervalMs,
-    tfs,
-    weights,
-    microLookback
-  } = opts;
-
-  pollInterval = setInterval(async () => {
-    try {
-      // anti-spam hard cap
-      const now = Date.now();
-      if (now - lastAlertTime < MIN_GAP_MS) return;
-
-      // FETCH ALL TFS
-      const tfBlocks = await getTFBlocks(symbol, tfs, 80);
-      const price = tfBlocks["1m"]?.price || 0;
-
-      // SCORE
-      const score = computeScore(tfBlocks, weights);
-
-      // MICRO ML
-      const microML = ML.runMicroPrediction(tfBlocks["1m"].candles, microLookback);
-
-      // ZONES
-      const zones = buildZones(tfBlocks);
-
-      // DETECT
-      const result = detectReversal(score, price, zones);
-      if (!result.detected) return;
-
-      const side = result.side;
-
-      // block duplicates
-      if (lastAlertSide === side && now - lastAlertTime < MIN_GAP_MS) return;
-
-      const pendingID = `pend_${Date.now()}`;
-      lastPendingID = pendingID;
-
-      // SEND PENDING ALERT
-      await onAlert(formatPendingAlert(result, price.toFixed(2), score, microML, pendingID));
-
-      lastAlertSide = side;
-      lastAlertTime = Date.now();
-
-      // CONFIRM AFTER A DELAY
-      setTimeout(async () => {
-        const newPriceBlock = await fetchMarketData(symbol, "1m", 2);
-        const newP = newPriceBlock?.price || price;
-
-        const movedPct = ((newP - price) / price) * 100;
-
-        const ok = (side === "Bullish" && movedPct > 0) ||
-                   (side === "Bearish" && movedPct < 0);
-
-        if (!ok) return;
-
-        const confirmID = `conf_${Date.now()}`;
-
-        if (lastConfirmedID === confirmID) return;
-
-        lastConfirmedID = confirmID;
-
-        await onAlert(formatConfirmAlert(result, newP.toFixed(2), microML, confirmID));
-
-      }, CONFIRM_GAP_MS);
-
-    } catch (err) {
-      console.log("Watcher error:", err.message);
-    }
-  }, pollIntervalMs);
-
-  console.log("📡 Reversal Watcher ON");
-}
-
-// =============================
-// STOP WATCHER
-// =============================
-export function stopReversalWatcher() {
-  active = false;
-  if (pollInterval) clearInterval(pollInterval);
-  pollInterval = null;
+    await sendTelegram(msg);
+  } catch (err) {
+    console.log("Watcher error:", err);
+  }
 }
