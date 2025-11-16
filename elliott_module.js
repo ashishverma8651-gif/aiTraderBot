@@ -431,58 +431,119 @@ function detectMarketStructure(candles, pivots) {
 }
 
 // ----------------------
-// TP/SL generator
+// TP/SL generator (fixed ordering & side-aware)
 // ----------------------
+
 function generateTargets({ price, atr, patterns = [], fib = null, channels = [], orderBlocks = [] }) {
   // Combine pattern targets (if present) and ATR/fib fallback
-  const tps = [];
-  const sls = [];
-  // pattern-based
-  (patterns || []).forEach(p=>{
-    if (p.target) {
-      const tp = Number(p.target);
-      const side = p.side === 'Bullish' ? 'BUY' : 'SELL';
-      // SL: use neckline/structure +/- ATR if available
-      let sl = null;
-      if (p.type === 'HeadAndShoulders' || p.type === 'InverseHeadAndShoulders') {
-        // use neckline +/- ATR
-        sl = p.side === 'Bullish' ? p.pivots[2].price - atr*1.2 : p.pivots[2].price + atr*1.2;
-      } else {
-        sl = p.side === 'Bullish' ? Math.min(...p.pivots.map(x=>x.price)) - atr*1.5 : Math.max(...p.pivots.map(x=>x.price)) + atr*1.5;
-      }
-      tps.push({ source: p.type, side: p.side, tp, confidence: p.confidence || 50 });
-      sls.push({ source: p.type, side: p.side, sl, confidence: p.confidence || 50 });
-    }
-  });
-  // harmonics produce potential exact D targets
-  // if none, use fib ext or ATR multiples
-  if (!tps.length) {
-    if (fib && fib.ext) {
-      // use 1.272 and 1.618
-      tps.push({ source: 'FIB_1.272', side: 'BOTH', tp: fib.ext['1.272'] });
-      tps.push({ source: 'FIB_1.618', side: 'BOTH', tp: fib.ext['1.618'] });
-      sls.push({ source: 'ATR_SL', sl: price - atr*2 });
+  const rawTps = [];
+  const rawSls = [];
+
+  // pattern-based (collect)
+  (patterns || []).forEach(p => {
+    if (p.target == null) return;
+    const tp = Number(p.target);
+    const side = (p.side === 'Bullish') ? 'BUY' : (p.side === 'Bearish' ? 'SELL' : 'BOTH');
+
+    // SL: use neckline/structure +/- ATR if available
+    let sl = null;
+    if (p.type === 'HeadAndShoulders' || p.type === 'InverseHeadAndShoulders') {
+      // use neckline +/- ATR (use pivot center)
+      sl = p.side === 'Bullish' ? (p.pivots[2].price - (atr * 1.2)) : (p.pivots[2].price + (atr * 1.2));
     } else {
-      tps.push({ source: 'ATR_MULT', side: 'BOTH', tp: price + atr*3 });
-      sls.push({ source: 'ATR_SL', sl: price - atr*2 });
+      sl = p.side === 'Bullish'
+        ? Math.min(...p.pivots.map(x => x.price)) - (atr * 1.5)
+        : Math.max(...p.pivots.map(x => x.price)) + (atr * 1.5);
+    }
+
+    rawTps.push({ source: p.type, side, tp: Number(tp), confidence: p.confidence || 50 });
+    rawSls.push({ source: p.type, side, sl: Number(sl), confidence: p.confidence || 50 });
+  });
+
+  // harmonics/fib/ATR fallback if no pattern TPs
+  if (!rawTps.length) {
+    if (fib && fib.ext) {
+      rawTps.push({ source: 'FIB_1.272', side: 'BOTH', tp: Number(fib.ext['1.272']) });
+      rawTps.push({ source: 'FIB_1.618', side: 'BOTH', tp: Number(fib.ext['1.618']) });
+      rawSls.push({ source: 'ATR_SL', side: 'BOTH', sl: Number(price - atr * 2) });
+    } else {
+      rawTps.push({ source: 'ATR_MULT', side: 'BOTH', tp: Number(price + atr * 3) });
+      rawSls.push({ source: 'ATR_SL', side: 'BOTH', sl: Number(price - atr * 2) });
     }
   }
+
   // orderblock based nearest levels
   if (orderBlocks && orderBlocks.length) {
-    orderBlocks.slice(-3).forEach(ob=>{
-      tps.push({ source: 'OrderBlock', side: ob.side, tp: ob.side === 'Bullish' ? ob.levelHigh + atr*2 : ob.levelLow - atr*2, confidence: ob.confidence });
+    orderBlocks.slice(-3).forEach(ob => {
+      const tpVal = ob.side === 'Bullish' ? (ob.levelHigh + atr * 2) : (ob.levelLow - atr * 2);
+      rawTps.push({ source: 'OrderBlock', side: ob.side === 'Bullish' ? 'BUY' : 'SELL', tp: Number(tpVal), confidence: ob.confidence || 50 });
     });
   }
 
-  // dedupe and format numbers
-  const uniqTps = [];
-  const tset = new Set();
-  for (const tp of tps) {
-    const key = `${Math.round(tp.tp||0)}_${tp.source}`;
-    if (!tset.has(key)) { tset.add(key); uniqTps.push(tp); }
+  // Dedupe by exact numeric value (keep last occurrence)
+  const tpMap = new Map(); // key -> tpObj
+  for (const r of rawTps) tpMap.set(Number(r.tp).toFixed(6), r);
+  const deduped = Array.from(tpMap.values());
+
+  // Partition by side to sort properly relative to price
+  const bullish = deduped.filter(x => x.side === 'BUY');
+  const bearish = deduped.filter(x => x.side === 'SELL');
+  const both = deduped.filter(x => x.side === 'BOTH');
+
+  // Helper: distance
+  const dist = (v) => Math.abs(Number(v) - Number(price || 0));
+
+  // For bullish: keep only tps > price (if none, keep all and sort by distance)
+  function sortBull(list) {
+    const above = list.filter(x => Number(x.tp) > Number(price));
+    if (above.length) return above.sort((a,b) => Number(a.tp) - Number(b.tp)); // ascending -> nearest above first
+    return list.sort((a,b) => dist(a.tp) - dist(b.tp)); // fallback
   }
-  return { targets: uniqTps, stops: sls };
+
+  // For bearish: keep only tps < price (if none, keep all and sort by distance)
+  function sortBear(list) {
+    const below = list.filter(x => Number(x.tp) < Number(price));
+    if (below.length) return below.sort((a,b) => Number(b.tp) - Number(a.tp)); // descending -> nearest below first
+    return list.sort((a,b) => dist(a.tp) - dist(b.tp)); // fallback
+  }
+
+  // For BOTH: sort by absolute distance (closest first)
+  function sortBoth(list) {
+    return list.sort((a,b) => dist(a.tp) - dist(b.tp));
+  }
+
+  const sortedTps = [
+    ...sortBull(bullish),
+    ...sortBear(bearish),
+    ...sortBoth(both)
+  ];
+
+  // final formatting: attach rank (TP1, TP2...) and round numbers to sensible decimals
+  const targets = sortedTps.map((t, idx) => ({
+    rank: idx + 1,
+    source: t.source,
+    side: t.side,
+    tp: Number(Number(t.tp).toFixed(2)),
+    confidence: t.confidence || null,
+    distance: Number(dist(t.tp).toFixed(2))
+  }));
+
+  // dedupe stops (keep last for same rounded SL)
+  const slMap = new Map();
+  for (const s of rawSls) {
+    if (s.sl == null) continue;
+    slMap.set(Number(s.sl).toFixed(6), s);
+  }
+  const stops = Array.from(slMap.values()).map(s => ({
+    source: s.source,
+    side: s.side,
+    sl: Number(Number(s.sl).toFixed(2)),
+    confidence: s.confidence || null
+  }));
+
+  return { targets, stops };
 }
+
 
 // ----------------------
 // SCORING & SENTIMENT
