@@ -54,7 +54,8 @@ function computeFusionScore(indObj, ellObj) {
 
     const ellSent = Number(ellObj?.sentiment ?? 0);
     const ellConf = Math.min(1, Number(ellObj?.confidence ?? 0) / 100);
-    score += ellSent * (0.25 * ellConf); weight += 0.25 * ellConf;
+    score += ellSent * (0.25 * ellConf);
+    weight += 0.25 * ellConf;
 
     const normalized = Math.max(-1, Math.min(1, score / Math.max(1e-4, weight)));
     return Number(normalized.toFixed(3));
@@ -169,7 +170,7 @@ function resolveTargetConfidence(t, ell) {
 }
 
 function getTPval(t) {
-  return Number(t.tp || t.target || t.price || t.tp || 0);
+  return Number(t.tp || t.target || t.price || 0);
 }
 
 // MAIN ENGINE
@@ -289,7 +290,6 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     // ML-driven TP selection: choose top target on side with highest combined (ml prob * target confidence)
     function pickMLTP(list, mode) {
       if (!Array.isArray(list) || !list.length) return null;
-      // ml.prob expected as numeric percent (e.g. 72.5). If ml.prob missing, fallback to target confidence only
       const mlProb = (ml && typeof ml.prob === "number") ? ml.prob : null;
       let best = null; let bestScore = -Infinity;
       for (const t of list) {
@@ -319,7 +319,7 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       shorts,
       ml,
       mlAcc,
-      mlDirection: ml?.label || "Neutral",
+      mlDirection: (ml && ml.label) ? ml.label : "Neutral",
       mlLongTP,
       mlShortTP,
       news,
@@ -392,17 +392,22 @@ export async function formatAIReport(report) {
         )
         .join(" | ") || "n/a";
 
-    // ML TP text
+    // ML TP text — ensure match with ML direction; fallbacks to closest if none on side
     let mlTPtxt = "N/A";
-    if (report.mlDirection?.toLowerCase().includes("bull")) {
-      mlTPtxt = report.mlLongTP ? `${nf(Number(report.mlLongTP.tp), 2)} [${report.mlLongTP.confidence}%]` : "N/A";
-    } else if (report.mlDirection?.toLowerCase().includes("bear")) {
-      mlTPtxt = report.mlShortTP ? `${nf(Number(report.mlShortTP.tp), 2)} [${report.mlShortTP.confidence}%]` : "N/A";
+    const mlLabel = (report.ml && report.ml.label) ? report.ml.label.toLowerCase() : (report.mlDirection || "neutral").toLowerCase();
+    if (mlLabel.includes("bull")) {
+      if (report.mlLongTP) mlTPtxt = `${nf(Number(report.mlLongTP.tp), 2)} [${report.mlLongTP.confidence}%]`;
+      else if ((report.longs && report.longs.length)) mlTPtxt = `${nf(Number(report.longs[0].tp),2)} [${report.longs[0].confidence}%]`;
+      else mlTPtxt = "N/A";
+    } else if (mlLabel.includes("bear")) {
+      if (report.mlShortTP) mlTPtxt = `${nf(Number(report.mlShortTP.tp), 2)} [${report.mlShortTP.confidence}%]`;
+      else if ((report.shorts && report.shorts.length)) mlTPtxt = `${nf(Number(report.shorts[0].tp),2)} [${report.shorts[0].confidence}%]`;
+      else mlTPtxt = "N/A";
     } else {
-      // neutral: show both top candidates
-      mlTPtxt = (report.mlLongTP ? `Long: ${nf(Number(report.mlLongTP.tp),2)} [${report.mlLongTP.confidence}%]` : "Long: N/A")
-               + " | " +
-               (report.mlShortTP ? `Short: ${nf(Number(report.mlShortTP.tp),2)} [${report.mlShortTP.confidence}%]` : "Short: N/A");
+      // neutral — show best long and short candidates
+      const longTxt = report.mlLongTP ? `Long: ${nf(Number(report.mlLongTP.tp),2)} [${report.mlLongTP.confidence}%]` : "Long: N/A";
+      const shortTxt = report.mlShortTP ? `Short: ${nf(Number(report.mlShortTP.tp),2)} [${report.mlShortTP.confidence}%]` : "Short: N/A";
+      mlTPtxt = `${longTxt} | ${shortTxt}`;
     }
 
     // News
@@ -456,10 +461,10 @@ SL (short): ${slShort}
 
 <b>ML Prediction</b>
 Label: <b>${report.ml?.label || report.mlDirection || "N/A"}</b>
-Probability: ${report.ml?.prob ?? 0}%
-Direction: <b>${report.mlDirection}</b>
+Probability: ${report.ml?.prob ?? (report.ml && report.ml.prob ? report.ml.prob : 0)}%
+Direction: <b>${report.mlDirection || (report.ml?.label || "N/A")}</b>
 ML Target: ${mlTPtxt}
-Accuracy: ${report.mlAcc}%
+Accuracy: ${report.mlAcc ?? report.mlAcc === 0 ? report.mlAcc : "N/A"}%
 
 <b>News Overview</b>
 ${newsTxt}
