@@ -1,478 +1,390 @@
-// reversal_watcher_v3.js
-// Single-file Reversal Watcher v3 (5m+15m main, 1m micro confirmation + micro-ML)
-// Drop-in replacement: exports startReversalWatcher, stopReversalWatcher, getWatcherState
+// reversal_watcher.js
+// v3 — Reversal Watcher with Entry Zone (Hybrid 5m+15m), MicroML + Feedback + Anti-spam
 //
-// Depends on:
-//  - ./config.js (CONFIG.SYMBOL optional)
-//  - ./utils.js -> fetchMarketData(symbol, tf, limit), fetchMultiTF(symbol, [tfs])
-//  - ./core_indicators.js -> computeRSI, computeMACD, computeATR, volumeTrend (optional)
-//  - ./elliott_module.js -> analyzeElliott (optional)
-//  - ./ml_module_v8_6.js -> runMLPrediction, runMicroPrediction, recordPrediction, recordOutcome, calculateAccuracy
+// Exports: startReversalWatcher(symbol, options, onAlert)
+//          stopReversalWatcher()
+//
+// Depends on (expected to exist in your project):
+//  - fetchMultiTF(symbol, tfs)           // returns { "1m":{data,price}, "5m":..., "15m":..., "1h":... }
+//  - fetchMarketData(symbol, tf, limit)  // returns { price, data }
+//  - runMicroPrediction(symbol)          // quick micro ML (1m/5m) returns { label, prob, probBull, probBear, tpMul, features }
+//  - runMLPrediction(symbol)             // optional full ML for bias/TP
+//  - recordPrediction(pred), recordOutcome(id, outcome)
+//  - indicators helpers optional (computeATR etc.) if available via ./core_indicators.js
 
-import fs from "fs";
-import path from "path";
-
-import CONFIG from "./config.js";
-import { fetchMarketData, fetchMultiTF } from "./utils.js";
-import * as indicators from "./core_indicators.js";
-import { analyzeElliott } from "./elliott_module.js";
-
+import { fetchMultiTF, fetchMarketData } from "./utils.js";
 import {
-  runMLPrediction,
   runMicroPrediction,
+  runMLPrediction,
   recordPrediction,
-  recordOutcome,
-  calculateAccuracy
-} from "./ml_module_v8_6.js";
+  recordOutcome
+} from "./ml_module_v8_6.js"; // adjust name if your ML file differs
+import * as indicators from "./core_indicators.js";
 
-// --------------------
-// Storage & defaults
-// --------------------
-const DATA_DIR = path.resolve(process.cwd(), "cache");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const STORE_PATH = path.join(DATA_DIR, "reversal_watcher_v3_store.json");
+let _watcher = null;
 
-function safeLoad(fp, def = {}) {
-  try { if (!fs.existsSync(fp)) return def; return JSON.parse(fs.readFileSync(fp, "utf8") || "{}"); } catch { return def; }
-}
-function safeSave(fp, obj) {
-  try { fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); return true; } catch { return false; }
-}
+function nowISO() { return new Date().toISOString(); }
+function clamp(v, lo=-1, hi=1){ return Math.max(lo, Math.min(hi, v)); }
 
-const DEFAULTS = Object.assign({
-  tfs: ["5m", "15m"],           // primary analysis TFs
-  entryTf: "5m",                // entry zone TF
-  confirmTf: "1m",              // fast confirmation TF
-  pollIntervalMs: 20 * 1000,
-  pendingThreshold: 58,         // consensus -> pending start
-  confirmCandles: 2,            // closed 1m candles to confirm
-  microMlImmediatePct: 65,      // if micro-ml prob >= this then immediate confirm
-  cooldownSeconds: 120,
-  debounceSeconds: 90,
-  slAtrMul: 2,
-  tpAtrMuls: [2,4],
-  volumeMultiplier: 0.8,
-  maxPendingAgeMs: 60*60*1000,
+function nf(v, d=2){ return (typeof v==="number" && Number.isFinite(v)) ? Number(v).toFixed(d) : "N/A"; }
+
+// default options
+const DEFAULTS = {
+  pollIntervalMs: 20_000,
+  tfs: ["1m","5m","15m"],
+  weights: { "1m":0.25, "5m":0.35, "15m":0.40 },
+  minAlertConfidence: 60,
+  microLookback: 60,
   feedbackWindowsSec: [60, 300],
-  allowNeutral: true
-}, CONFIG.REVERSAL_WATCHER_V3 || {});
+  zoneCfg: {
+    // zone width multipliers relative to ATR (wider zone for 5m, tighter for 15m)
+    "5m": { atrMult: 1.4, padPct: 0.0025 },
+    "15m": { atrMult: 0.9, padPct: 0.0015 }
+  },
+  cooldownSecPerZone: 60,   // don't re-alert same zone within this seconds
+  globalRateLimitSec: 6,    // min seconds between any alert send
+  statusEverySec: 300       // heartbeat/status message every 5 minutes
+};
 
-let STORE = safeLoad(STORE_PATH, { recent: [], pending: [], hourly: [] });
-STORE.recent = Array.isArray(STORE.recent) ? STORE.recent.slice(-1000) : [];
-STORE.pending = Array.isArray(STORE.pending) ? STORE.pending : [];
-STORE.hourly = Array.isArray(STORE.hourly) ? STORE.hourly : [];
-
-// --------------------
-// Helpers
-// --------------------
-function now() { return Date.now(); }
-function nowStr() { return new Date().toISOString(); }
-function recordHourly() {
-  const t = now();
-  STORE.hourly.push(t);
-  STORE.hourly = STORE.hourly.filter(x => x >= t - 3600000);
-  safeSave(STORE_PATH, STORE);
-}
-function hourlyCount() { return STORE.hourly.length; }
-function pruneRecent() {
-  const cutoff = now() - DEFAULTS.debounceSeconds*1000;
-  STORE.recent = STORE.recent.filter(r => r.ts >= cutoff);
-}
-function addRecent(key) {
-  STORE.recent.push({ key, ts: now() });
-  STORE.recent = STORE.recent.slice(-1000);
-  recordHourly();
-  safeSave(STORE_PATH, STORE);
-}
-function recentlyAlerted(key) { pruneRecent(); return STORE.recent.some(r => r.key === key); }
-
-function makeKey(symbol, side, zone, price) {
-  const bucket = Math.round((price||0)/Math.max(1, Math.abs(price||1))*100);
-  return `${symbol}|${side}|${zone}|${bucket}`;
+// helpers: get ATR fallback
+function getATR(candles) {
+  try { return (typeof indicators.computeATR==="function") ? indicators.computeATR(candles) : null; } catch(e){return null;}
 }
 
-// pattern detection (light, used by consensus)
-function detectBasicPatterns(candles) {
-  if (!Array.isArray(candles) || candles.length < 3) return [];
-  const last = candles.at(-1), prev = candles.at(-2), prev2 = candles.at(-3);
-  const patterns = [];
-  const body = Math.abs(last.close - last.open) || 1;
-  const upper = last.high - Math.max(last.open, last.close);
-  const lower = Math.min(last.open, last.close) - last.low;
-
-  if (lower > body*1.6 && upper < body*0.6 && last.close > last.open) patterns.push({name:"Hammer", side:"Bullish", strength:70});
-  if (upper > body*1.6 && lower < body*0.6 && last.close < last.open) patterns.push({name:"ShootingStar", side:"Bearish", strength:70});
-  if (prev.close < prev.open && last.close > last.open && last.close > prev.open && last.open < prev.close) patterns.push({name:"BullishEngulfing", side:"Bullish", strength:65});
-  if (prev.close > prev.open && last.close < last.open && last.open > prev.close && last.close < prev.open) patterns.push({name:"BearishEngulfing", side:"Bearish", strength:65});
-  if (body / ((last.high - last.low)||1) < 0.2) patterns.push({name:"Doji", side:"Neutral", strength:40});
-  return patterns;
+// build zone from level +/- atr-based width or small percent fallback
+function buildZone(level, candles, tf, cfg) {
+  const atr = getATR(candles) || (candles?.length ? (candles.at(-1).close * 0.002) : 0.002);
+  const mult = (cfg?.zoneCfg?.[tf]?.atrMult) ?? 1.0;
+  const padPct = (cfg?.zoneCfg?.[tf]?.padPct) ?? 0.002;
+  const half = Math.max( Math.abs(atr) * mult, Math.abs(level) * padPct );
+  return { lo: level - half, hi: level + half, width: half*2, basisATR: atr };
 }
 
-// compute score per TF
-function computeTfScore(candles, weight=1) {
-  const out = { score:50, reasons:[], patterns:[] };
-  if (!candles || candles.length < 3) return out;
-  const patterns = detectBasicPatterns(candles);
-  if (patterns.length) { const p = patterns[0]; out.patterns.push(p); out.score += (p.side==="Bullish"? p.strength/2: -p.strength/2); out.reasons.push("pattern:"+p.name); }
-
-  try {
-    const rsi = typeof indicators.computeRSI === "function" ? indicators.computeRSI(candles) : 50;
-    const macd = typeof indicators.computeMACD === "function" ? indicators.computeMACD(candles) : {hist:0};
-    const last = candles.at(-1);
-    const vol = (last && (last.vol||last.v||last.volume)) || 0;
-    const window = Math.min(20, candles.length);
-    const avgVol = candles.slice(-window).reduce((s,c)=> s + ((c.vol||c.v||c.volume)||0), 0) / Math.max(1, window);
-
-    if (rsi < 30) { out.score += 8; out.reasons.push("rsi_oversold"); }
-    if (rsi > 70) { out.score -= 8; out.reasons.push("rsi_overbought"); }
-    if (macd && typeof macd.hist === "number") { out.score += macd.hist > 0 ? 6 : -6; out.reasons.push("macd"); }
-    if (avgVol && vol) {
-      if (vol > avgVol * DEFAULTS.volumeMultiplier) { out.score += 6; out.reasons.push("vol_spike"); }
-      if (vol < avgVol*0.6) { out.score -= 3; out.reasons.push("vol_drop"); }
-    }
-  } catch(e){}
-
-  out.score = Math.round(Math.max(0, Math.min(100, out.score)) * (weight||1));
-  return out;
-}
-
-// consensus across tfs
-function buildConsensus(perTfResults, weights = {}) {
-  let sumW = 0, sumS = 0;
-  for (const r of perTfResults) {
-    const w = weights[r.tf] ?? 1;
-    sumW += w;
-    sumS += (r.score||50) * w;
+// internal state
+class WatcherState {
+  constructor(symbol, opts, onAlert) {
+    this.symbol = symbol;
+    this.opts = opts;
+    this.onAlert = onAlert;
+    this.running = false;
+    this.timer = null;
+    this.lastGlobalAlertAt = 0;
+    this.zoneCooldowns = new Map(); // key -> timestamp
+    this.pending = new Map(); // id -> pending object
+    this.confirmed = new Map(); // id -> confirmed object
+    this.statusTimer = null;
   }
-  const avg = sumW ? sumS/sumW : 50;
-  return Math.round(Math.max(0, Math.min(100, avg)));
+  canSendGlobal() {
+    return (Date.now() - this.lastGlobalAlertAt) / 1000 >= this.opts.globalRateLimitSec;
+  }
+  markSent() { this.lastGlobalAlertAt = Date.now(); }
+  zoneKey(tf, side, lo, hi) {
+    // key combining tf+side+rounded zone
+    return `${tf}|${side}|${Math.round(lo)}|${Math.round(hi)}`;
+  }
+  inCooldown(key) {
+    const now = Date.now();
+    const t = this.zoneCooldowns.get(key) || 0;
+    return (now - t) / 1000 < this.opts.cooldownSecPerZone;
+  }
+  setCooldown(key) {
+    this.zoneCooldowns.set(key, Date.now());
+  }
 }
 
-// targets / SL builder (ATR + Elliott if available)
-function buildTargets({ price, atr, ellObj=null }) {
+// build fusion bias simple helper (we keep lightweight)
+function computeTFBias(mtf) {
+  // mtf: [{tf, fusionScore}] -> weighted sum
+  try {
+    const weights = mtf.reduce((s,m)=>s + (m.weight||1), 0) || 1;
+    let sum = 0;
+    for (const m of mtf) {
+      sum += (m.fusionScore || 0) * (m.weight || 1);
+    }
+    return clamp(sum / weights, -1, 1);
+  } catch(e){ return 0; }
+}
+
+// format messages (html/plain)
+function formatPendingMessage(p) {
+  return `⚡ REVERSAL DETECTED (PENDING) —\nSymbol: ${p.symbol}\nZone: ${p.tf} ${nf(p.zone.lo,2)} - ${nf(p.zone.hi,2)}\nScore: ${Math.round(p.score*100)}% | Price: ${nf(p.price,2)}\nTopTPs: ${p.topTPs.join(" / ")}\nSLs: ${p.SLs.join(" / ")}\nMicroML: ${p.micro?.label || "N/A"} ${p.micro?.prob ? "(" + nf(p.micro.prob,2) + "%)" : ""}\nPendingID: ${p.id}`;
+}
+function formatConfirmedMessage(c) {
+  return `🟢 REVERSAL CONFIRMED — ${c.side}\nSymbol: ${c.symbol} | Price: ${nf(c.price,2)}\nTPs: ${c.TPs.join(" / ")}\nSLs: ${c.SLs.join(" / ")}\nSupport: ${c.supportCount || 0} | movedPct: ${nf(c.movedPct*100,3)}%\nID: ${c.id}`;
+}
+function formatFailedMessage(f) {
+  return `🔴 REVERSAL FAILED ${f.symbol} ${f.side}\nReason: ${f.reason}\nID: ${f.id}`;
+}
+function formatStatusMessage(summary) {
+  return `⚙️ REV WATCH STATUS — ${summary.symbol}\nTime: ${new Date().toLocaleString()}\nActive pendings: ${summary.pending}\nConfirmed (last): ${summary.confirmed}\nGlobalRateLimitSec: ${summary.globalRateLimitSec}`;
+}
+
+// decide whether price is inside zone
+function priceInZone(price, zone) {
+  return (price >= zone.lo && price <= zone.hi);
+}
+
+// choose TPs: prefer ML tp multiplier if available, else use Elliott targets or simple ATR multiples
+function chooseTPs(price, mlPred, ellTargets, atr) {
   const tps = [];
-  if (ellObj && Array.isArray(ellObj.targets) && ellObj.targets.length) {
-    ellObj.targets.slice(0,3).forEach(t => {
-      const tpVal = Number(t.tp || t.target || t.price || 0);
-      if (tpVal) tps.push({ source:"Elliott", tp: tpVal, confidence: t.confidence || 50 });
-    });
+  if (ellTargets && ellTargets.length) {
+    // use top upto 3 unique
+    for (const t of ellTargets.slice(0,3)) {
+      const tp = Number(t.tp || t.target || t.price || 0);
+      if (tp && !tps.includes(tp)) tps.push(tp);
+    }
   }
+  if (!tps.length && mlPred && mlPred.tpMul) {
+    const mul = Number(mlPred.tpMul) || 2.0;
+    if (mlPred.label && mlPred.label.toLowerCase().includes("bull")) {
+      tps.push(price * (1 + mul/100));
+      tps.push(price * (1 + (mul*1.5)/100));
+    } else if (mlPred.label && mlPred.label.toLowerCase().includes("bear")) {
+      tps.push(price * (1 - mul/100));
+      tps.push(price * (1 - (mul*1.5)/100));
+    }
+  }
+  // fallback: ATR multiples
   if (!tps.length) {
-    for (const m of DEFAULTS.tpAtrMuls) tps.push({ source:"ATR", tp: Number((price + (atr||1)*m).toFixed(2)), confidence:40 });
+    const a = Math.max(atr || 1, price*0.002);
+    tps.push(price + a*3, price + a*6);
   }
-  const slLong = Number((price - (atr||1)*DEFAULTS.slAtrMul).toFixed(2));
-  const slShort = Number((price + (atr||1)*DEFAULTS.slAtrMul).toFixed(2));
-  return { tps, sls: [ {side:"LONG", sl: slLong}, {side:"SHORT", sl: slShort} ] };
+  // normalize numbers
+  return tps.map(v => Number(v));
 }
 
-// --------------------
-// Evaluate symbol -> create pending
-// --------------------
-async function evaluateSymbol(symbol, opts, sendAlert) {
-  // returns object with status
-  try {
-    const tfs = opts.tfs || DEFAULTS.tfs;
-    const multi = await fetchMultiTF(symbol, tfs.concat([opts.entryTf, opts.confirmTf]).filter((v,i,a)=>a.indexOf(v)===i));
-    // compute per tf scores (primary tfs only)
-    const per = [];
-    for (const tf of tfs) {
-      const entry = multi[tf] || { data: [], price: 0 };
-      const candles = Array.isArray(entry.data) ? entry.data : [];
-      const price = entry.price ?? (candles.at(-1)?.close ?? 0);
-      const weight = (tf === "15m") ? 1.2 : 1.0;
-      const s = computeTfScore(candles, weight);
-      per.push({ tf, score: s.score, patterns: s.patterns, price, candles });
-    }
-
-    const consensus = buildConsensus(per, opts.weights || { "5m":1, "15m":1.2 });
-    if (consensus < (opts.pendingThreshold ?? DEFAULTS.pendingThreshold)) return { alerted:false, reason:"below_threshold", score:consensus };
-
-    // decide side by pattern majority and simple trend
-    let bull=0, bear=0;
-    for (const p of per.flatMap(x=>x.patterns||[])) { if (p.side==="Bullish") bull++; if (p.side==="Bearish") bear++; }
-    // trend via 15m slope if available
-    let trend = "FLAT";
-    try {
-      const c15 = per.find(x=>x.tf==="15m")?.candles || [];
-      if (c15.length >= 3) { const s = c15.at(-1).close - c15.at(-3).close; trend = s>0 ? "UP" : s<0 ? "DOWN" : "FLAT"; }
-    } catch {}
-
-    let side = "Bullish";
-    if (bear > bull) side = "Bearish";
-    else if (bull === bear) side = (trend==="UP" ? "Bullish" : trend==="DOWN" ? "Bearish" : "Bullish");
-
-    // entry zone: recent 5m candle high/low +/- small buffer
-    const entryTf = opts.entryTf || DEFAULTS.entryTf;
-    const entryCandles = (multi[entryTf] && Array.isArray(multi[entryTf].data)) ? multi[entryTf].data : [];
-    const lastEntry = entryCandles.at(-1) || {};
-    const zoneHigh = lastEntry.high || lastEntry.close || 0;
-    const zoneLow = lastEntry.low || lastEntry.close || 0;
-    const priceRef = per[0]?.price ?? (zoneHigh || zoneLow || 0);
-    const zoneName = `${entryTf}_${Math.round(zoneLow)}_${Math.round(zoneHigh)}`;
-    const key = makeKey(symbol, side, zoneName, priceRef);
-
-    // debounce / rate
-    if (recentlyAlerted(key)) return { alerted:false, reason:"debounced" };
-    if (hourlyCount() > 500) return { alerted:false, reason:"rate_limit" }; // safe guard
-
-    // micro-ML immediate check: if micro predicts strongly same side, confirm immediately
-    let micro = null;
-    try {
-      micro = await runMicroPrediction(symbol, opts.microLookbackSec || 60);
-    } catch {}
-    const microStrong = micro && typeof micro.prob === "number" && micro.prob >= (opts.microMlImmediatePct || DEFAULTS.microMlImmediatePct) &&
-                        ((side === "Bullish" && (micro.label||"").toLowerCase().includes("bull")) || (side==="Bearish" && (micro.label||"").toLowerCase().includes("bear")));
-
-    // create pending record
-    const id = `pend_v3_${Date.now()}_${Math.floor(Math.random()*9000)}`;
-    const pending = {
-      id, key, symbol, side, createdAt: now(), priceAtDetect: priceRef,
-      zone: { high: zoneHigh, low: zoneLow, tf: entryTf }, consensus, perTf: per,
-      predId: null, status: "pending", requiredCandles: opts.confirmCandles || DEFAULTS.confirmCandles,
-      confirmationTf: opts.confirmTf || DEFAULTS.confirmTf
-    };
-
-    // record pred (if recordPrediction exists)
-    try {
-      pending.predId = await recordPrediction({
-        symbol, predictedAt: nowStr(), label: side, prob: consensus, features: { perTf: per.map(p=>({tf:p.tf,score:p.score})) }, meta:{source:"rev_watcher_v3"}
-      });
-    } catch { pending.predId = null; }
-
-    STORE.pending = STORE.pending || [];
-    STORE.pending.push(pending);
-    safeSave(STORE_PATH, STORE);
-
-    // build preview alert
-    let atr = 0;
-    try { atr = indicators.computeATR(per.find(x=>x.tf==="15m")?.candles || []) || 0; } catch {}
-    let ell = null;
-    try { ell = await analyzeElliott(per.find(x=>x.tf==="15m")?.candles || []); } catch {}
-    const { tps, sls } = buildTargets({ price: priceRef, atr, ellObj: ell && ell.ok ? ell : null });
-
-    const previewMsg = [
-      `⚡ <b>REVERSAL DETECTED (PENDING)</b> — <b>${side}</b>`,
-      `Symbol: <b>${symbol}</b> | Zone: ${entryTf} ${zoneLow} - ${zoneHigh}`,
-      `Score: <b>${consensus}%</b> | Price: ${Number(priceRef).toFixed(4)}`,
-      `Top TPs: ${tps.slice(0,2).map(x=>`${x.tp}(${x.source})`).join(" / ")}`,
-      `SLs: ${sls.map(s=>s.sl).join(" / ")}`,
-      `MicroML: ${micro ? `${micro.label} ${Math.round(micro.prob)}%` : "N/A"}`,
-      `PendingID: ${id}`
-    ].join("\n");
-
-    // send preview
-    try { if (typeof sendAlert === "function") await sendAlert(previewMsg); } catch(e){}
-
-    // if micro strong -> immediate confirm shortcut
-    if (microStrong) {
-      // mark confirmed and send final immediately
-      const confirmed = {
-        ...pending,
-        status: "confirmed_micro",
-        confirmedAt: now(),
-        confirmedBy: "microML"
-      };
-      // create final message
-      const finalMsg = [
-        `🟢 <b>REVERSAL CONFIRMED (MICRO ML)</b> — <b>${side}</b>`,
-        `Symbol: <b>${symbol}</b> | Zone: ${entryTf} ${zoneLow} - ${zoneHigh}`,
-        `Detected: ${Number(priceRef).toFixed(4)} | MicroML: ${micro.label} ${Math.round(micro.prob)}%`,
-        `TPs: ${tps.map(x=>x.tp).join(" / ")}`,
-        `SLs: ${sls.map(x=>x.sl).join(" / ")}`,
-        `ID: ${id}`
-      ].join("\n");
-      try { if (typeof sendAlert === "function") await sendAlert(finalMsg); } catch(e){}
-      // update store/outcome
-      addRecent(key);
-      updatePendingStatus(id, "sent_micro");
-      if (pending.predId) {
-        try { await recordOutcome(pending.predId, { correct: true, realizedPrice: priceRef }); } catch {}
-      }
-      // schedule post-feedback checks
-      scheduleFeedbackChecks(pending, opts, sendAlert);
-      return { alerted:true, pendingId:id, microConfirmed:true };
-    }
-
-    return { alerted:true, pendingId:id, microConfirmed:false };
-  } catch (e) {
-    return { alerted:false, error: String(e) };
-  }
-}
-
-// --------------------
-// Pending processor: confirm and finalize
-// --------------------
-async function confirmPendingRecord(p) {
-  // uses confirmationTF and requiredCandles
-  try {
-    const tf = p.confirmationTf || DEFAULTS.confirmTf;
-    const req = p.requiredCandles || DEFAULTS.confirmCandles;
-    const resp = await fetchMarketData(p.symbol, tf, req + 3);
-    const candles = resp?.data || [];
-    const closed = candles.slice(-(req+1), -1);
-    if (closed.length < req) return { ok:false, reason:"not_enough_closed" };
-
-    // simple supportive votes
-    let support = 0;
-    for (const c of closed) {
-      const up = c.close > c.open;
-      const body = Math.abs(c.close - c.open) || 1;
-      const lowWick = Math.min(c.open,c.close) - c.low;
-      const upWick = c.high - Math.max(c.open,c.close);
-
-      if (p.side === "Bullish" && up) support++;
-      if (p.side === "Bearish" && !up) support++;
-      if (p.side === "Bullish" && lowWick > body*1.5) support++;
-      if (p.side === "Bearish" && upWick > body*1.5) support++;
-    }
-    const need = Math.ceil(closed.length * 0.6);
-    const ok = support >= need;
-
-    return { ok, support, need, closedLast: closed.at(-1), movedPct: ((closed.at(-1).close - closed[0].close)/Math.max(1, Math.abs(closed[0].close))) * 100 };
-  } catch (e) {
-    return { ok:false, reason: String(e) };
-  }
-}
-
-function updatePendingStatus(id, status, extra={}) {
-  STORE.pending = STORE.pending || [];
-  for (let i=0;i<STORE.pending.length;i++) {
-    if (STORE.pending[i].id === id) {
-      STORE.pending[i].status = status;
-      if (extra) STORE.pending[i].meta = Object.assign({}, STORE.pending[i].meta || {}, extra);
-      STORE.pending[i].closedAt = now();
-      break;
-    }
-  }
-  safeSave(STORE_PATH, STORE);
-}
-function removePending(id) {
-  STORE.pending = (STORE.pending||[]).filter(x=>x.id!==id);
-  safeSave(STORE_PATH, STORE);
-}
-function scheduleFeedbackChecks(pending, opts={}, sendAlert=async()=>{}) {
-  const wins = opts.feedbackWindowsSec || DEFAULTS.feedbackWindowsSec;
-  wins.forEach(win=>{
-    setTimeout(async ()=>{
-      try {
-        const outcome = await checkPostOutcome(pending, win);
-        updatePendingStatus(pending.id, outcome.success ? "done" : "failed", outcome);
-        if (pending.predId) {
-          try { await recordOutcome(pending.predId, { correct: !!outcome.success, realizedReturn: outcome.realizedReturn, realizedPrice: outcome.newPrice }); } catch {}
-        }
-        // optionally send short feedback alert
-        try { if (typeof sendAlert === "function") await sendAlert(`🧾 Feedback: ${pending.symbol} ${pending.side} -> ${outcome.success ? "SUCCESS":"FAIL"} | window ${win}s`); } catch {}
-        // remove after small delay
-        setTimeout(()=> removePending(pending.id), 2000);
-      } catch(e){}
-    }, win*1000);
-  });
-}
-
-async function checkPostOutcome(pending, windowSec) {
-  try {
-    const resp = await fetchMarketData(pending.symbol, "1m", Math.max(3, Math.ceil(windowSec/60)+2));
-    const newPrice = resp?.price ?? null;
-    const orig = pending.priceAtDetect || (pending.perTf && pending.perTf[0] && pending.perTf[0].price) || 0;
-    const success = pending.side === "Bullish" ? (newPrice > orig) : (newPrice < orig);
-    const realizedReturn = orig ? ((newPrice - orig) / Math.max(1, Math.abs(orig))) * 100 : null;
-    return { ok:true, predId: pending.predId, windowSec, priceAtSend: orig, newPrice, success, realizedReturn };
-  } catch (e) { return { ok:false, error: String(e) }; }
-}
-
-// --------------------
-// processAllPending loop
-// --------------------
-async function processAllPending(sendAlert, opts={}) {
-  const list = Array.isArray(STORE.pending) ? STORE.pending.slice() : [];
-  for (const p of list) {
-    try {
-      if (now() - (p.createdAt||0) > (opts.maxPendingAgeMs||DEFAULTS.maxPendingAgeMs)) {
-        updatePendingStatus(p.id, "expired");
-        removePending(p.id);
-        continue;
-      }
-      const conf = await confirmPendingRecord(p);
-      if (!conf.ok) {
-        if (conf.reason === "not_enough_closed") continue;
-        // failed: notify & record outcome
-        try { if (typeof sendAlert === "function") await sendAlert(`🔴 <b>REVERSAL FAILED</b> ${p.symbol} ${p.side}\nReason: ${conf.reason || "invalidated"}`); } catch {}
-        if (p.predId) { try { await recordOutcome(p.predId, { correct:false, realizedPrice: conf.closedLast?.close || null }); } catch {} }
-        updatePendingStatus(p.id, "failed", conf);
-        removePending(p.id);
-        continue;
-      }
-      // confirmed -> final alert
-      const lastClose = conf.closedLast.close;
-      const atr = (()=>{ try { return indicators.computeATR(p.perTf.find(x=>x.tf==="15m")?.candles||[]) || 0; } catch(e){ return 0; } })();
-      let ell = null;
-      try { ell = await analyzeElliott(p.perTf.find(x=>x.tf==="15m")?.candles || []); } catch {}
-      const { tps, sls } = buildTargets({ price: p.priceAtDetect || lastClose, atr, ellObj: ell && ell.ok ? ell : null });
-
-      const finalMsg = [
-        `🟢 <b>REVERSAL CONFIRMED</b> — <b>${p.side}</b>`,
-        `Symbol: <b>${p.symbol}</b> | Price: ${Number(lastClose).toFixed(4)}`,
-        `TPs: ${tps.map(x=>x.tp).join(" / ")}`,
-        `SLs: ${sls.map(x=>x.sl).join(" / ")}`,
-        `Support: ${conf.support}/${conf.need} | movedPct: ${conf.movedPct.toFixed(3)}%`,
-        `ID: ${p.id}`
-      ].join("\n");
-
-      try { if (typeof sendAlert === "function") await sendAlert(finalMsg); } catch {}
-
-      updatePendingStatus(p.id, "sent_confirm");
-      addRecent(p.key);
-      // schedule feedback checks
-      scheduleFeedbackChecks(p, opts, sendAlert);
-    } catch(e) {
-      // swallow
-    }
-  }
-}
-
-// --------------------
-// Public start/stop
-// --------------------
-let _timers = new Map();
-
-export function startReversalWatcher(symbol = CONFIG.SYMBOL, options = {}, sendAlert = async ()=>{}) {
-  if (_timers.has(symbol)) return false;
-  const opts = Object.assign({}, DEFAULTS, options || {});
-  // tick: detect candidates
-  const tick = async ()=> {
-    try { await evaluateSymbol(symbol, opts, sendAlert); } catch(e){ /* swallow */ }
-  };
-  // pend processor
-  const pend = async ()=> {
-    try { await processAllPending(sendAlert, opts); } catch(e){ /* swallow */ }
-  };
-
-  // run immediately
-  tick();
-  const t1 = setInterval(tick, opts.pollIntervalMs || DEFAULTS.pollIntervalMs);
-  const t2 = setInterval(pend, Math.max(5000, Math.floor((opts.confirmCandles||2)*15000))); // frequent pend checks
-  _timers.set(symbol, { t1, t2 });
-  return true;
-}
-
-export async function stopReversalWatcher(symbol=null) {
-  if (symbol) {
-    const rec = _timers.get(symbol);
-    if (rec) { clearInterval(rec.t1); clearInterval(rec.t2); _timers.delete(symbol); }
+// choose SLs: use ATR or small percent
+function chooseSLs(price, side, atr) {
+  const a = Math.max(atr || 1, price*0.0015);
+  if (side === "Bullish") {
+    // long SL below
+    return [ price - a*2, price - a*4 ].map(v => Number(v));
   } else {
-    for (const [k, rec] of _timers.entries()) { clearInterval(rec.t1); clearInterval(rec.t2); _timers.delete(k); }
+    return [ price + a*2, price + a*4 ].map(v => Number(v));
   }
-  return true;
 }
 
-export function getWatcherState() {
-  return {
-    running: _timers.size > 0,
-    symbols: Array.from(_timers.keys()),
-    pending: STORE.pending.slice(-50),
-    recent: STORE.recent.slice(-50),
-    accuracy: (typeof calculateAccuracy === "function") ? calculateAccuracy() : { accuracy: 0 }
-  };
+// MAIN: detect zones from ell/fib and build candidates (both buy & sell)
+async function discoverZones(symbol, multi, opts) {
+  // returns array of { tf, side, zone, priceRef, scoreHint, ellTargets, ellSupport, ellRes }
+  const zones = [];
+  // for each TF we try to get ell summary: safe fallback to fib levels or simple pivots
+  for (const tf of opts.tfs) {
+    const entry = multi[tf] || {};
+    const candles = entry.data || [];
+    const price = (entry.price || candles?.at(-1)?.close || 0);
+    // try to get ell info from analyzeElliott (assumed present in multi object e.g. multi[tf].ell)
+    const ell = entry.ell || entry.elliott || null;
+    // prefer ell pivots: support/resistance
+    let sup = ell?.support || null;
+    let res = ell?.resistance || null;
+    // fallback: simple fib or last swing extremes (cheap)
+    if (!sup || !res) {
+      // derive simple recent high/low (last 20)
+      const recent = (candles.length >= 20) ? candles.slice(-20) : candles;
+      const highs = recent.map(c=>c.high||c.h||c[2]||0);
+      const lows = recent.map(c=>c.low||c.l||c[3]||0);
+      const hi = highs.length ? Math.max(...highs) : null;
+      const lo = lows.length ? Math.min(...lows) : null;
+      if (!res && hi) res = hi;
+      if (!sup && lo) sup = lo;
+    }
+    // build buy zone (around support) and sell zone (around resistance)
+    if (sup) {
+      const zone = buildZone(sup, candles, tf, opts);
+      zones.push({ tf, side: "Bullish", zone, priceRef: price, scoreHint: 0.6, ell, ellTargets: ell?.targets || [] });
+    }
+    if (res) {
+      const zone = buildZone(res, candles, tf, opts);
+      zones.push({ tf, side: "Bearish", zone, priceRef: price, scoreHint: 0.6, ell, ellTargets: ell?.targets || [] });
+    }
+  }
+  return zones;
 }
 
-export default { startReversalWatcher, stopReversalWatcher, getWatcherState };
+// pending -> confirm logic
+async function processPending(state, p) {
+  // p: pending object { id, symbol, tf, zone, side, score, createdAt, priceAtDetect, topTPs, SLs, micro, ml }
+  const windowSec = state.opts.feedbackWindowsSec[0] || 60; // primary short window (1m)
+  try {
+    // wait lookback seconds then check price movement
+    await new Promise(r => setTimeout(r, Math.max(1000, Math.min(windowSec*1000, 30_000))));
+    const resp = await fetchMarketData(p.symbol, "1m", 3);
+    const newPrice = resp?.price ?? null;
+    if (newPrice === null) {
+      // mark failed (no price)
+      await finalizeFailed(state, p, "no_price");
+      return;
+    }
+    // compute realized move relative to priceAtDetect
+    const priceAtSend = (p.priceAtDetect || p.price) || newPrice;
+    const ret = (newPrice - priceAtSend) / Math.max(1, Math.abs(priceAtSend));
+    const success = (p.side === "Bullish") ? (ret > 0) : (ret < 0);
+    const movedPct = ret;
+    if (success) {
+      // confirm
+      const confirmed = {
+        id: p.id,
+        symbol: p.symbol,
+        side: p.side,
+        price: newPrice,
+        TPs: p.topTPs,
+        SLs: p.SLs,
+        supportCount: 2,
+        movedPct,
+        createdAt: nowISO()
+      };
+      state.confirmed.set(p.id, confirmed);
+      // send confirmed msg (throttle check)
+      if (state.canSendGlobal()) {
+        await state.onAlert(formatConfirmedMessage(confirmed));
+        state.markSent();
+      }
+      // record feedback/outcome to ML store if available
+      try {
+        await recordOutcome(p.predId || p.id, { correct: true, realizedReturn: ret, realizedPrice: newPrice });
+      } catch(e) {}
+    } else {
+      // failed
+      await finalizeFailed(state, p, "invalidated");
+    }
+  } catch(e) {
+    await finalizeFailed(state, p, "error:" + (e?.message||String(e)));
+  } finally {
+    // cleanup pending
+    state.pending.delete(p.id);
+  }
+}
+
+async function finalizeFailed(state, p, reason="invalidated") {
+  try {
+    const f = { id: p.id, symbol: p.symbol, side: p.side, reason, createdAt: nowISO() };
+    if (state.canSendGlobal()) {
+      await state.onAlert(formatFailedMessage(f));
+      state.markSent();
+    }
+    try { await recordOutcome(p.predId || p.id, { correct:false, realizedReturn: 0 }); } catch(e){}
+  } catch(e){}
+}
+
+// main watcher tick
+async function tick(state) {
+  try {
+    // fetch multi-tf candles (1m/5m/15m)
+    const multi = await fetchMultiTF(state.symbol, state.opts.tfs);
+    const mtfArray = [];
+    for (const tf of state.opts.tfs) {
+      const entry = multi[tf] || {};
+      const ind = {};
+      ind.ATR = (typeof indicators.computeATR === "function") ? indicators.computeATR(entry.data || []) : null;
+      ind.RSI = (typeof indicators.computeRSI === "function") ? indicators.computeRSI(entry.data || []) : null;
+      ind.MACD = (typeof indicators.computeMACD === "function") ? (indicators.computeMACD(entry.data || [])).hist : null;
+      mtfArray.push({ tf, fusionScore: (entry.fusionScore ?? 0), weight: state.opts.weights[tf] ?? 1, ind, entry });
+    }
+
+    // discover entry zones (support/resistance)
+    const zones = await discoverZones(state.symbol, multi, state.opts);
+
+    // current price (from 1m)
+    const m1 = multi["1m"] || {};
+    const price = m1.price || (m1.data?.at(-1)?.close) || (multi["5m"]?.price) || 0;
+
+    // microML quick
+    let micro = null;
+    try { micro = await runMicroPrediction(state.symbol); } catch(e){ micro = null; }
+
+    // for each zone candidate check if price is inside (both 5m & 15m logic: prefer confirmed when both hit)
+    for (const z of zones) {
+      // construct key & de-dupe
+      const key = state.zoneKey(z.tf, z.side, z.zone.lo, z.zone.hi);
+      if (state.inCooldown(key)) continue;
+
+      if (priceInZone(price, z.zone)) {
+        // build pending object
+        const id = "pend_v3_" + Date.now() + "_" + Math.floor(Math.random()*9000);
+        const ellTargets = (z.ellTargets || []).map(t => Number(t.tp || t.target || t.price || 0)).filter(v=>v);
+        // get ml full prediction optionally (non-blocking)
+        let ml = null;
+        try { ml = await runMLPrediction(state.symbol); } catch(e){ ml = null; }
+        const tps = chooseTPs(price, ml, ellTargets, z.zone.basisATR);
+        const sls = chooseSLs(price, z.side, z.zone.basisATR);
+        const pending = {
+          id, symbol: state.symbol, tf: z.tf, zone: z.zone, side: z.side,
+          score: (z.scoreHint || 0.6), price, priceAtDetect: price,
+          topTPs: tps, SLs: sls, micro, ml, ell: z.ell || null,
+          createdAt: nowISO()
+        };
+
+        // record prediction to ML store (so we can tie later)
+        try {
+          const predRec = { id, symbol: state.symbol, label: z.side, price, createdAt: nowISO(), features: { tf:z.tf } };
+          const predId = await recordPrediction(predRec);
+          if (predId) pending.predId = predId;
+        } catch(e){}
+
+        // send pending alert (respect global rate limit)
+        if (state.canSendGlobal()) {
+          await state.onAlert(formatPendingMessage(pending));
+          state.markSent();
+        }
+        // push pending and start async monitor
+        state.pending.set(id, pending);
+        state.setCooldown(key); // start zone cooldown immediately to avoid duplicates
+        // kick background checker
+        processPending(state, pending).catch(()=>{});
+      }
+    }
+
+    // optionally send a periodic status summary (every statusEverySec)
+    // maintained by separate timer below - so not here
+
+  } catch (e) {
+    // swallow and log (if you have logger, print)
+    try { console.error("reversalWatcher tick err:", e?.message || e); } catch(e2){}
+  }
+}
+
+export function startReversalWatcher(symbol = "BTCUSDT", options = {}, onAlert = async (msg)=>{ console.log(msg); }) {
+  if (_watcher && _watcher.running) {
+    console.log("Reversal watcher already running for", _watcher.symbol);
+    return _watcher;
+  }
+  const opts = Object.assign({}, DEFAULTS, options || {});
+  const state = new WatcherState(symbol, opts, onAlert);
+  _watcher = state;
+  state.running = true;
+
+  // primary polling
+  state.timer = setInterval(() => {
+    tick(state).catch(()=>{});
+  }, Math.max(2000, opts.pollIntervalMs || 20_000));
+  // fire one immediate tick
+  tick(state).catch(()=>{});
+
+  // periodic status heartbeat (every opts.statusEverySec)
+  state.statusTimer = setInterval(async () => {
+    try {
+      const summary = { symbol, pending: state.pending.size, confirmed: state.confirmed.size, globalRateLimitSec: state.opts.globalRateLimitSec };
+      if (state.canSendGlobal()) {
+        await state.onAlert(formatStatusMessage(summary));
+        state.markSent();
+      }
+    } catch(e){}
+  }, Math.max(60_000, opts.statusEverySec || 300_000));
+
+  console.log("Reversal Watcher Started v3 for", symbol);
+  return state;
+}
+
+export async function stopReversalWatcher() {
+  if (!_watcher) return;
+  try {
+    _watcher.running = false;
+    if (_watcher.timer) clearInterval(_watcher.timer);
+    if (_watcher.statusTimer) clearInterval(_watcher.statusTimer);
+    _watcher = null;
+    console.log("Reversal Watcher stopped");
+  } catch(e){}
+}
+
+export default { startReversalWatcher, stopReversalWatcher };
