@@ -1,5 +1,6 @@
-// reversal_watcher_strict.js — Single-file STRICT watcher
+// reversal_watcher.js — FINAL single-file (Clean alerts + confirmation + ML feedback)
 // Requires: config.js, utils.js (fetchMultiTF, fetchMarketData), elliott_module.js, core_indicators.js, ml_module_v8_6.js
+
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
@@ -20,108 +21,72 @@ import {
 const DATA_DIR = path.resolve(process.cwd(), "cache");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const STORE_FILE = path.join(DATA_DIR, "reversal_watcher_strict_store.json");
-const LOG_FILE = path.join(DATA_DIR, "reversal_watcher_strict_log.txt");
+const STORE_FILE = path.join(DATA_DIR, "reversal_watcher_store.json");
+const LOG_FILE = path.join(DATA_DIR, "reversal_watcher_log.txt");
 
-// Safe JSON helpers (single definitions)
+function log(...args) {
+  const line = `[${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true })}] ${args.join(" ")}`;
+  try { fs.appendFileSync(LOG_FILE, line + "\n"); } catch (e) {}
+  // also print to console for dev
+  console.log(line);
+}
+
 function safeLoad(fp, def = {}) {
-  try {
-    if (!fs.existsSync(fp)) return def;
-    const txt = fs.readFileSync(fp, "utf8");
-    return txt ? JSON.parse(txt) : def;
-  } catch (e) {
-    console.warn("safeLoad err", e?.message || e);
-    return def;
-  }
+  try { if (!fs.existsSync(fp)) return def; const txt = fs.readFileSync(fp,"utf8"); return txt ? JSON.parse(txt) : def; }
+  catch (e) { return def; }
 }
 function safeSave(fp, obj) {
-  try {
-    fs.writeFileSync(fp, JSON.stringify(obj, null, 2));
-    return true;
-  } catch (e) {
-    console.warn("safeSave err", e?.message || e);
-    return false;
-  }
-}
-function log(...args) {
-  try {
-    const line = `[${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true })}] ${args.join(" ")}`;
-    fs.appendFileSync(LOG_FILE, line + "\n");
-    console.log(line);
-  } catch (e) {
-    console.log("log:", ...args);
-  }
+  try { fs.writeFileSync(fp, JSON.stringify(obj, null, 2)); return true; } catch (e) { log("safeSave err", e?.message || e); return false; }
 }
 
 // -------------------------
-// Defaults (STRICT mode)
+// Defaults (tunable via CONFIG.REVERSAL_WATCHER)
 // -------------------------
 const DEFAULTS = Object.assign({
-  tfs: ["1m", "5m", "15m"],
+  tfs: ["1m","5m","15m"],
   weights: { "1m": 0.25, "5m": 0.35, "15m": 0.4 },
-  pollIntervalMs: 20 * 1000,
-  minAlertConfidence: 75,        // strict: require high consensus
-  mlGateMinProb: 60,             // require ml main prob >= 60
-  confirmationCandles: 3,        // strict: 3 candles on confirmation TF
-  confirmationTF: "1m",
-  debounceSeconds: 600,          // cooldown after confirmed alert (10 min)
-  pendingThresholdOffset: -5,    // start pending when consensus >= minAlertConfidence - 5
-  microMlGateDelta: 3,           // micro ML contradictory guard (percent)
-  feedbackWindowsSec: [60, 300],
-  maxSavedAlerts: 2000,
-  requireMLGate: true,
-  maxAlertsPerHour: 4,           // stricter rate limit
+  pollIntervalMs: 20000,
+  pendingThreshold: 60,         // candidate threshold to enter pending (slightly below final alert threshold)
+  minAlertConfidence: 70,       // final confidence threshold for first quick alert (if you want immediate)
+  confirmCandles: 3,            // number of subsequent closed candles needed for confirmation
+  confirmTF: "1m",              // confirmation TF
+  debounceSeconds: 180,         // cooldown for duplicate key
+  cooldownAfterConfirmSec: 300, // cooldown after a confirmed sent alert
+  mlGateMinProb: 40,            // if ML main prob < this and consensus weak, block candidate
+  microMlGateDelta: 6,          // micro ml contradictory delta percent
+  maxSaved: 2000,
+  maxAlertsPerHour: 6,
+  enablePatternBoost: true,
   patternBoostPoints: 45,
-  enablePatternBoost: true
+  feedbackWindowsSec: [60, 300]
 }, CONFIG.REVERSAL_WATCHER || {});
 
 // -------------------------
-// Internal state (single store)
- // store = { alerts: [...], pending: [...], hourly: [...] }
-const _store = safeLoad(STORE_FILE, { alerts: [], pending: [], hourly: [] });
-
-// normalize
-_store.alerts = Array.isArray(_store.alerts) ? _store.alerts.slice(-DEFAULTS.maxSavedAlerts) : [];
-_store.pending = Array.isArray(_store.pending) ? _store.pending : [];
-_store.hourly = Array.isArray(_store.hourly) ? _store.hourly : [];
-
-// watcher timers
-let _watcherTimers = new Map();
-let _running = false;
-
+// Persistent store in cache
 // -------------------------
-// Utility helpers
-// -------------------------
+const STORE = safeLoad(STORE_FILE, { alerts: [], pending: [], hourly: [] });
+STORE.alerts = Array.isArray(STORE.alerts) ? STORE.alerts.slice(-DEFAULTS.maxSaved) : [];
+STORE.pending = Array.isArray(STORE.pending) ? STORE.pending : [];
+STORE.hourly = Array.isArray(STORE.hourly) ? STORE.hourly : [];
+
 function recordHourly() {
   const now = Date.now();
-  _store.hourly.push(now);
-  // keep last hour
-  const cutoff = now - 60 * 60 * 1000;
-  _store.hourly = _store.hourly.filter(t => t >= cutoff);
-  safeSave(STORE_FILE, _store);
+  STORE.hourly.push(now);
+  const cutoff = now - (60*60*1000);
+  STORE.hourly = STORE.hourly.filter(ts => ts >= cutoff);
+  safeSave(STORE_FILE, STORE);
 }
-function hourlyCount() {
-  const now = Date.now();
-  const cutoff = now - 60 * 60 * 1000;
-  _store.hourly = (_store.hourly || []).filter(t => t >= cutoff);
-  return _store.hourly.length;
-}
-function cleanupAlerts() {
-  // remove stale pending (older than 24h)
-  const now = Date.now();
-  _store.pending = (_store.pending || []).filter(p => (now - (p.ts || 0)) < (24 * 60 * 60 * 1000));
-  _store.alerts = (_store.alerts || []).slice(-DEFAULTS.maxSavedAlerts);
-  safeSave(STORE_FILE, _store);
-}
+function hourlyCount() { return STORE.hourly.length; }
 
 // -------------------------
-// Simple pattern detector
+// Utilities: patterns (cheap)
 // -------------------------
 function detectSimplePatternsFromCandles(candles = []) {
   const out = [];
-  if (!Array.isArray(candles) || candles.length < 3) return out;
-  const last = candles.at(-1), prev = candles.at(-2);
-  const body = Math.max(1e-6, Math.abs(last.close - last.open));
+  if (!Array.isArray(candles) || candles.length < 2) return out;
+  const last = candles.at(-1);
+  const prev = candles.at(-2);
+  const body = Math.max(1e-8, Math.abs(last.close - last.open));
   const upperWick = last.high - Math.max(last.close, last.open);
   const lowerWick = Math.min(last.close, last.open) - last.low;
 
@@ -133,30 +98,30 @@ function detectSimplePatternsFromCandles(candles = []) {
   }
   const isBullEngulf = (prev.close < prev.open) && (last.close > last.open) && (last.close > prev.open) && (last.open < prev.close);
   if (isBullEngulf) out.push({ name: "BullishEngulfing", side: "Bullish", strength: 60 });
+
   const isBearEngulf = (prev.close > prev.open) && (last.close < last.open) && (last.open > prev.close) && (last.close < prev.open);
   if (isBearEngulf) out.push({ name: "BearishEngulfing", side: "Bearish", strength: 60 });
+
   return out;
 }
 
 // -------------------------
-// Per-TF scoring
+// Scoring & consensus (compact)
 // -------------------------
 function computeTFScore({ candles = [], ell = null, mlMicro = null, tf = "15m", tfWeight = 1 }) {
   let score = 0;
   const reasons = [];
   const patterns = detectSimplePatternsFromCandles(candles);
-
   if (patterns.length) {
     const p = patterns[0];
     const pscore = Math.min(90, p.strength || DEFAULTS.patternBoostPoints);
     score += pscore;
-    reasons.push(`pattern:${p.name}(${p.side})`);
+    reasons.push(`pattern:${p.name}`);
   }
 
   try {
     const rsi = indicators.computeRSI(candles);
     const macd = indicators.computeMACD(candles);
-    const atr = indicators.computeATR(candles);
     if (macd && typeof macd.hist === "number") {
       if (macd.hist > 0) { score += 6; reasons.push("macd_pos"); }
       else if (macd.hist < 0) { score -= 6; reasons.push("macd_neg"); }
@@ -165,504 +130,477 @@ function computeTFScore({ candles = [], ell = null, mlMicro = null, tf = "15m", 
       if (rsi < 30) { score += 6; reasons.push("rsi_oversold"); }
       if (rsi > 70) { score -= 6; reasons.push("rsi_overbought"); }
     }
-    if (typeof atr === "number") reasons.push(`atr:${Math.round(atr)}`);
-  } catch (e) {
-    // non-fatal
-  }
+  } catch (e) {}
 
   if (ell && typeof ell.sentiment === "number") {
-    const s = ell.sentiment * 10;
-    score += s;
-    reasons.push(`ell_sent:${ell.sentiment.toFixed(2)}`);
+    score += ell.sentiment * 10;
+    reasons.push("elliott");
   }
 
   if (mlMicro && typeof mlMicro.prob === "number") {
-    const p = (mlMicro.prob - 50) / 100 * 20;
-    score += p;
-    reasons.push(`mlMicro:${mlMicro.label || ""}:${mlMicro.prob}`);
+    score += ((mlMicro.prob - 50) / 100) * 20; // small micro nudge
+    reasons.push("mlMicro");
   }
 
   const raw = Math.max(-100, Math.min(100, score));
   const norm = Math.round((raw + 100) / 2); // 0..100
-  const weighted = norm * (tfWeight || 1);
-  return { score: norm, weighted, reasons, patterns };
+  return { score: norm, reasons, patterns };
 }
 
-// -------------------------
-// Consensus builder
-// -------------------------
 function buildConsensus(perTfResults = [], weights = DEFAULTS.weights, mlMain = null) {
   let sumW = 0, sumS = 0;
   const breakdown = [];
   for (const r of perTfResults) {
     const w = weights[r.tf] || 0.1;
     sumW += w;
-    sumS += (r.score || 0) * w;
-    breakdown.push({ tf: r.tf, score: r.score, patterns: r.patterns || [], reasons: r.reasons || [] });
+    sumS += (r.score || 50) * w;
+    breakdown.push({ tf: r.tf, score: r.score, patterns: r.patterns || [] });
   }
   const avg = sumW ? (sumS / sumW) : 50;
 
+  // mlMain nudging (small)
   let boost = 0;
   if (mlMain && typeof mlMain.prob === "number") {
-    // mlMain.prob: 0..100 -> convert to -8..+8 (smaller influence for strict)
-    boost = ((mlMain.prob - 50) / 50) * 8 * DEFAULTS.mlGateMinProb / 100;
+    boost = ((mlMain.prob - 50) / 50) * (DEFAULTS.mlWeight || 0.18) * 50; // scaled
   }
 
   const final = Math.round(Math.max(0, Math.min(100, avg + boost)));
-  const label = final >= 85 ? "STRONG" : final >= DEFAULTS.minAlertConfidence ? "MODERATE" : final >= 50 ? "WEAK" : "NONE";
-  return { final, label, breakdown, mlBoost: Math.round(boost * 100) / 100, mlMainLabel: mlMain?.label || null };
+  const label = final >= 80 ? "STRONG" : final >= 65 ? "MODERATE" : final >= 50 ? "WEAK" : "NONE";
+  return { final, label, breakdown, mlBoost: Math.round(boost*100)/100, mlMainLabel: mlMain?.label || null };
 }
 
 // -------------------------
-// Debounce key & recent checks
+// Debounce key (stable)
 // -------------------------
-function makeDebounceKey(symbol, side, perTfResults) {
-  const patterns = perTfResults
-    .flatMap(r => (r.patterns || []).map(p => `${r.tf}:${p.name}`))
-    .sort()
-    .join("|") || "NOPAT";
-  const scores = perTfResults
-    .map(r => `${r.tf}:${Math.round(r.score || 0)}`)
-    .sort()
-    .join("|") || "NOSCORE";
+function makeDebounceKey(symbol, side, perTfResults = []) {
+  const patterns = perTfResults.flatMap(r => (r.patterns || []).map(p => `${r.tf}:${p.name}`)).sort().join("|") || "NOPAT";
+  const scores = perTfResults.map(r => `${r.tf}:${Math.round(r.score||50)}`).sort().join("|") || "NOSCORE";
   const priceZone = perTfResults[0] && perTfResults[0].price ? Math.round(perTfResults[0].price / 10) : "P0";
   return `${symbol}_${side}_${patterns}_${scores}_${priceZone}`;
 }
-function recentlyConfirmedOrCooldown(key) {
-  cleanupAlerts();
+
+// -------------------------
+// Pending management
+// -------------------------
+function persistStore() { safeSave(STORE_FILE, STORE); }
+function recentlyAlerted(key) {
   const now = Date.now();
-  // check recent confirmed alerts with same key within debounceSeconds
   const cutoff = now - (DEFAULTS.debounceSeconds * 1000);
-  return (_store.alerts || []).some(a => a.key === key && (a.ts || 0) >= cutoff);
+  STORE.alerts = (STORE.alerts || []).filter(a => a.ts >= cutoff);
+  return (STORE.alerts || []).some(a => a.key === key);
 }
-function recordConfirmedAlert(key, meta = {}) {
-  _store.alerts = _store.alerts || [];
-  _store.alerts.push(Object.assign({ key, ts: Date.now() }, meta));
-  _store.alerts = _store.alerts.slice(-DEFAULTS.maxSavedAlerts);
+function recordSent(key, meta = {}) {
+  STORE.alerts = STORE.alerts || [];
+  STORE.alerts.push(Object.assign({ key, ts: Date.now() }, meta));
+  STORE.alerts = STORE.alerts.slice(-DEFAULTS.maxSaved);
   recordHourly();
-  safeSave(STORE_FILE, _store);
+  persistStore();
 }
-
-// -------------------------
-// Confirmation assessment (strict)
-// -------------------------
-function assessConfirmation(side, recentCandles) {
-  // recentCandles: array oldest->newest of length >= confirmationCandles
-  const N = recentCandles.length;
-  if (N === 0) return { ok: false, reason: "no_candles" };
-  let directionalCount = 0;
-  const start = recentCandles[0], last = recentCandles.at(-1);
-  let movedPct = 0;
-  if (start && last) movedPct = start.close ? ((last.close - start.close) / Math.max(1, Math.abs(start.close))) * 100 : 0;
-  for (const c of recentCandles) {
-    if (side === "Bullish" && c.close > c.open) directionalCount++;
-    if (side === "Bearish" && c.close < c.open) directionalCount++;
-    // wick confirmation adds weight
-    const body = Math.max(1e-6, Math.abs(c.close - c.open));
-    const upperWick = c.high - Math.max(c.close, c.open);
-    const lowerWick = Math.min(c.close, c.open) - c.low;
-    if (side === "Bullish" && lowerWick > body * 1.6) directionalCount++;
-    if (side === "Bearish" && upperWick > body * 1.6) directionalCount++;
+function addPending(p) {
+  STORE.pending = STORE.pending || [];
+  STORE.pending.push(Object.assign({ status: "pending", ts: Date.now() }, p));
+  persistStore();
+}
+function updatePending(id, patch) {
+  STORE.pending = STORE.pending || [];
+  for (let i=0;i<STORE.pending.length;i++) {
+    if (STORE.pending[i].id === id) { STORE.pending[i] = Object.assign({}, STORE.pending[i], patch); break; }
   }
-  const supportNeeded = Math.ceil(N * 0.6);
-  const ok = directionalCount >= supportNeeded || (side === "Bullish" ? movedPct > 0.15 : movedPct < -0.15);
-  return { ok, directionalCount, movedPct };
+  persistStore();
+}
+function removePending(id) {
+  STORE.pending = (STORE.pending || []).filter(x => x.id !== id);
+  persistStore();
 }
 
 // -------------------------
-// TP/SL builder
+// Confirmation helper (wait for closed candles)
 // -------------------------
-function makeTPsAndSLs({ ellSummary = null, ellTargets = [], atr = 0, price = 0 }) {
-  const tps = [];
-  const sls = [];
+async function assessConfirmationByCandles(symbol, side, requiredCandles = DEFAULTS.confirmCandles, tf = DEFAULTS.confirmTF) {
   try {
-    if (Array.isArray(ellTargets) && ellTargets.length) {
-      for (const t of ellTargets.slice(0, 4)) {
-        const tp = Number(t.tp || t.target || t.price || 0);
-        if (tp && !Number.isNaN(tp)) tps.push({ source: "Elliott", tp, confidence: t.confidence || 50 });
+    // fetch requiredCandles + 1 so we get closed candles (exclude currently open)
+    const resp = await fetchMarketData(symbol, tf, requiredCandles + 2);
+    const candles = resp?.data || [];
+    if (!Array.isArray(candles) || candles.length < requiredCandles + 1) {
+      return { ok: false, reason: "not_enough_candles", have: candles.length };
+    }
+    // take last N closed (exclude last open)
+    const closed = candles.slice(-(requiredCandles+1), -1);
+    // count directional candles
+    let dirCount = 0;
+    for (const c of closed) {
+      const movedUp = (c.close > c.open);
+      if (side === "Bullish" && movedUp) dirCount++;
+      if (side === "Bearish" && !movedUp) dirCount++;
+      // also consider wick confirmation
+      const body = Math.max(1e-8, Math.abs(c.close - c.open));
+      const lowerWick = Math.min(c.close, c.open) - c.low;
+      const upperWick = c.high - Math.max(c.close, c.open);
+      if (side === "Bullish" && lowerWick > body * 1.6) dirCount++;
+      if (side === "Bearish" && upperWick > body * 1.6) dirCount++;
+    }
+    const need = Math.ceil(closed.length * 0.6); // 60% supportive
+    const movedPct = closed.length ? ((closed.at(-1).close - closed[0].close) / Math.max(1, Math.abs(closed[0].close))) * 100 : 0;
+    return { ok: dirCount >= need, dirCount, need, closedCount: closed.length, movedPct };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+// -------------------------
+// Outcome / feedback (calls recordOutcome for ML)
+// -------------------------
+async function scheduleFeedbackChecks(predId, symbol, side, priceAtDetect, opts = {}) {
+  const windows = opts.feedbackWindowsSec || DEFAULTS.feedbackWindowsSec;
+  for (const w of windows) {
+    setTimeout(async () => {
+      try {
+        const resp = await fetchMarketData(symbol, "1m", Math.max(3, Math.ceil(w/60)+2));
+        const newPrice = resp?.price ?? priceAtDetect;
+        const movedUp = newPrice > priceAtDetect;
+        const success = (side === "Bullish") ? movedUp : (!movedUp);
+        const realizedReturn = priceAtDetect ? ((newPrice - priceAtDetect)/Math.max(1,Math.abs(priceAtDetect))) * 100 : null;
+        if (predId && typeof recordOutcome === "function") {
+          try { recordOutcome(predId, { correct: !!success, realizedReturn: typeof realizedReturn === "number" ? realizedReturn : null, realizedPrice: newPrice }); }
+          catch(e) { log("recordOutcome err", e?.message || e); }
+        }
+        log("feedback", symbol, side, "windowSec", w, "success", success, "newPrice", newPrice);
+      } catch (e) {
+        log("feedback check err", e?.message || e);
       }
-    }
-    if ((!tps || tps.length === 0) && ellSummary && ellSummary.support && ellSummary.resistance) {
-      tps.push({ source: "ElliottZoneHi", tp: ellSummary.resistance, confidence: 40 });
-      tps.push({ source: "ElliottZoneLo", tp: ellSummary.support, confidence: 40 });
-    }
-    if (!tps || tps.length === 0) {
-      tps.push({ source: "ATR_x2", tp: Number((price + Math.max(1, atr) * 2).toFixed(2)), confidence: 30 });
-      tps.push({ source: "ATR_x4", tp: Number((price + Math.max(1, atr) * 4).toFixed(2)), confidence: 25 });
-    }
-    const slLong = Number((price - Math.max(1, atr) * 2).toFixed(2));
-    const slShort = Number((price + Math.max(1, atr) * 2).toFixed(2));
-    sls.push({ side: "LONG", sl: slLong });
-    sls.push({ side: "SHORT", sl: slShort });
-  } catch (e) {}
-  return { tps, sls };
+    }, w * 1000);
+  }
 }
 
 // -------------------------
-// Evaluate symbol (candidate -> create pending)
+// Main evaluateSymbol (detection + pending queuing)
 // -------------------------
-async function evaluateSymbolCandidate(symbol, opts = {}, sendAlert = null) {
+async function evaluateSymbol(symbol = CONFIG.SYMBOL, options = {}, sendAlert = null) {
   try {
-    const tfs = opts.tfs || DEFAULTS.tfs;
+    const opts = Object.assign({}, DEFAULTS, options);
+    const tfs = opts.tfs;
     const multi = await fetchMultiTF(symbol, tfs);
 
-    // ml main (15m) — best-effort
+    // main ML prediction (15m)
     let mlMain = null;
     try { mlMain = await runMLPrediction(symbol, "15m"); } catch (e) { mlMain = null; }
 
+    // build per-TF results
     const perTfResults = [];
     for (const tf of tfs) {
       const entry = multi[tf] || { data: [], price: 0 };
       const candles = Array.isArray(entry.data) ? entry.data : [];
       const price = entry.price || (candles.at(-1)?.close ?? 0);
-
       let ell = null;
       try { const er = await analyzeElliott(candles); ell = (er && er.ok) ? er : null; } catch (e) { ell = null; }
-
       let mlMicro = null;
-      if (["1m", "5m"].includes(tf)) {
-        try { mlMicro = await runMicroPrediction(symbol, tf, opts.microLookback || 60); } catch (e) { mlMicro = null; }
+      if (["1m","5m"].includes(tf)) {
+        try { mlMicro = await runMicroPrediction(symbol, tf, opts.microLookback || 60); } catch(e){ mlMicro = null; }
       }
-
-      const weight = opts.weights && opts.weights[tf] ? opts.weights[tf] : (DEFAULTS.weights[tf] || 0.1);
-      const sc = computeTFScore({ candles, ell, mlMicro, tf, tfWeight: weight });
-
-      perTfResults.push({
-        tf,
-        price,
-        candles,
-        ell,
-        mlMicro,
-        score: sc.score,
-        weighted: sc.weighted,
-        reasons: sc.reasons,
-        patterns: sc.patterns
-      });
+      const scoreObj = computeTFScore({ candles, ell, mlMicro, tf, tfWeight: opts.weights?.[tf] || DEFAULTS.weights[tf] || 0.1 });
+      perTfResults.push(Object.assign({ tf, price, candles, ell, mlMicro }, scoreObj));
     }
 
     const consensus = buildConsensus(perTfResults, opts.weights || DEFAULTS.weights, mlMain);
     const finalScore = consensus.final;
 
-    // Trend quick check (use 15m or 1h if provided)
-    let trend = "FLAT";
-    try {
-      const hc = multi["1h"] || multi["15m"];
-      const closes = (hc?.data || []).map(c => c.close).slice(-10);
-      if (closes.length >= 2) {
-        const last = Number(closes.at(-1)), prev = Number(closes.at(-3) || closes.at(-2));
-        if (last > prev) trend = "UP"; else if (last < prev) trend = "DOWN";
-      }
-    } catch (e) {}
-
-    // Strict ML gate
-    if (DEFAULTS.requireMLGate && mlMain && typeof mlMain.prob === "number") {
-      if (mlMain.prob < DEFAULTS.mlGateMinProb && finalScore < 95) {
-        log("ML main blocked candidate", symbol, "mlProb:", mlMain.prob, "consensus:", finalScore);
-        return { alerted: false, reason: "ml_gate", finalScore, mlMain };
-      }
+    // soft ML gate: if mlMain prob very low and consensus is not extremely high, skip
+    if (mlMain && typeof mlMain.prob === "number" && mlMain.prob < (opts.mlGateMinProb || DEFAULTS.mlGateMinProb) && finalScore < 95) {
+      log("ML gate blocked candidate", symbol, "mlProb:", mlMain.prob, "consensus:", finalScore);
+      return { alerted: false, reason: "ml_gate", finalScore, mlMain };
     }
 
-    // threshold to start pending (slightly below min to let confirmation verify)
-    const pendingThreshold = (opts.pendingThresholdOffset != null) ? (DEFAULTS.minAlertConfidence + DEFAULTS.pendingThresholdOffset) : (DEFAULTS.minAlertConfidence - 5);
-    if (finalScore >= pendingThreshold) {
-      // determine side
-      const bullCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bullish")).length;
-      const bearCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bearish")).length;
-      let side = "Bullish";
-      if (bullCount > bearCount) side = "Bullish";
-      else if (bearCount > bullCount) side = "Bearish";
-      else if (mlMain && mlMain.label) side = mlMain.label;
-      else side = finalScore >= 50 ? "Bullish" : "Bearish";
+    // decide side by pattern majority or mlMain fallback
+    const bullCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bullish")).length;
+    const bearCount = perTfResults.filter(r => (r.patterns || []).some(p => p.side === "Bearish")).length;
+    let side = "Bullish";
+    if (bullCount > bearCount) side = "Bullish";
+    else if (bearCount > bullCount) side = "Bearish";
+    else if (mlMain && mlMain.label) side = mlMain.label;
+    else side = finalScore >= 50 ? "Bullish" : "Bearish";
 
-      const key = makeDebounceKey(symbol, side, perTfResults);
-      if (recentlyConfirmedOrCooldown(key)) {
-        log("suppressed by recent confirmed/cooldown", key);
-        return { alerted: false, reason: "suppressed_cooldown", key };
-      }
-      // avoid duplicate pending
-      if ((_store.pending || []).some(p => p.key === key && (p.status === "pending" || p.status === "confirmed"))) {
-        log("duplicate pending exists, skipping", key);
-        return { alerted: false, reason: "duplicate_pending", key };
-      }
-      // rate limit per hour
-      if (hourlyCount() >= DEFAULTS.maxAlertsPerHour) {
-        log("hourly rate limit reached, skipping candidate", symbol);
-        return { alerted: false, reason: "rate_limited" };
-      }
+    // very simple first quick alert (clean) if score high enough and not recently sent
+    const key = makeDebounceKey(symbol, side, perTfResults);
+    if (finalScore >= (opts.minAlertConfidence || DEFAULTS.minAlertConfidence)) {
+      if (!recentlyAlerted(key) && hourlyCount() < (opts.maxAlertsPerHour || DEFAULTS.maxAlertsPerHour)) {
+        // record quick-first alert (simple format)
+        const firstMsg = [
+          `🚨 Reversal Watcher`,
+          `Time: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true })}`,
+          `Symbol: ${symbol}`,
+          `Pattern: ${ (perTfResults.flatMap(r=>r.patterns||[])[0]?.name) || "N/A" }`,
+          `Volume: ${ (perTfResults[0] && perTfResults[0].candles && perTfResults[0].candles.at(-1)?.v) || "n/a" }`,
+          `Price: ${Number(perTfResults[0]?.price || 0).toFixed(2)}`,
+          `ML Prob: ${ mlMain && typeof mlMain.prob === "number" ? (Math.round(mlMain.prob*100)/100) + "%" : "N/A" }`
+        ].join("\n");
 
-      // record base prediction (for feedback later)
-      let predId = null;
-      try {
-        predId = await recordPrediction({
+        try { if (typeof sendAlert === "function") await sendAlert(firstMsg); else log("Would send (first):", firstMsg); }
+        catch(e){ log("sendAlert err (first)", e?.message || e); }
+
+        // record a prediction entry (so ML can get feedback later)
+        let predId = null;
+        try {
+          predId = await recordPrediction({
+            symbol, predictedAt: new Date().toISOString(), label: side, prob: finalScore,
+            features: { perTf: perTfResults.map(r=>({tf:r.tf,score:r.score})) },
+            meta: { source: "reversal_watcher_first" }
+          });
+        } catch(e){ predId = null; }
+
+        // mark as pending to confirm across next N candles
+        const pendingId = `pend_${Date.now()}_${Math.floor(Math.random()*9999)}`;
+        addPending({
+          id: pendingId,
+          key,
           symbol,
-          predictedAt: new Date().toISOString(),
-          label: side,
-          prob: finalScore,
-          features: { perTf: perTfResults.map(r => ({ tf: r.tf, score: r.score })) },
-          meta: { source: "reversal_watcher_strict", mlMain }
+          side,
+          predId,
+          consensusScore: finalScore,
+          requiredCandles: opts.confirmCandles || DEFAULTS.confirmCandles,
+          confirmTF: opts.confirmTF || DEFAULTS.confirmTF,
+          priceAtDetect: perTfResults[0]?.price || 0,
+          perTfResults
         });
-      } catch (e) { predId = null; }
 
-      // add pending entry
-      const pendingId = `pending_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-      _store.pending = _store.pending || [];
-      _store.pending.push({
-        id: pendingId,
-        key,
-        symbol,
-        side,
-        ts: Date.now(),
-        createdAt: new Date().toISOString(),
-        perTfResults,
-        predId,
-        status: "pending",
-        consensusScore: finalScore,
-        priceAtDetect: perTfResults[0]?.price || 0,
-        requiredCandles: opts.confirmationCandles || DEFAULTS.confirmationCandles,
-        confirmTf: opts.confirmationTF || DEFAULTS.confirmationTF
-      });
-      safeSave(STORE_FILE, _store);
-      log("pending candidate recorded", symbol, side, "pendingId:", pendingId, "score:", finalScore);
-      return { alerted: false, reason: "pending_created", pendingId, key, finalScore };
+        // record initial first-alert to prevent duplicates in debounce window
+        recordSent(key, { symbol, side, predId, score: finalScore, note: "first_alert" });
+
+        return { alerted: true, type: "first", key, pendingId, predId };
+      } else {
+        log("first alert suppressed by debounce/hourly", key);
+      }
     }
 
-    return { alerted: false, reason: "below_threshold", finalScore };
+    // otherwise, if score is high enough to queue pending even without first alert threshold:
+    if (finalScore >= (opts.pendingThreshold || DEFAULTS.pendingThreshold)) {
+      if (!recentlyAlerted(key) && hourlyCount() < (opts.maxAlertsPerHour || DEFAULTS.maxAlertsPerHour)) {
+        // create pending without sending first immediate message (user asked first alert + confirmation; this branch still queues pending)
+        let predId = null;
+        try {
+          predId = await recordPrediction({
+            symbol, predictedAt: new Date().toISOString(), label: side, prob: finalScore,
+            features: { perTf: perTfResults.map(r=>({tf:r.tf,score:r.score})) },
+            meta: { source: "reversal_watcher_pending" }
+          });
+        } catch(e){ predId = null; }
 
+        const pendingId = `pend_${Date.now()}_${Math.floor(Math.random()*9999)}`;
+        addPending({
+          id: pendingId,
+          key,
+          symbol,
+          side,
+          predId,
+          consensusScore: finalScore,
+          requiredCandles: opts.confirmCandles || DEFAULTS.confirmCandles,
+          confirmTF: opts.confirmTF || DEFAULTS.confirmTF,
+          priceAtDetect: perTfResults[0]?.price || 0,
+          perTfResults
+        });
+        recordSent(key, { symbol, side, predId, score: finalScore, note: "pending_only" });
+        log("queued pending (no first alert)", pendingId);
+        return { alerted: false, reason: "pending_queued", pendingId };
+      }
+    }
+
+    return { alerted: false, reason: "none", finalScore };
   } catch (e) {
-    log("evaluateSymbolCandidate error", e?.message || e);
+    log("evaluateSymbol err", e?.message || e);
     return { alerted: false, error: e?.message || String(e) };
   }
 }
 
 // -------------------------
-// Process pending queue (confirmation + confirmed send)
+// Pending processor — called periodically to check pending items and send confirmation/fail
 // -------------------------
-async function processPending(sendAlert = null, opts = {}) {
-  const pendingCopy = Array.isArray(_store.pending) ? _store.pending.slice() : [];
-  for (const p of pendingCopy) {
-    try {
-      if (!p || p.status !== "pending") continue;
-      const tf = p.confirmTf || DEFAULTS.confirmationTF;
-      const needed = p.requiredCandles || DEFAULTS.confirmationCandles;
-
-      // fetch recent needed candles (use last needed closed candles)
-      const resp = await fetchMarketData(p.symbol, tf, needed + 3);
-      const candles = (resp?.data || []);
-      if (!candles || candles.length < needed) {
-        // not enough closed candles yet (wait)
-        continue;
-      }
-      // use last `needed` closed candles (excluding current open)
-      const recent = candles.slice(- (needed + 0)); // they are closed if fetch returns closed candles
-      // ensure oldest->newest
-      const conf = assessConfirmation(p.side, recent.slice(-needed));
-      if (conf.ok) {
-        // re-evaluate micro ML average to avoid contradictory micro predictions
-        let mlMicroAvg = null;
-        try {
-          const microPromises = (p.perTfResults || []).filter(r => ["1m", "5m"].includes(r.tf)).map(async r => {
-            if (r.mlMicro) return r.mlMicro;
-            try { return await runMicroPrediction(p.symbol, r.tf, opts.microLookback || 60); } catch (e) { return null; }
-          });
-          const microRes = await Promise.all(microPromises);
-          const probs = microRes.filter(Boolean).map(m => Number(m.prob || 50));
-          if (probs.length) mlMicroAvg = probs.reduce((a, b) => a + b, 0) / probs.length;
-        } catch (e) { mlMicroAvg = null; }
-
-        if (mlMicroAvg != null) {
-          if (p.side === "Bullish" && mlMicroAvg < (50 - DEFAULTS.microMlGateDelta)) {
-            log("micro ML contradiction - blocking confirmed send", p.id, p.symbol, "microAvg:", mlMicroAvg);
-            // mark failed
-            p.status = "failed";
-            p.closedAt = new Date().toISOString();
-            safeSave(STORE_FILE, _store);
-            continue;
-          }
-          if (p.side === "Bearish" && mlMicroAvg > (50 + DEFAULTS.microMlGateDelta)) {
-            log("micro ML contradiction - blocking confirmed send", p.id, p.symbol, "microAvg:", mlMicroAvg);
-            p.status = "failed";
-            p.closedAt = new Date().toISOString();
-            safeSave(STORE_FILE, _store);
-            continue;
-          }
-        }
-
-        // final cooldown check (maybe confirmed already)
-        if (recentlyConfirmedOrCooldown(p.key)) {
-          log("recent confirmed/cooldown prevents sending", p.key);
-          p.status = "failed";
-          p.closedAt = new Date().toISOString();
-          safeSave(STORE_FILE, _store);
-          continue;
-        }
-
-        // Prepare TP/SL and send message
-        const topTf = p.perTfResults && p.perTfResults.length ? p.perTfResults[0] : null;
-        const ellTargets = (topTf && topTf.ell && topTf.ell.targets) ? topTf.ell.targets : [];
-        const ellSummary = (topTf && topTf.ell && topTf.ell.ok) ? { support: topTf.ell.support, resistance: topTf.ell.resistance } : null;
-        const atr = (topTf && topTf.candles) ? indicators.computeATR(topTf.candles) : 0;
-        const price = p.priceAtDetect || (topTf && topTf.price) || 0;
-        const { tps, sls } = makeTPsAndSLs({ ellSummary, ellTargets, atr, price });
-
-        const tpTxt = tps && tps.length ? tps.slice(0, 3).map(t => `${Number(t.tp).toFixed(2)} (${t.source})`).join(" / ") : "n/a";
-        const slTxt = sls && sls.length ? sls.map(s => `${s.side}:${s.sl}`).join(" / ") : "n/a";
-
-        const msgLines = [
-          `⚡ <b>REVERSED (CONFIRMED)</b> — <b>${p.side}</b>`,
-          `Symbol: <b>${p.symbol}</b> | Confidence: <b>${Math.round(p.consensusScore || 0)}%</b>`,
-          `PriceAtDetect: ${Number(price).toFixed(2)} | TP(s): ${tpTxt}`,
-          `SLs: ${slTxt}`,
-          `Observed: ${conf.directionalCount}/${needed} candles in direction | movePct: ${Number(conf.movedPct).toFixed(4)}%`,
-          `ID: ${p.predId || "none"}`
-        ];
-        const text = msgLines.join("\n");
-
-        try {
-          if (typeof sendAlert === "function") await sendAlert(text);
-          else log("Would send confirmed alert:", text);
-        } catch (e) {
-          log("sendAlert error", e?.message || e);
-        }
-
-        // mark sent & record for cooldown
-        p.status = "sent";
-        p.sentAt = new Date().toISOString();
-        p.confirmation = conf;
-        recordConfirmedAlert(p.key, { symbol: p.symbol, side: p.side, predId: p.predId, score: p.consensusScore });
-        safeSave(STORE_FILE, _store);
-
-        // schedule outcome checks (feedback)
-        (opts.feedbackWindowsSec || DEFAULTS.feedbackWindowsSec).forEach(win => {
-          setTimeout(async () => {
-            try {
-              const outcome = await (async () => {
-                // fetch fresh 1m price at time of check
-                const r = await fetchMarketData(p.symbol, "1m", 1);
-                const newPrice = r?.price ?? price;
-                const movedUp = newPrice > price;
-                const success = (p.side === "Bullish") ? movedUp : !movedUp;
-                const realizedReturn = price ? ((newPrice - price) / Math.max(1, Math.abs(price))) * 100 : null;
-                if (p.predId) {
-                  try { recordOutcome(p.predId, { correct: !!success, realizedReturn: typeof realizedReturn === "number" ? realizedReturn : null, realizedPrice: newPrice }); } catch (e) {}
+async function processPending(sendAlert = null, options = {}) {
+  try {
+    const pend = Array.isArray(STORE.pending) ? STORE.pending.slice() : [];
+    for (const p of pend) {
+      if (!p || p.status && p.status !== "pending") continue;
+      try {
+        const required = p.requiredCandles || DEFAULTS.confirmCandles;
+        const tf = p.confirmTF || DEFAULTS.confirmTF;
+        // assess confirmation using the recent candles
+        const conf = await assessConfirmationByCandles(p.symbol, p.side, required, tf);
+        if (conf.ok) {
+          // Before sending, micro-ML gating: recompute micro ML average
+          let microAvg = null;
+          try {
+            const microList = [];
+            if (Array.isArray(p.perTfResults)) {
+              for (const r of p.perTfResults) {
+                if (r.tf === "1m" || r.tf === "5m") {
+                  if (r.mlMicro && typeof r.mlMicro.prob === "number") microList.push(r.mlMicro.prob);
+                  else {
+                    try {
+                      const mm = await runMicroPrediction(p.symbol, r.tf, options.microLookback || 60);
+                      if (mm && typeof mm.prob === "number") microList.push(mm.prob);
+                    } catch(e){}
+                  }
                 }
-                return { ok: true, predId: p.predId, newPrice, success, realizedReturn };
-              })();
-              // mark done/failed
-              p.closedAt = new Date().toISOString();
-              p.outcome = outcome;
-              p.status = outcome.success ? "done" : "failed";
-              safeSave(STORE_FILE, _store);
-              log("feedback recorded for", p.id, JSON.stringify(outcome));
-            } catch (e) {
-              log("feedback processing error", e?.message || e);
+              }
             }
-          }, win * 1000);
-        });
+            if (microList.length) microAvg = microList.reduce((a,b)=>a+b,0)/microList.length;
+          } catch(e){ microAvg = null; }
 
-      } else {
-        // not confirmed -> increase observation counter or mark failed if old
-        p.lastCheck = new Date().toISOString();
-        p.observed = (p.observed || 0) + 1;
-        // If observed many times without confirmation, mark failed
-        if (p.observed > ((p.requiredCandles || DEFAULTS.confirmationCandles) + 6)) {
-          p.status = "failed";
-          p.closedAt = new Date().toISOString();
-          safeSave(STORE_FILE, _store);
-          log("pending marked failed (no confirmation over time)", p.id);
+          // block if micro ml strongly contradicts p.side
+          if (microAvg !== null) {
+            if (p.side === "Bullish" && microAvg < (50 - (options.microMlGateDelta || DEFAULTS.microMlGateDelta))) {
+              updatePending(p.id, { status: "failed", closedAt: new Date().toISOString(), note: "micro_ml_contradict" });
+              removePending(p.id);
+              log("pending blocked by micro-ml contradiction", p.id, p.symbol, microAvg);
+              continue;
+            }
+            if (p.side === "Bearish" && microAvg > (50 + (options.microMlGateDelta || DEFAULTS.microMlGateDelta))) {
+              updatePending(p.id, { status: "failed", closedAt: new Date().toISOString(), note: "micro_ml_contradict" });
+              removePending(p.id);
+              log("pending blocked by micro-ml contradiction", p.id, p.symbol, microAvg);
+              continue;
+            }
+          }
+
+          // Prepare confirmation message (clean)
+          const price = p.priceAtDetect || (p.perTfResults && p.perTfResults[0]?.price) || 0;
+          const ellTargets = (p.perTfResults && p.perTfResults[0] && p.perTfResults[0].ell && p.perTfResults[0].ell.targets) || [];
+          const tpTxt = (ellTargets && ellTargets.length) ? ellTargets.slice(0,3).map(t => Number(t.tp || t.target || t.price || 0).toFixed(2)).join(" / ") : `${(price + 1).toFixed(2)} / ${(price + 2).toFixed(2)}`;
+          const slLong = Number((price - 1).toFixed(2));
+          const slShort = Number((price + 1).toFixed(2));
+
+          const confirmMsg = [
+            `⚡ Reversed (CONFIRMED) — ${p.side}`,
+            `Symbol: ${p.symbol} | Confidence: ${Math.round(p.consensusScore || 0)}%`,
+            `PriceAtDetect: ${Number(price).toFixed(2)} | TP(s): ${tpTxt}`,
+            `SLs: LONG:${slLong} / SHORT:${slShort}`,
+            `Observed: ${conf.dirCount}/${conf.closedCount} supportive signals | movePct: ${conf.movedPct.toFixed(3)}%`,
+            `ID: ${p.predId || "none"}`
+          ].join("\n");
+
+          try { if (typeof sendAlert === "function") await sendAlert(confirmMsg); else log("Would send confirm:", confirmMsg); }
+          catch (e) { log("sendAlert err (confirm)", e?.message || e); }
+
+          // mark pending sent and apply cooldown
+          updatePending(p.id, { status: "sent", sentAt: new Date().toISOString(), confirmed: true });
+          recordSent(p.key, { symbol: p.symbol, side: p.side, predId: p.predId, score: p.consensusScore, note: "confirmed" });
+
+          // schedule ML feedback
+          try { await scheduleFeedbackChecks(p.predId, p.symbol, p.side, p.priceAtDetect); } catch(e){ log("scheduleFeedback err", e?.message || e); }
+
+          // remove pending after small delay
+          setTimeout(()=> removePending(p.id), 2000);
         } else {
-          safeSave(STORE_FILE, _store);
-          log("pending still waiting", p.id, "observed:", p.observed);
+          // not confirmed: increase observed count or fail after long wait
+          const observed = (p.observedChecks || 0) + 1;
+          updatePending(p.id, { observedChecks: observed, lastCheck: new Date().toISOString() });
+          // if too many checks without confirm, mark failed
+          if (observed > Math.max(4, (p.requiredCandles || DEFAULTS.confirmCandles) * 3)) {
+            // send fail message cleanly so user knows
+            const price = p.priceAtDetect || (p.perTfResults && p.perTfResults[0]?.price) || 0;
+            const failMsg = [
+              `⚠️ Reversal FAILED — ${p.side}`,
+              `Symbol: ${p.symbol} | Score: ${Math.round(p.consensusScore || 0)}%`,
+              `Reason: Not confirmed in expected candles`,
+              `PriceAtDetect: ${Number(price).toFixed(2)}`,
+              `ID: ${p.predId || "none"}`
+            ].join("\n");
+            try { if (typeof sendAlert === "function") await sendAlert(failMsg); else log("Would send fail:", failMsg); } catch(e){ log("sendAlert err (fail)", e?.message || e); }
+
+            updatePending(p.id, { status: "failed", closedAt: new Date().toISOString(), note: "no_confirm" });
+            // schedule feedback (failed)
+            try { await scheduleFeedbackChecks(p.predId, p.symbol, p.side, p.priceAtDetect); } catch(e){ }
+            removePending(p.id);
+            recordSent(p.key, { symbol: p.symbol, side: p.side, predId: p.predId, score: p.consensusScore, note: "failed_no_confirm" });
+          } else {
+            log("pending still waiting", p.id, "observed", observed);
+          }
         }
+      } catch (e) {
+        log("processPending item err", e?.message || e);
       }
-    } catch (e) {
-      log("processPending error", e?.message || e);
     }
+  } catch (e) {
+    log("processPending error", e?.message || e);
   }
-  // cleanup finished/old pending entries
-  cleanupAlerts();
 }
 
 // -------------------------
-// Public API: start/stop watcher
+// Public API: start/stop
 // -------------------------
-function startReversalWatcher(symbol = CONFIG.SYMBOL || "BTCUSDT", options = {}, sendAlert = null) {
-  if (_watcherTimers.has(symbol)) {
+let _timers = new Map();
+
+export function startReversalWatcher(symbol = CONFIG.SYMBOL || "BTCUSDT", options = {}, sendAlert = null) {
+  if (_timers.has(symbol)) {
     log("Watcher already running for", symbol);
     return false;
   }
   const opts = Object.assign({}, DEFAULTS, options);
-  log("Starting STRICT Reversal Watcher for", symbol, "opts:", JSON.stringify({ tfs: opts.tfs, pollIntervalMs: opts.pollIntervalMs, minAlertConfidence: opts.minAlertConfidence }));
+  log("Starting Reversal Watcher for", symbol, "opts:", JSON.stringify({ tfs: opts.tfs, pollIntervalMs: opts.pollIntervalMs }));
 
-  // main candidate tick
+  // main scan tick
   const tick = async () => {
     try {
-      await evaluateSymbolCandidate(symbol, opts, sendAlert);
+      await evaluateSymbol(symbol, opts, sendAlert);
     } catch (e) {
-      log("tick exception", e?.message || e);
+      log("tick err", e?.message || e);
     }
   };
-
-  // pending processor tick
+  // pending processor tick (short interval)
   const pendTick = async () => {
-    try {
-      await processPending(sendAlert, opts);
-    } catch (e) {
-      log("pendTick exception", e?.message || e);
-    }
+    try { await processPending(sendAlert, opts); } catch(e) { log("pendTick err", e?.message || e); }
   };
 
-  // start timers
+  // immediate run then intervals
   tick();
   const idMain = setInterval(tick, opts.pollIntervalMs || DEFAULTS.pollIntervalMs);
-  // process pending more frequently to catch candle closes (every 10s)
-  const idPend = setInterval(pendTick, Math.max(8 * 1000, Math.floor((opts.pollIntervalMs || DEFAULTS.pollIntervalMs) / 2)));
-  _watcherTimers.set(symbol, { idMain, idPend });
-  _running = true;
+  const idPend = setInterval(pendTick, Math.max(5000, Math.floor((opts.pollIntervalMs || DEFAULTS.pollIntervalMs) / 2)));
+
+  _timers.set(symbol, { idMain, idPend });
+  log("Watcher started:", symbol);
   return true;
 }
 
-async function stopReversalWatcher(symbol = null) {
+export async function stopReversalWatcher(symbol = null) {
   try {
     if (symbol) {
-      const rec = _watcherTimers.get(symbol);
+      const rec = _timers.get(symbol);
       if (rec) {
-        if (rec.idMain) clearInterval(rec.idMain);
-        if (rec.idPend) clearInterval(rec.idPend);
-        _watcherTimers.delete(symbol);
+        clearInterval(rec.idMain); clearInterval(rec.idPend);
+        _timers.delete(symbol);
       }
     } else {
-      for (const [s, rec] of _watcherTimers.entries()) {
-        if (rec.idMain) clearInterval(rec.idMain);
-        if (rec.idPend) clearInterval(rec.idPend);
-        _watcherTimers.delete(s);
+      for (const [s, rec] of _timers.entries()) {
+        clearInterval(rec.idMain); clearInterval(rec.idPend);
+        _timers.delete(s);
       }
     }
-    _running = _watcherTimers.size > 0;
-    log("Stopped watcher for", symbol || "ALL");
+    persistStore();
+    log("Watcher stopped", symbol || "ALL");
     return true;
-  } catch (e) {
-    log("stopReversalWatcher error", e?.message || e);
-    return false;
-  }
+  } catch (e) { log("stop err", e?.message || e); return false; }
 }
 
-function getWatcherState() {
-  cleanupAlerts();
+export function getWatcherState() {
   return {
-    running: _running,
-    symbols: Array.from(_watcherTimers.keys()),
-    pending: (_store.pending || []).slice(-50),
-    recentAlerts: (_store.alerts || []).slice(-50),
+    running: _timers.size > 0,
+    symbols: Array.from(_timers.keys()),
+    pending: STORE.pending.slice(-50),
+    recentAlerts: STORE.alerts.slice(-50),
     hourlyCount: hourlyCount(),
     accuracy: (typeof calculateAccuracy === "function") ? calculateAccuracy() : { accuracy: 0 }
   };
 }
 
-// export functions (named exports)
-export {
+// If module loaded and configured to auto-start
+if (CONFIG?.REVERSE_WATCHER?.AUTO_START && CONFIG.SYMBOL) {
+  try { startReversalWatcher(CONFIG.SYMBOL, CONFIG.REVERSE_WATCHER?.OPTIONS || {}, async (msg) => { 
+      // if you have a global telegram sender function, replace this or pass on start
+      if (typeof global.sendTelegram === "function") await global.sendTelegram(msg); else console.log("ALERT:", msg);
+    }); 
+  } catch (e) { log("autostart err", e?.message || e); }
+}
+
+export default {
   startReversalWatcher,
   stopReversalWatcher,
-  getWatcherState,
-  evaluateSymbolCandidate as evaluateSymbolCandidate, // exported for debugging
-  processPending as processPending // exported for manual trigger
+  getWatcherState
 };
