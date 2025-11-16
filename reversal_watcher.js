@@ -3,10 +3,12 @@
 //
 // Drop-in replacement for aiTraderBot.js usage of startReversalWatcher / stopReversalWatcher.
 //
-// Notes:
-// - Depends on: ./config.js, ./utils.js (fetchMarketData, fetchMultiTF), ./core_indicators.js (computeRSI, computeMACD, computeATR),
-//   ./elliott_module.js (analyzeElliott) and ./ml_module_v8_6.js (runMLPrediction, runMicroPrediction, recordPrediction, recordOutcome, calculateAccuracy)
-// - Persistence file: ./cache/reversal_watcher_store.json
+// Dependencies (must exist):
+// ./config.js
+// ./utils.js -> fetchMarketData, fetchMultiTF
+// ./core_indicators.js -> computeRSI, computeMACD, computeATR
+// ./elliott_module.js -> analyzeElliott
+// ./ml_module_v8_6.js -> runMLPrediction, runMicroPrediction, recordPrediction, recordOutcome, calculateAccuracy
 
 import fs from "fs";
 import path from "path";
@@ -453,8 +455,7 @@ async function evaluateSymbol(symbol, opts = {}, sendAlert = async () => {}) {
       pending.predId = null;
     }
 
-    STORE.pending.push(pending);
-    safeSave(STORE_FILE, STORE);
+    addPendingRecord(pending);
 
     // Build preview alert
     const atr = perTfResults[0] && perTfResults[0].candles ? indicators.computeATR(perTfResults[0].candles) : 0;
@@ -551,7 +552,6 @@ async function processAllPending(sendAlert = async () => {}, opts = {}) {
 
     } catch (e) {
       // keep loop alive on single error
-      // console.error("processAllPending error:", e?.message || e);
     }
   }
 }
@@ -579,75 +579,101 @@ function updatePendingRecordStatus(id, status, extra = {}) {
   safeSave(STORE_FILE, STORE);
 }
 
-// helper used by processAllPending scheduling to compute final move after X seconds
+// =====================
+// checkPostOutcome — FIXED & COMPLETE
+// =====================
 async function checkPostOutcome(pending, windowSec) {
   try {
-    const resp = await fetchMarketData(pending.symbol, "1m", Math.max(3, Math.ceil(windowSec/60) + 2));
-    const newPrice = resp?.price ?? null;
-    const priceAtSend = pending.priceAtDetect ?? (pending.perTfResults && pending.perTfResults[0]?.price) ?? 0;
-    const movedUp = newPrice > priceAtSend;
-    const success = (pending.side === "Bullish") ? movedUp : !movedUp;
-    const realizedReturn = priceAtSend ? ((newPrice - priceAtSend) / Math.max(1, Math.abs(priceAtSend))) * 100 : null;
-    return { ok: true, predId: pending.predId, windowSec, priceAtSend, newPrice, success, realizedReturn };
+    // fetch recent 1m candles to measure price after window
+    const resp = await fetchMarketData(
+      pending.symbol,
+      "1m",
+      Math.max(5, Math.ceil(windowSec / 60) + 5)
+    );
+
+    const candles = resp?.data || [];
+    if (!candles.length) {
+      return { success: false, reason: "no_candles", realizedReturn: 0, newPrice: null };
+    }
+
+    // use last closed price in fetched candles
+    const newPrice = candles.at(-1).close;
+
+    const priceAtSend =
+      pending.priceAtDetect ||
+      (pending.perTfResults &&
+        pending.perTfResults[0] &&
+        (pending.perTfResults[0].price ?? null)) ||
+      newPrice;
+
+    const movePct =
+      priceAtSend !== 0
+        ? ((newPrice - priceAtSend) / Math.abs(priceAtSend)) * 100
+        : 0;
+
+    const success = pending.side === "Bullish" ? (movePct > 0) : (movePct < 0);
+
+    return {
+      success,
+      realizedReturn: movePct,
+      newPrice
+    };
   } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
+    return {
+      success: false,
+      reason: e?.message || String(e),
+      realizedReturn: 0,
+      newPrice: null
+    };
   }
 }
 
 // =====================
-// Public API
+// Public API start/stop
 // =====================
 let _timers = new Map();
 
 export function startReversalWatcher(symbol = CONFIG.SYMBOL, options = {}, sendAlert = async () => {}) {
+  const opts = Object.assign({}, DEFAULTS, options);
   if (_timers.has(symbol)) return false;
-  const opts = Object.assign({}, DEFAULTS, options || {});
 
-  // Main tick: detection
-  const tick = async () => {
-    try {
-      await evaluateSymbol(symbol, opts, sendAlert);
-    } catch (e) { /* ignore */ }
-  };
+  // immediate tick then intervals
+  const tickFn = async () => { try { await evaluateSymbol(symbol, opts, sendAlert); } catch (e) {} };
+  const pendFn = async () => { try { await processAllPending(sendAlert, opts); } catch (e) {} };
 
-  // Pending tick: confirmation processing
-  const pendTick = async () => {
-    try {
-      await processAllPending(sendAlert, opts);
-    } catch (e) { /* ignore */ }
-  };
-
-  // Run immediately then schedule
-  tick();
-  const t1 = setInterval(tick, Math.max(1000, opts.pollIntervalMs || DEFAULTS.pollIntervalMs));
-  const pendIntervalMs = Math.max(10*1000, Math.min(60*1000, Math.floor((opts.confirmCandles || DEFAULTS.confirmCandles) * 15 * 1000)));
-  const t2 = setInterval(pendTick, pendIntervalMs);
-
-  _timers.set(symbol, { t1, t2 });
+  tickFn();
+  const mainId = setInterval(tickFn, opts.pollIntervalMs || DEFAULTS.pollIntervalMs);
+  const pendId = setInterval(pendFn, Math.max(8*1000, Math.min(60*1000, Math.floor((opts.confirmCandles || DEFAULTS.confirmCandles) * 15 * 1000))));
+  _timers.set(symbol, { mainId, pendId });
   return true;
 }
 
-export function stopReversalWatcher(symbol) {
-  if (symbol) {
-    const rec = _timers.get(symbol);
-    if (rec) {
-      clearInterval(rec.t1);
-      clearInterval(rec.t2);
-      _timers.delete(symbol);
+export async function stopReversalWatcher(symbol = null) {
+  try {
+    if (symbol) {
+      const rec = _timers.get(symbol);
+      if (rec) {
+        clearInterval(rec.mainId);
+        clearInterval(rec.pendId);
+        _timers.delete(symbol);
+      }
+    } else {
+      for (const [s, rec] of _timers.entries()) {
+        clearInterval(rec.mainId);
+        clearInterval(rec.pendId);
+        _timers.delete(s);
+      }
     }
-  } else {
-    for (const [s, rec] of _timers.entries()) {
-      clearInterval(rec.t1);
-      clearInterval(rec.t2);
-      _timers.delete(s);
-    }
+    return true;
+  } catch {
+    return false;
   }
-  return true;
 }
 
 export function getWatcherState() {
   return {
     running: _timers.size > 0,
+    symbols: Array.from(_timers.keys()),
     pending: STORE.pending.slice(-50),
     recent: STORE.recent.slice(-50),
     accuracy: (typeof calculateAccuracy === "function") ? calculateAccuracy() : { accuracy: 0 }
