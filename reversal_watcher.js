@@ -33,6 +33,9 @@ let _pendingMap = new Map(); // pendingID -> pending object
 let _lastAlertAt = 0;
 let _globalRateLimitSec = 6; // default throttle between alerts globally
 let _lastSentPerSymbol = new Map(); // symbol -> timestamp
+
+let _statusTicker = null;
+
 let _configDefaults = {
   pollIntervalMs: 20 * 1000,
   tfs: ["1m", "5m", "15m"],
