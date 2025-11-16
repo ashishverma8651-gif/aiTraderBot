@@ -92,15 +92,15 @@ function fibLevelsFromSwing(low, high) {
   return {
     lo: low, hi: high,
     retrace: {
-      '0.236': Number((high - diff*0.236).toFixed(6)),
-      '0.382': Number((high - diff*0.382).toFixed(6)),
-      '0.5': Number((high - diff*0.5).toFixed(6)),
-      '0.618': Number((high - diff*0.618).toFixed(6)),
-      '0.786': Number((high - diff*0.786).toFixed(6))
+      '0.236': Number((high - diff * 0.236).toFixed(6)),
+      '0.382': Number((high - diff * 0.382).toFixed(6)),
+      '0.5': Number((high - diff * 0.5).toFixed(6)),
+      '0.618': Number((high - diff * 0.618).toFixed(6)),
+      '0.786': Number((high - diff * 0.786).toFixed(6))
     },
     ext: {
-      '1.272': Number((high + diff*0.272).toFixed(6)),
-      '1.618': Number((high + diff*0.618).toFixed(6))
+      '1.272': Number((high + diff * 0.272).toFixed(6)),
+      '1.618': Number((high + diff * 0.618).toFixed(6))
     }
   };
 }
@@ -110,20 +110,17 @@ function fibLevelsFromSwing(low, high) {
 // ----------------------
 function detectHeadAndShoulders(pivots) {
   // Look for pattern: H - L - H - L - H  (for H&S top)
-  // pivots: sequence of H/L alternating. We'll search triplets of three highs with lows between.
   const patterns = [];
   for (let i = 0; i < pivots.length - 4; i++) {
     const a = pivots[i], b = pivots[i+1], c = pivots[i+2], d = pivots[i+3], e = pivots[i+4];
     if (a.type === 'H' && b.type === 'L' && c.type === 'H' && d.type === 'L' && e.type === 'H') {
       // potential H&S top: left shoulder (a), head (c), right shoulder (e)
-      // Neckline between lows b and d
       const neck = (b.price + d.price) / 2;
       const headHigher = c.price > a.price && c.price > e.price;
       if (!headHigher) continue;
-      // Confidence: how symmetric shoulders are and head prominence
       const shoulderSym = 1 - (Math.abs(a.price - e.price) / Math.max(1, (a.price + e.price)/2));
       const headProm = (c.price - Math.max(a.price,e.price)) / Math.max(1, c.price);
-      const confidence = Math.max(0, Math.min(1, (shoulderSym*0.5 + headProm*0.5)));
+      const confidence = Math.max(0, Math.min(1, (shoulderSym * 0.5 + headProm * 0.5)));
       const target = neck - (c.price - neck); // target measured move
       patterns.push({
         type: 'HeadAndShoulders',
@@ -131,7 +128,7 @@ function detectHeadAndShoulders(pivots) {
         pivots: [a,b,c,d,e].map(p=>({idx:p.idx, t:p.t, price:p.price, type:p.type})),
         neckline: neck,
         target,
-        confidence: Number((confidence*100).toFixed(1))
+        confidence: Number((confidence * 100).toFixed(1))
       });
     }
     // Inverse H&S (bottom)
@@ -141,7 +138,7 @@ function detectHeadAndShoulders(pivots) {
       if (!headLower) continue;
       const shoulderSym = 1 - (Math.abs(a.price - e.price) / Math.max(1, (a.price + e.price)/2));
       const headProm = (Math.min(a.price,e.price) - c.price) / Math.max(1, Math.min(a.price,e.price));
-      const confidence = Math.max(0, Math.min(1, (shoulderSym*0.5 + headProm*0.5)));
+      const confidence = Math.max(0, Math.min(1, (shoulderSym * 0.5 + headProm * 0.5)));
       const target = neck + (neck - c.price);
       patterns.push({
         type: 'InverseHeadAndShoulders',
@@ -149,7 +146,7 @@ function detectHeadAndShoulders(pivots) {
         pivots: [a,b,c,d,e].map(p=>({idx:p.idx, t:p.t, price:p.price, type:p.type})),
         neckline: neck,
         target,
-        confidence: Number((confidence*100).toFixed(1))
+        confidence: Number((confidence * 100).toFixed(1))
       });
     }
   }
@@ -176,7 +173,7 @@ function detectDoubleTopsBottoms(pivots) {
           pivots: [a,b,c].map(p=>({idx:p.idx, price:p.price, type:p.type})),
           neckline,
           target,
-          confidence: Number((closeness*100).toFixed(1))
+          confidence: Number((closeness * 100).toFixed(1))
         });
       }
     }
@@ -193,7 +190,7 @@ function detectDoubleTopsBottoms(pivots) {
           pivots: [a,b,c].map(p=>({idx:p.idx, price:p.price, type:p.type})),
           neckline,
           target,
-          confidence: Number((closeness*100).toFixed(1))
+          confidence: Number((closeness * 100).toFixed(1))
         });
       }
     }
@@ -217,7 +214,8 @@ function detectTriangles(pivots) {
       // Check contraction: highs decreasing, lows increasing
       const highsTrend = highs[0] - highs.at(-1); // positive if contracted downward
       const lowsTrend = lows.at(-1) - lows[0]; // positive if contracted upward
-      if (highsTrend > Math.max( (highs[0]*0.002),  (Math.abs(highs[0])*0.001)) && lowsTrend > Math.max((lows[0]*0.002),(Math.abs(lows[0])*0.001))) {
+      if (highsTrend > Math.max((highs[0]*0.002), (Math.abs(highs[0])*0.001)) &&
+          lowsTrend > Math.max((lows[0]*0.002), (Math.abs(lows[0])*0.001))) {
         // determine type
         const firstHigh = seq.find(p=>p.type==='H').price;
         const lastHigh = [...seq].reverse().find(p=>p.type==='H').price;
@@ -230,13 +228,13 @@ function detectTriangles(pivots) {
         else if (highSlope < 0 && lowSlope <= 0) triType = 'Descending';
         else if (highSlope >= 0 && lowSlope > 0) triType = 'Ascending';
         // confidence proportional to contraction ratio
-        const contraction = ( (highs[0]-highs.at(-1)) + (lows.at(-1)-lows[0]) ) / (Math.max(1, Math.abs(highs[0]) + Math.abs(lows[0])));
+        const contraction = ((highs[0]-highs.at(-1)) + (lows.at(-1)-lows[0])) / (Math.max(1, Math.abs(highs[0]) + Math.abs(lows[0])));
         patterns.push({
           type: 'Triangle',
           triType,
           pivots: seq.map(p=>({idx:p.idx, price:p.price, type:p.type})),
-          contraction: Number((contraction*100).toFixed(1)),
-          confidence: Math.min(99, Math.max(30, Math.round(contraction*100)))
+          contraction: Number((contraction * 100).toFixed(1)),
+          confidence: Math.min(99, Math.max(30, Math.round(contraction * 100)))
         });
       }
     }
@@ -272,7 +270,7 @@ function detectChannels(pivots) {
   };
   const highFit = fit(highs);
   const lowFit = fit(lows);
-  const width = highs.reduce((a,b)=>a + Math.abs(b.price - (lowFit.slope*(highs.indexOf(b)) + lowFit.intercept)),0)/Math.max(1,highs.length);
+  const width = highs.reduce((a,b)=>a + Math.abs(b.price - (lowFit.slope * highs.indexOf(b) + lowFit.intercept)),0)/Math.max(1,highs.length);
   channels.push({
     type: 'RegressionChannel',
     highFit, lowFit,
@@ -373,10 +371,8 @@ function detectSFP(candles, pivots) {
   const sfps = [];
   for (let i = 1; i < pivots.length - 1; i++) {
     const p = pivots[i];
-    // check if previous pivot sets a structure and p is extreme wick beyond it then reversal
     const prev = pivots[i-1], next = pivots[i+1];
     if (!prev || !next) continue;
-    // Example: bullish SFP = low pushes below prior low but closes above
     if (p.type === 'L') {
       const candle = candles[p.idx];
       const lowerThanPrev = p.price < prev.price;
@@ -401,154 +397,84 @@ function detectSFP(candles, pivots) {
 // Market Structure Breaks (BOS / CHoCH)
 // ----------------------
 function detectMarketStructure(candles, pivots) {
-  // Basic approach: compare latest pivots with previous structure
   const ms = [];
   if (pivots.length < 4) return ms;
-  const lastPivot = pivots.at(-1);
   const prevHighs = pivots.filter(p=>p.type==='H').slice(-3).map(p=>p.price);
   const prevLows = pivots.filter(p=>p.type==='L').slice(-3).map(p=>p.price);
-
-  // BOS up: higher high higher low sequence broken upwards
-  const hh = Math.max(...prevHighs);
-  const ll = Math.min(...prevLows);
-  const price = candles.at(-1).close;
-  if (price > hh) ms.push({ type: 'BOS', side: 'Bullish', price });
-  if (price < ll) ms.push({ type: 'BOS', side: 'Bearish', price });
-
-  // CHoCH detection (change of character): quick reversal crossing recent structure
-  // If last pivot direction flips and new pivot crosses mid-range
+  if (prevHighs.length && prevLows.length) {
+    const hh = Math.max(...prevHighs);
+    const ll = Math.min(...prevLows);
+    const price = safeNum(candles.at(-1)?.close || 0);
+    if (price > hh) ms.push({ type: 'BOS', side: 'Bullish', price });
+    if (price < ll) ms.push({ type: 'BOS', side: 'Bearish', price });
+  }
   const lastTwo = pivots.slice(-3);
   if (lastTwo.length >= 3) {
     const a = lastTwo[0], b = lastTwo[1], c = lastTwo[2];
     if (a.type !== c.type) {
-      // cross detection
       if (c.type === 'H' && c.price < b.price) ms.push({ type: 'CHoCH', side: 'Bearish', info: { a,b,c }});
       if (c.type === 'L' && c.price > b.price) ms.push({ type: 'CHoCH', side: 'Bullish', info: { a,b,c }});
     }
   }
-
   return ms;
 }
 
-
 // ----------------------
-// TP/SL generator (RESTORED BOTH-SIDE MODE)
+// TP/SL generator
 // ----------------------
 function generateTargets({ price, atr, patterns = [], fib = null, channels = [], orderBlocks = [] }) {
+  // Combine pattern targets (if present) and ATR/fib fallback
   const tps = [];
   const sls = [];
-
-  // --- pattern based targets (ALWAYS BOTH SIDES) ---
-  (patterns || []).forEach(p => {
-    if (!p.target) return;
-
-    const tpValue = Number(p.target);
-    const conf = p.confidence || 50;
-
-    // LONG TP (always)
-    tps.push({
-      source: p.type,
-      side: "LONG",
-      tp: tpValue,
-      confidence: conf
-    });
-
-    // SHORT TP (always)
-    tps.push({
-      source: p.type,
-      side: "SHORT",
-      tp: tpValue,
-      confidence: conf
-    });
-
-    // SL for long
-    let slLong;
-    if (p.type === "HeadAndShoulders" || p.type === "InverseHeadAndShoulders") {
-      slLong = p.pivots[2].price - atr * 1.2;
-    } else {
-      slLong = Math.min(...p.pivots.map(x => x.price)) - atr * 1.5;
+  // pattern-based
+  (patterns || []).forEach(p=>{
+    if (p.target) {
+      const tp = Number(p.target);
+      // side literal for reporter (Bullish/Bearish kept)
+      const side = p.side;
+      // SL: use neckline/structure +/- ATR if available
+      let sl = null;
+      if (p.type === 'HeadAndShoulders' || p.type === 'InverseHeadAndShoulders') {
+        // use neckline +/- ATR
+        if (p.side === 'Bullish') sl = p.pivots[2].price - atr * 1.2;
+        else sl = p.pivots[2].price + atr * 1.2;
+      } else {
+        if (p.side === 'Bullish') sl = Math.min(...p.pivots.map(x=>x.price)) - atr * 1.5;
+        else sl = Math.max(...p.pivots.map(x=>x.price)) + atr * 1.5;
+      }
+      tps.push({ source: p.type, side: p.side, tp, confidence: p.confidence || 50 });
+      sls.push({ source: p.type, side: p.side, sl, confidence: p.confidence || 50 });
     }
-    sls.push({
-      source: p.type,
-      side: "LONG",
-      sl: slLong,
-      confidence: conf
-    });
-
-    // SL for short
-    let slShort;
-    if (p.type === "HeadAndShoulders" || p.type === "InverseHeadAndShoulders") {
-      slShort = p.pivots[2].price + atr * 1.2;
-    } else {
-      slShort = Math.max(...p.pivots.map(x => x.price)) + atr * 1.5;
-    }
-    sls.push({
-      source: p.type,
-      side: "SHORT",
-      sl: slShort,
-      confidence: conf
-    });
   });
-
-  // --- If no pattern targets, fallback to fib/atr ---
+  // harmonics produce potential exact D targets
+  // if none, use fib ext or ATR multiples
   if (!tps.length) {
-    if (fib?.ext) {
-      tps.push(
-        { source: "FIB_1.272", side: "LONG", tp: fib.ext["1.272"], confidence: 50 },
-        { source: "FIB_1.272", side: "SHORT", tp: fib.ext["1.272"], confidence: 50 },
-        { source: "FIB_1.618", side: "LONG", tp: fib.ext["1.618"], confidence: 50 },
-        { source: "FIB_1.618", side: "SHORT", tp: fib.ext["1.618"], confidence: 50 }
-      );
-      sls.push(
-        { source: "ATR_SL", side: "LONG", sl: price - atr * 2 },
-        { source: "ATR_SL", side: "SHORT", sl: price + atr * 2 }
-      );
+    if (fib && fib.ext) {
+      // use 1.272 and 1.618
+      tps.push({ source: 'FIB_1.272', side: 'BOTH', tp: fib.ext['1.272'] });
+      tps.push({ source: 'FIB_1.618', side: 'BOTH', tp: fib.ext['1.618'] });
+      sls.push({ source: 'ATR_SL', sl: price - atr * 2 });
     } else {
-      tps.push(
-        { source: "ATR_MULT", side: "LONG", tp: price + atr * 3, confidence: 50 },
-        { source: "ATR_MULT", side: "SHORT", tp: price - atr * 3, confidence: 50 }
-      );
-      sls.push(
-        { source: "ATR_SL", side: "LONG", sl: price - atr * 2 },
-        { source: "ATR_SL", side: "SHORT", sl: price + atr * 2 }
-      );
+      tps.push({ source: 'ATR_MULT', side: 'BOTH', tp: price + atr * 3 });
+      sls.push({ source: 'ATR_SL', sl: price - atr * 2 });
     }
   }
-
-  // --- ORDERBLOCK add-ons ---
-  (orderBlocks || []).slice(-3).forEach(ob => {
-    const conf = ob.confidence || 50;
-
-    // Both side targets
-    tps.push({
-      source: "OrderBlock",
-      side: "LONG",
-      tp: ob.levelHigh + atr * 2,
-      confidence: conf
+  // orderblock based nearest levels
+  if (orderBlocks && orderBlocks.length) {
+    orderBlocks.slice(-3).forEach(ob=>{
+      tps.push({ source: 'OrderBlock', side: ob.side, tp: ob.side === 'Bullish' ? ob.levelHigh + atr * 2 : ob.levelLow - atr * 2, confidence: ob.confidence });
     });
-
-    tps.push({
-      source: "OrderBlock",
-      side: "SHORT",
-      tp: ob.levelLow - atr * 2,
-      confidence: conf
-    });
-  });
-
-  // --- Clean duplicates ---
-  const uniqueTP = [];
-  const seen = new Set();
-  for (const t of tps) {
-    const k = `${t.side}_${Math.round(t.tp)}`;
-    if (!seen.has(k)) { seen.add(k); uniqueTP.push(t); }
   }
 
-  return {
-    targets: uniqueTP.sort((a, b) => a.tp - b.tp),
-    stops: sls
-  };
+  // dedupe and format numbers
+  const uniqTps = [];
+  const tset = new Set();
+  for (const tp of tps) {
+    const key = `${Math.round(tp.tp||0)}_${tp.source}`;
+    if (!tset.has(key)) { tset.add(key); uniqTps.push(tp); }
+  }
+  return { targets: uniqTps, stops: sls };
 }
-
 
 // ----------------------
 // SCORING & SENTIMENT
@@ -559,13 +485,14 @@ function scoreEverything({ patterns=[], harmonics=[], channels=[], sfps=[], ms=[
   // patterns
   patterns.forEach(p => { score += (p.confidence || 50) * (p.side === 'Bullish' ? 1 : -1); weight += 100; });
   harmonics.forEach(h => { score += (h.confidence || 50) * (h.side === 'Bullish' ? 1 : -1); weight += 80; });
-  channels.forEach(c => { score += (c.confidence || 50) * (c.highFit && c.lowFit ? 0 : 10); weight += 40; });
+  channels.forEach(c => { score += (c.confidence || 50) * ((c.highFit && c.lowFit) ? 0 : 10); weight += 40; });
   sfps.forEach(s => { score += s.type === 'BullishSFP' ? 30 : -30; weight += 30; });
   ms.forEach(m => { score += m.side === 'Bullish' ? 40 : -40; weight += 40; });
   if (weight === 0) return { sentiment: 0, confidence: 30 };
   const sentiment = Math.max(-1, Math.min(1, score / (weight)));
   const confidence = Math.min(99, Math.max(10, Math.round(Math.abs(score) / Math.max(1, weight) * 200)));
-  return { sentiment: Number(sentiment.toFixed(3)), confidence };
+  return { sentiment:
+Number(sentiment.toFixed(3)), confidence };
 }
 
 // ----------------------
@@ -579,9 +506,10 @@ export async function analyzeElliott(candles = [], opts = {}) {
     const pivots = findPivots(candles, left, right);
     const waves = mapWavesFromPivots(pivots);
     const atr = computeATR(candles, opts.atrPeriod || 14);
-    // major swing for fib (use last 20 pivots)
-    const majorHigh = Math.max(...candles.slice(-200).map(c=>c.high));
-    const majorLow = Math.min(...candles.slice(-200).map(c=>c.low));
+    // major swing for fib (use last 200 candles)
+    const sliceForSwing = candles.slice(-200);
+    const majorHigh = Math.max(...sliceForSwing.map(c=>safeNum(c.high)));
+    const majorLow = Math.min(...sliceForSwing.map(c=>safeNum(c.low)));
     const fib = fibLevelsFromSwing(majorLow, majorHigh);
 
     // detect patterns
