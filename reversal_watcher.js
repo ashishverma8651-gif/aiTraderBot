@@ -1,234 +1,176 @@
-// ======================================================
-// reversal_watcher.js — FINAL STABLE VERSION
-// Fully compatible with aiTraderBot.js
-// ======================================================
+// reversal_watcher.js — FINAL NO-ENTRY-ZONE VERSION
+//--------------------------------------------------
 
-import { fetchMultiTF, nowLocal } from "./utils.js";
+import { fetchMarketData } from "./utils.js";
 import {
   runMicroPrediction,
   runMLPrediction,
   recordPrediction,
   recordOutcome,
   calculateAccuracy
-} from "./ml_module_v8_6.js";   // <-- YOUR ML FILE NAME
+} from "./ml_module_v8_6.js";  // EXACT ML MODULE
 
-
+//--------------------------------------------------
 // INTERNAL STATE
+//--------------------------------------------------
 let _running = false;
-let _timer = null;
+let _loop = null;
 
-let _pending = new Map(); // pendingID → object
-let _lastSent = new Map(); // symbol → timestamp
-let _lastGlobal = 0;
+let _pending = new Map();          // pendingID → object
+let _lastAlertTime = 0;
+let _rateLimitGlobal = 6;          // seconds
 
-let CONFIG_DEFAULTS = {
-  pollIntervalMs: 20000,
-  tfs: ["1m", "5m", "15m"],
-  weights: { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
-  minAlertConfidence: 65,
+//--------------------------------------------------
+// HELPERS
+//--------------------------------------------------
 
-  // ML tuning
-  microLookback: 60,
-  feedbackWindowsSec: [60, 300],
-
-  // rate limit
-  maxAlertsPerMinutePerSymbol: 3,
-  symbolCooldownSec: 20
-};
-
-
-// UTILS
-function genID(prefix) {
-  return prefix + "_" + Date.now() + "_" + Math.floor(Math.random() * 99999);
+function nowIST() {
+  return new Date().toLocaleString("en-IN", { hour12: true, timeZone: "Asia/Kolkata" });
 }
 
-function rateLimited(symbol) {
-  const now = Date.now();
-
-  // global throttle
-  if (now - _lastGlobal < 6000) return true;
-
-  // per symbol throttle
-  const last = _lastSent.get(symbol) || 0;
-  if (now - last < CONFIG_DEFAULTS.symbolCooldownSec * 1000) return true;
-
-  return false;
+function rateLimited() {
+  return (Date.now() - _lastAlertTime) < _rateLimitGlobal * 1000;
 }
 
-function markSent(symbol) {
-  const now = Date.now();
-  _lastGlobal = now;
-  _lastSent.set(symbol, now);
+function send(onAlert, msg) {
+  if (typeof onAlert === "function") onAlert(msg);
 }
 
+//--------------------------------------------------
+// MAIN DETECTION LOGIC
+//--------------------------------------------------
 
-// ENTRY ZONE BUILDER
-function buildEntryZone(tfCandles) {
-  const lows = [];
-  const highs = [];
+async function analyze(symbol, cfg, onAlert) {
 
-  for (const tf of Object.values(tfCandles)) {
-    if (!tf.data || !tf.data.length) continue;
+  const m = await fetchMarketData(symbol, "1m", 60);
+  const f = await fetchMarketData(symbol, "5m", 60);
+  const t = await fetchMarketData(symbol, "15m", 60);
 
-    const arr = tf.data.slice(-40);
-    const lo = Math.min(...arr.map(c => c.low));
-    const hi = Math.max(...arr.map(c => c.high));
+  const price = m.price;
 
-    lows.push(lo);
-    highs.push(hi);
-  }
+  if (!m.data.length || !f.data.length || !t.data.length) return;
 
-  if (!lows.length || !highs.length) return null;
+  // basic directional score
+  const dir1 = m.price > m.data[m.data.length - 2].close ? 1 : -1;
+  const dir5 = f.price > f.data[f.data.length - 2].close ? 1 : -1;
+  const dir15 = t.price > t.data[t.data.length - 2].close ? 1 : -1;
 
-  return {
-    low: Math.min(...lows),
-    high: Math.max(...highs)
-  };
-}
+  const score =
+    dir1 * cfg.weights["1m"] +
+    dir5 * cfg.weights["5m"] +
+    dir15 * cfg.weights["15m"];
 
+  let direction = score > 0 ? "Bullish" : "Bearish";
+  let absScore = Math.round(Math.abs(score) * 100);
 
-// ENTRY ZONE ALERT MESSAGE
-function formatEntryZone(symbol, zone, price, score) {
-  return `🔔 ENTRY ZONE ALERT
+  // MICRO ML
+  const micro = await runMicroPrediction(symbol, { price, tf: "1m" });
+  const ml = await runMLPrediction(symbol, { price });
+
+  const microProb = Math.round((micro?.prob || 0) * 100);
+  const mlProb = Math.round((ml?.prob || 0) * 100);
+
+  // FEEDBACK ACCURACY
+  const acc1 = await calculateAccuracy(symbol, 60);
+  const acc5 = await calculateAccuracy(symbol, 300);
+
+  // ------------------------------------------------------
+  // TRIGGER PENDING REVERSAL
+  // ------------------------------------------------------
+  if (absScore >= cfg.minAlertConfidence) {
+    const id = "pend_" + Date.now();
+    _pending.set(id, {
+      id,
+      symbol,
+      direction,
+      createdAt: Date.now(),
+      price,
+      score: absScore,
+      microProb,
+      mlProb,
+      acc1,
+      acc5
+    });
+
+    if (!rateLimited()) {
+      _lastAlertTime = Date.now();
+
+      send(onAlert,
+`⚡ <b>REVERSAL DETECTED — Pending</b>
 Symbol: ${symbol}
-Zone: ${zone.low.toFixed(2)} - ${zone.high.toFixed(2)}
-Score: ${score}% | Price: ${price}
-Instant entry zone touch`;
-}
+Direction: <b>${direction}</b>
+Price: ${price}
 
+Score: ${absScore}%
+Micro-ML: ${microProb}%
+Historical Accuracy (1m/5m): ${acc1}% / ${acc5}%
 
-// REVERSAL MESSAGE
-function formatPending(symbol, zone, side, score, price, micro) {
-  return `⚡ REVERSAL DETECTED (PENDING) — ${side}
-Symbol: ${symbol}
-Zone: ${zone.low.toFixed(2)} - ${zone.high.toFixed(2)}
-Score: ${score}% | Price: ${price}
-MicroML: ${micro?.label || "NA"} (${micro?.prob || 0}%)
-PendingID: ${genID("pend")}`;
-}
-
-function formatConfirmed(symbol, side, price, micro) {
-  return `🟢 REVERSAL CONFIRMED — ${side}
-Symbol: ${symbol} | Price: ${price}
-MicroML: ${micro?.label || "NA"} (${micro?.prob || 0}%)
-ID: ${genID("conf")}`;
-}
-
-
-// MAIN LOGIC
-async function scan(symbol, USER_CFG, sendFn) {
-  const CFG = { ...CONFIG_DEFAULTS, ...USER_CFG };
-
-  const tfs = await fetchMultiTF(symbol, CFG.tfs);
-  const price = tfs["1m"]?.price || 0;
-  if (!price) return;
-
-  const zone = buildEntryZone(tfs);
-  if (!zone) return;
-
-  // compute position inside zone
-  const zoneSize = zone.high - zone.low;
-  const pos = ((price - zone.low) / zoneSize);
-  const score = Math.round(pos * 100);
-
-  // ENTRY ZONE TOUCH
-  if (price >= zone.low && price <= zone.high) {
-
-    if (!rateLimited(symbol)) {
-      await sendFn(formatEntryZone(symbol, zone, price, score));
-      markSent(symbol);
+Pending ID: <code>${id}</code>
+⏳ Waiting for confirmation…`);
     }
   }
 
-  // Check REVERSAL direction
-  let side = null;
-  if (price > zone.high) side = "Bullish";   // breakout up
-  else if (price < zone.low) side = "Bearish"; // breakout down
-  else return;
+  // ------------------------------------------------------
+  // CONFIRMATION CHECK
+  // ------------------------------------------------------
+  for (const [pid, p] of _pending.entries()) {
+    if (Date.now() - p.createdAt < 8000) continue;
 
-  const micro = await runMicroPrediction(symbol, CFG.microLookback);
-  const microProb = Math.round(micro?.prob || 0);
+    // confirmation rule
+    if (p.microProb >= cfg.confirmThreshold || p.mlProb >= cfg.confirmThreshold) {
 
-  const weightedScore = Math.round(
-    score * CFG.weights["1m"] +
-    score * CFG.weights["5m"] +
-    score * CFG.weights["15m"]
-  );
+      _pending.delete(pid);
 
-  if (weightedScore < CFG.minAlertConfidence) return;
+      if (!rateLimited()) {
+        _lastAlertTime = Date.now();
 
-  // CREATE PENDING
-  const pendID = genID("pend");
-  _pending.set(pendID, {
-    id: pendID,
-    symbol,
-    side,
-    createdAt: Date.now(),
-    entryZone: zone,
-    priceAtTrigger: price,
-    micro
-  });
+        const cid = "conf_" + Date.now();
 
-  if (!rateLimited(symbol)) {
-    await sendFn(formatPending(symbol, zone, side, weightedScore, price, micro));
-    markSent(symbol);
-  }
+        send(onAlert,
+`${p.direction === "Bullish" ? "🟢" : "🔴"} <b>REVERSAL CONFIRMED — ${p.direction}</b>
+Symbol: ${symbol}
+Entry Price: ${p.price}
 
-  // CONFIRMATION after breakout follows through
-  if ((side === "Bullish" && price > zone.high * 1.001) ||
-      (side === "Bearish" && price < zone.low * 0.999)) {
+Strength Score: ${p.score}%
+Micro-ML: ${p.microProb}%
+Signal Reliability: ${Math.round((p.acc1 + p.acc5) / 2)}%
 
-    const confMsg = formatConfirmed(symbol, side, price, micro);
+ID: <code>${cid}</code>`);
 
-    if (!rateLimited(symbol)) {
-      await sendFn(confMsg);
-      markSent(symbol);
+      }
     }
-
-    // ML FEEDBACK
-    try {
-      await recordPrediction({
-        symbol,
-        predictedAt: new Date().toISOString(),
-        label: side,
-        prob: microProb,
-        features: micro.features || micro.featureVector
-      });
-    } catch (e) {}
-
-    try {
-      const acc = await calculateAccuracy(symbol, CFG.feedbackWindowsSec);
-      console.log("ML Accuracy:", acc);
-    } catch (e) {}
-
-    _pending.delete(pendID);
   }
+
 }
 
+//--------------------------------------------------
+// START / STOP
+//--------------------------------------------------
 
-// START
-export function startReversalWatcher(symbol, cfg, sendFn) {
+export function startReversalWatcher(symbol, cfg = {}, onAlert) {
   if (_running) return;
+
+  const config = {
+    pollIntervalMs: cfg.pollIntervalMs || 20000,
+    tfs: cfg.tfs || ["1m", "5m", "15m"],
+    weights: cfg.weights || { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
+    minAlertConfidence: cfg.minAlertConfidence || 65,
+    confirmThreshold: cfg.confirmThreshold || 70
+  };
+
+  console.log("🔥 Reversal Watcher STARTED for", symbol, "CFG:", config);
+
   _running = true;
 
-  console.log("🚀 Reversal Watcher STARTED");
-
-  _timer = setInterval(() => {
-    scan(symbol, cfg, sendFn).catch(e => console.log("RevScan error:", e.message));
-  }, (cfg.pollIntervalMs || 20000));
+  _loop = setInterval(() => {
+    analyze(symbol, config, onAlert);
+  }, config.pollIntervalMs);
 }
 
-
-// STOP
 export function stopReversalWatcher() {
-  return new Promise(resolve => {
-    if (_timer) clearInterval(_timer);
-    _running = false;
-    resolve();
-  });
+  if (!_running) return;
+  _running = false;
+  if (_loop) clearInterval(_loop);
+  _loop = null;
+  console.log("🛑 Reversal Watcher STOPPED");
 }
-
-export default {
-  startReversalWatcher,
-  stopReversalWatcher
-};
