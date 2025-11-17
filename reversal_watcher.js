@@ -1,7 +1,7 @@
 // reversal_watcher.js — FINAL (ML v8.7 + Elliott Fusion + Anti-Spam)
 
 import { fetchMarketData, safeAxiosGet, fetchMultiTF } from "./utils.js";
-import { runMicroPrediction, runMLPrediction, recordPrediction } from "./ml_module_v8_7.js";
+import { runMicroPrediction, runMLPrediction, recordPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 
 let _interval = null;
