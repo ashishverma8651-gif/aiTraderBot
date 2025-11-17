@@ -19,7 +19,8 @@ const {
   recordPrediction
 } = ML;
 
-const { fetchNewsBundle } = NEWS;
+// correct import usage (News is the default export object)
+const { fetchNewsBundle } = News;
 
 // Telegram bot
 const bot = new TelegramBot(process.env.TG_BOT_TOKEN, { polling: true });
@@ -71,7 +72,7 @@ async function safeSend(chatId, text) {
 // --------------------
 function renderTFblock(tf, obj) {
   // obj: { rsi, macd, volText, atr, ellPattern, ellConf, s, r, tps[], sl }
-  const volIcon = obj.volText.includes("🔼") ? "🔼" : obj.volText.includes("🔽") ? "🔽" : "🔻";
+  const volIcon = (obj.volText || "").includes("🔼") ? "🔼" : (obj.volText || "").includes("🔽") ? "🔽" : "🔻";
 
   const tps =
     (obj.tps && obj.tps.length)
@@ -79,11 +80,11 @@ function renderTFblock(tf, obj) {
       : "N/A";
 
   return `
-🕒 <b>${tf}</b> — ${obj.biasIcon}
+🕒 <b>${tf}</b> — ${obj.biasIcon || "⚪"}
 RSI ${obj.rsi} | MACD ${obj.macd} | Vol ${volIcon} | ATR ${obj.atr}
 Elliott: ${obj.ellPattern} | Conf ${obj.ellConf}%
 S: ${obj.s} | R: ${obj.r}
-TP 🎯: ${tps}  
+TP 🎯: ${tps}    
 SL: ${obj.sl}
   `.trim();
 }
@@ -93,10 +94,30 @@ SL: ${obj.sl}
 // --------------------
 function biasIconFrom(direction) {
   if (!direction) return "⚪";
-  if (direction.includes("Bull")) return "🟢 BUY";
-  if (direction.includes("Bear")) return "🔴 SELL";
+  const d = String(direction).toLowerCase();
+  if (d.includes("bull")) return "🟢 BUY";
+  if (d.includes("bear")) return "🔴 SELL";
   return "🟡 NEUTRAL";
 }
+
+export {
+  bot,
+  safeSend,
+  renderTFblock,
+  biasIconFrom,
+  NF,
+  isNum,
+  ellipsis,
+  nowIST,
+  runMLPrediction,
+  runMicroPrediction,
+  calculateAccuracy,
+  recordOutcome,
+  recordPrediction,
+  fetchNewsBundle,
+  fetchMultiTF,
+  fetchMarketData
+};
 
 // ===============================
 // tg_commands.js (FULL FILE PART 2/3)
