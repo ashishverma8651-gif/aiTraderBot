@@ -1,6 +1,15 @@
-// reversal_watcher.js
-// Advanced Pattern+Volume Reversal Watcher with ML feedback
-// Exported API: startReversalWatcher(symbol, opts, sendFunc) and stopReversalWatcher()
+// reversal_watcher.js — PATcHED v1.0 (ML v8_6 compatible)
+// Advanced Pattern+Volume Reversal Watcher with micro-ML + main ML + feedback
+//
+// Exports:
+//   startReversalWatcher(symbol, opts, sendAlert)
+//   stopReversalWatcher()
+//   getWatcherState()
+//
+// Dependencies: ./utils.js (fetchMultiTF), ./ml_module_v8_6.js (runMicroPrediction, runMLPrediction, recordPrediction, recordOutcome, calculateAccuracy)
+
+import fs from "fs";
+import path from "path";
 
 import { fetchMultiTF } from "./utils.js";
 import {
@@ -11,265 +20,318 @@ import {
   calculateAccuracy
 } from "./ml_module_v8_6.js";
 
+// -------------------- Persistence --------------------
+const CACHE_DIR = path.resolve(process.cwd(), "cache");
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+const STORE_FILE = path.join(CACHE_DIR, "reversal_watcher_store.json");
+
+function safeLoad(fp, def = {}) {
+  try {
+    if (!fs.existsSync(fp)) return def;
+    return JSON.parse(fs.readFileSync(fp, "utf8") || "{}");
+  } catch {
+    return def;
+  }
+}
+function safeSave(fp, obj) {
+  try {
+    fs.writeFileSync(fp, JSON.stringify(obj, null, 2));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// -------------------- Defaults --------------------
 const DEFAULTS = {
-  pollIntervalMs: 20 * 1000,
-  tfs: ["1m", "5m", "15m"],
+  pollIntervalMs: 20 * 1000,         // main loop
+  tfs: ["1m", "5m", "15m"],          // ordered from fastest to slowest
   weights: { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
-  requireSupportCount: 2,          // how many TFs must agree
-  minScorePct: 50,                 // combined score minimum to create pending
-  volumeRVolThreshold: 1.2,        // last volume >= avg * this
-  microLookback: 60,               // seconds for micro ML
-  confirmWindowMs: 90 * 1000,      // time window to confirm pending (e.g., 90s)
-  confirmByNextCandle: true,       // require next candle in same direction to confirm
-  maxPendingPerSymbol: 4,
-  globalRateLimitSec: 6,           // global minimal secs between messages
-  perSymbolCooldownSec: 30,        // per symbol cooldown after confirmed
-  maxAlertsBurst: 3,               // safety
-  enableML: true,
+  requireSupportCount: 2,            // TF count that must support reversal
+  minScorePct: 55,                   // minimum combined score to create pending
+  volumeRVolThreshold: 0.9,          // relative vol threshold (if <, lowers score)
+  microLookbackSec: 60,              // micro ml lookback in seconds (used only to fetch micro features)
+  microAlert: true,                  // allow micro-ML immediate alerts (lightweight)
+  microAlertProbThresh: 75,          // micro-ML prob percent threshold to consider immediate micro-alert
+  confirmWindowMs: 2 * 60 * 1000,    // pending expires after this
+  confirmByNextCandle: true,         // require small TF's next candle direction as optional confirmation
+  maxPendingPerSymbol: 3,
+  globalRateLimitSec: 8,             // global minimal secs between sending messages
+  perSymbolCooldownSec: 30,          // cooldown per symbol after confirmed
+  maxAlertsBurst: 3,                 // burst limiter
+  enableML: true,                    // whether to run main ML (async)
+  mlMainGateMinProb: 20,             // don't aggressively block — only strong contradictions below this (0..100)
+  debounceSimilarZonePct: 0.005,     // 0.5% same-zone dedupe
+  feedbackWindowsSec: [60, 300],     // check outcomes after these seconds
   spamWindowSec: 60
 };
 
-// internal state
-let _running = false;
-let _timer = null;
-let _pending = new Map(); // pendingId -> {symbol, side, createdAt, supportTFs, zone, details, mlPredId?}
-let _lastSentAt = 0;
-let _lastSentPerSymbol = new Map(); // symbol -> ts
-let _alertsBurstCount = 0;
+// -------------------- Internal store --------------------
+let STORE = safeLoad(STORE_FILE, { pending: [], recent: [], hourly: [] });
+STORE.pending = Array.isArray(STORE.pending) ? STORE.pending : [];
+STORE.recent = Array.isArray(STORE.recent) ? STORE.recent : [];
+STORE.hourly = Array.isArray(STORE.hourly) ? STORE.hourly : [];
+
+function persistState() { safeSave(STORE_FILE, STORE); }
+
+// -------------------- Internal runtime state --------------------
 let _opts = null;
 let _sendFunc = null;
+let _timer = null;
+let _running = false;
+let _pendingMap = new Map(); // id -> pending obj
+let _lastSentAt = 0;
+let _lastSentPerSymbol = new Map();
+let _burstCount = 0;
 
-// util helpers
+// -------------------- Utils --------------------
 const nowTs = () => Date.now();
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-function uid(prefix = "pend") {
-  return `${prefix}_${Date.now()}_${Math.floor(Math.random()*9000)}`;
-}
+const uid = (prefix = "p") => `${prefix}_${Date.now()}_${Math.floor(Math.random()*9000)}`;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-// Candle helpers
-function last(candles) { return (candles && candles.length) ? candles.at(-1) : null; }
-function avgVolume(candles, n = 20) {
+// candle helpers
+function last(c) { return Array.isArray(c) && c.length ? c.at(-1) : null; }
+function avgVol(candles, n = 20) {
   const arr = (candles || []).slice(-n);
   if (!arr.length) return 1;
-  const s = arr.reduce((acc, c) => acc + (c.vol || c.volume || 0), 0);
+  const s = arr.reduce((acc, c) => acc + (c.vol ?? c.volume ?? 0), 0);
   return s / arr.length;
 }
 
-// Simple pattern detectors (work on candle objects {open,high,low,close,vol})
+// -------------------- Pattern detection --------------------
 function isBullishEngulfing(prev, cur) {
   if (!prev || !cur) return false;
-  return (prev.close < prev.open) && (cur.close > cur.open) && (cur.open < prev.close) && (cur.close > prev.open);
+  return prev.close < prev.open && cur.close > cur.open && cur.open < prev.close && cur.close > prev.open;
 }
 function isBearishEngulfing(prev, cur) {
   if (!prev || !cur) return false;
-  return (prev.close > prev.open) && (cur.close < cur.open) && (cur.open > prev.close) && (cur.close < prev.open);
+  return prev.close > prev.open && cur.close < cur.open && cur.open > prev.close && cur.close < prev.open;
 }
 function isHammer(c) {
   if (!c) return false;
-  const body = Math.abs(c.close - c.open);
+  const body = Math.abs(c.close - c.open) || 1;
   const lower = Math.min(c.open, c.close) - c.low;
   const upper = c.high - Math.max(c.open, c.close);
-  return lower > (body * 1.5) && upper < (body * 0.6);
-}
-function isInvertedHammer(c) {
-  if (!c) return false;
-  const body = Math.abs(c.close - c.open);
-  const lower = Math.min(c.open, c.close) - c.low;
-  const upper = c.high - Math.max(c.open, c.close);
-  return upper > (body * 1.5) && lower < (body * 0.6);
+  return lower > body * 1.6 && upper < body * 0.6 && c.close > c.open;
 }
 function isShootingStar(c) {
   if (!c) return false;
-  const body = Math.abs(c.close - c.open);
+  const body = Math.abs(c.close - c.open) || 1;
   const upper = c.high - Math.max(c.open, c.close);
   const lower = Math.min(c.open, c.close) - c.low;
-  return upper > (body * 1.6) && lower < (body * 0.6) && (c.close < c.open);
+  return upper > body * 1.6 && lower < body * 0.6 && c.close < c.open;
 }
-// basic tweezer detection (top/bottom) for last two candles
-function isTweezerTop(c1, c2) {
-  if (!c1 || !c2) return false;
-  return (Math.abs(c1.high - c2.high) / Math.max(1, Math.min(c1.high, c2.high)) < 0.002) &&
-         (c1.close < c1.open) && (c2.close < c2.open);
+function isTweezerTop(a,b) {
+  if (!a || !b) return false;
+  return Math.abs(a.high - b.high) / Math.max(1, Math.min(a.high, b.high)) < 0.002 && a.close < a.open && b.close < b.open;
 }
-function isTweezerBottom(c1, c2) {
-  if (!c1 || !c2) return false;
-  return (Math.abs(c1.low - c2.low) / Math.max(1, Math.min(c1.low, c2.low)) < 0.002) &&
-         (c1.close > c1.open) && (c2.close > c2.open);
+function isTweezerBottom(a,b) {
+  if (!a || !b) return false;
+  return Math.abs(a.low - b.low) / Math.max(1, Math.min(a.low, b.low)) < 0.002 && a.close > a.open && b.close > b.open;
 }
 
-// combine pattern detection for a candle series
+// detect patterns for a TF (returns detection obj or null)
 function detectPatternsForTF(candles) {
-  // returns side: "bull" | "bear" | null, patternName, score (0..100), zone{low,high}
   try {
-    const n = candles.length;
-    if (n < 2) return null;
-    const lastC = candles.at(-1);
+    if (!Array.isArray(candles) || candles.length < 2) return null;
+    const cur = candles.at(-1);
     const prev = candles.at(-2);
-    // Engulfings
-    if (isBullishEngulfing(prev, lastC)) {
-      return { side: "bull", pattern: "BullishEngulfing", score: 80, zone: { low: Math.min(prev.low, lastC.low), high: Math.max(prev.high, lastC.high) } };
+
+    if (isBullishEngulfing(prev, cur)) {
+      return { side: "bull", pattern: "BullishEngulfing", score: 80, zone: { low: Math.min(prev.low, cur.low), high: Math.max(prev.high, cur.high) } };
     }
-    if (isBearishEngulfing(prev, lastC)) {
-      return { side: "bear", pattern: "BearishEngulfing", score: 80, zone: { low: Math.min(prev.low, lastC.low), high: Math.max(prev.high, lastC.high) } };
+    if (isBearishEngulfing(prev, cur)) {
+      return { side: "bear", pattern: "BearishEngulfing", score: 80, zone: { low: Math.min(prev.low, cur.low), high: Math.max(prev.high, cur.high) } };
     }
-    // Hammers & inverted
-    if (isHammer(lastC)) {
-      return { side: "bull", pattern: "Hammer", score: 65, zone: { low: lastC.low, high: lastC.high } };
+    if (isHammer(cur)) {
+      return { side: "bull", pattern: "Hammer", score: 66, zone: { low: cur.low, high: cur.high } };
     }
-    if (isInvertedHammer(lastC) || isShootingStar(lastC)) {
-      // inverted hammer when green -> bullish; when red -> cautious. shooting star => bearish
-      const p = isShootingStar(lastC) ? "ShootingStar" : "InvertedHammer";
-      const side = isShootingStar(lastC) ? "bear" : "bull";
-      return { side, pattern: p, score: 60, zone: { low: lastC.low, high: lastC.high } };
+    if (isShootingStar(cur)) {
+      return { side: "bear", pattern: "ShootingStar", score: 66, zone: { low: cur.low, high: cur.high } };
     }
-    // Tweezer
-    if (candles.length >= 2) {
-      const c1 = candles.at(-2), c2 = candles.at(-1);
-      if (isTweezerBottom(c1, c2)) return { side: "bull", pattern: "TweezerBottom", score: 65, zone: { low: Math.min(c1.low, c2.low), high: Math.max(c1.high, c2.high)} };
-      if (isTweezerTop(c1, c2)) return { side: "bear", pattern: "TweezerTop", score: 65, zone: { low: Math.min(c1.low, c2.low), high: Math.max(c1.high, c2.high)} };
+    // tweezer across last two
+    if (isTweezerBottom(prev, cur)) {
+      return { side: "bull", pattern: "TweezerBottom", score: 64, zone: { low: Math.min(prev.low, cur.low), high: Math.max(prev.high, cur.high) } };
+    }
+    if (isTweezerTop(prev, cur)) {
+      return { side: "bear", pattern: "TweezerTop", score: 64, zone: { low: Math.min(prev.low, cur.low), high: Math.max(prev.high, cur.high) } };
     }
     return null;
   } catch (e) {
-    console.warn("pattern detect error:", e);
     return null;
   }
 }
 
-// combine multi-TF detections
+// -------------------- Aggregation --------------------
 function aggregateDetections(dets, weights) {
-  // dets: { tf: {side, pattern, score, zone} }
-  let support = { bull: 0, bear: 0 };
+  // dets: { tf: detection | null }
+  const support = { bull: 0, bear: 0 };
   let scoreSum = 0;
-  let maxZone = { low: Infinity, high: -Infinity };
+  let weightSum = 0;
+  let zone = { low: Infinity, high: -Infinity };
   const supportingTFs = [];
-  for (const tf of Object.keys(dets)) {
+
+  for (const tf of Object.keys(weights)) {
     const d = dets[tf];
-    if (!d) continue;
-    const w = weights[tf] || 1;
+    const w = weights[tf] ?? 1;
+    if (!d) { weightSum += w; continue; }
     scoreSum += (d.score || 0) * w;
-    if (d.side === "bull") { support.bull += 1; supportingTFs.push(`${tf}:${d.pattern}`); }
-    if (d.side === "bear") { support.bear += 1; supportingTFs.push(`${tf}:${d.pattern}`); }
+    weightSum += w;
+    if (d.side === "bull") support.bull++;
+    if (d.side === "bear") support.bear++;
+    supportingTFs.push(`${tf}:${d.pattern}`);
     if (d.zone) {
-      maxZone.low = Math.min(maxZone.low, d.zone.low || Infinity);
-      maxZone.high = Math.max(maxZone.high, d.zone.high || -Infinity);
+      zone.low = Math.min(zone.low, d.zone.low ?? Infinity);
+      zone.high = Math.max(zone.high, d.zone.high ?? -Infinity);
     }
   }
-  const avgScore = Object.keys(weights).length ? Math.round(scoreSum / Object.keys(weights).length) : Math.round(scoreSum);
-  let side = null;
-  if (support.bull >= support.bear && support.bull >= 1) side = "bull";
-  if (support.bear > support.bull && support.bear >= 1) side = "bear";
-  return { side, supportCount: Math.max(support.bull, support.bear), supportingTFs, avgScore, zone: (maxZone.low === Infinity ? null : maxZone) };
+
+  const avgScore = weightSum ? Math.round(scoreSum / weightSum) : 0;
+  const side = support.bull >= support.bear && support.bull > 0 ? "bull" : (support.bear > support.bull ? "bear" : null);
+  const supportCount = Math.max(support.bull, support.bear);
+  if (zone.low === Infinity) zone = null;
+  return { side, supportCount, avgScore, supportingTFs, zone };
 }
 
-function formatZone(zone) {
-  if (!zone) return "n/a";
-  return `${Number(zone.low).toFixed(2)} - ${Number(zone.high).toFixed(2)}`;
-}
-
-// rate limiter: global + per symbol
-function allowSend(symbol) {
+// -------------------- Rate limiting --------------------
+function allowSendFor(symbol) {
   const now = nowTs();
   if (now - _lastSentAt < (_opts.globalRateLimitSec * 1000)) return false;
   const lastSym = _lastSentPerSymbol.get(symbol) || 0;
   if (now - lastSym < (_opts.perSymbolCooldownSec * 1000)) return false;
-  // burst limiter
-  if (_alertsBurstCount >= _opts.maxAlertsBurst) return false;
+  if (_burstCount >= _opts.maxAlertsBurst) return false;
   return true;
 }
 function noteSent(symbol) {
-  _lastSentAt = nowTs();
-  _lastSentPerSymbol.set(symbol, _lastSentAt);
-  _alertsBurstCount++;
-  // decay burst count slowly
-  setTimeout(() => { _alertsBurstCount = Math.max(0, _alertsBurstCount - 1); }, Math.max(1000, _opts.spamWindowSec * 1000));
+  const t = nowTs();
+  _lastSentAt = t;
+  _lastSentPerSymbol.set(symbol, t);
+  _burstCount++;
+  // decay burst slowly
+  setTimeout(() => { _burstCount = Math.max(0, _burstCount - 1); }, Math.max(1000, _opts.spamWindowSec * 1000));
+  // also keep recent log persisted
+  STORE.recent = (STORE.recent || []).slice(-_opts.maxPendingPerSymbol*10);
+  STORE.recent.push({ symbol, ts: t });
+  persistState();
 }
 
-// create pending object
-async function createPending(symbol, side, zone, supportingTFs, score, details, price, microMl) {
-  const pid = uid("pend");
-  const createdAt = nowTs();
+// -------------------- Pending management --------------------
+function persistPendingMapToStore() {
+  STORE.pending = Array.from(_pendingMap.values()).map(x => {
+    const clone = Object.assign({}, x);
+    // remove large functions/refs
+    delete clone._internal;
+    return clone;
+  });
+  persistState();
+}
+
+function restorePendingFromStore() {
+  try {
+    const raw = STORE.pending || [];
+    for (const r of raw) {
+      // basic validation
+      if (r && r.id) _pendingMap.set(r.id, r);
+    }
+  } catch {}
+}
+
+// -------------------- Create pending --------------------
+async function createPending(symbol, side, zone, supportingTFs, score, dets, price, microMl) {
+  const id = uid("pend");
   const rec = {
-    id: pid,
+    id,
     symbol,
     side,
     zone,
     supportingTFs,
-    createdAt,
+    createdAt: nowTs(),
     score,
-    details,
-    state: "pending",
+    dets,
     priceAtPending: price,
-    microMl
+    state: "pending",
+    microMl: microMl || null,
+    mlMain: null,
+    sent: false,
+    mlPredictionId: null
   };
-  _pending.set(pid, rec);
-  // persist ML record
+
+  // record to ML store (weak record) - asynchronous but we await to store id
   if (_opts.enableML) {
     try {
-      const predRec = {
-        id: null,
+      const pRec = {
         symbol,
-        label: side === "bull" ? "Bullish" : "Bearish",
-        prob: (microMl && microMl.prob) ? microMl.prob : null,
         predictedAt: new Date().toISOString(),
-        features: microMl?.features || null
+        label: side === "bull" ? "Bullish" : "Bearish",
+        prob: microMl?.prob ?? null,
+        features: microMl?.features ?? null
       };
-      const rid = await recordPrediction(predRec).catch(()=>null);
+      const rid = await recordPrediction(pRec).catch(()=>null);
       rec.mlPredictionId = rid;
-    } catch(e){}
+    } catch {}
   }
+
+  _pendingMap.set(id, rec);
+  persistPendingMapToStore();
   return rec;
 }
 
-// confirm pending by either price action or next-candle rule
-async function tryConfirmPending(pending) {
+// -------------------- Confirmation rules --------------------
+async function tryConfirmPending(rec) {
   try {
+    if (!rec || rec.state !== "pending") return false;
     const now = nowTs();
-    if (!pending) return false;
-    // time window exceeded?
-    if (now - pending.createdAt > _opts.confirmWindowMs) {
-      // expire pending
-      pending.state = "expired";
-      _pending.set(pending.id, pending);
+    if (now - rec.createdAt > _opts.confirmWindowMs) {
+      // expire
+      rec.state = "expired";
+      _pendingMap.set(rec.id, rec);
+      persistPendingMapToStore();
       return false;
     }
-    // fetch latest multiTF (1m/5m/15m)
-    const multi = await fetchMultiTF(pending.symbol, _opts.tfs);
-    const price = multi[_opts.tfs[0]]?.price || Object.values(multi).find(x=>x.price)?.price || 0;
-    // confirmation rule: if price has moved beyond zone edge in the pattern direction by small margin
-    const marginPct = 0.0005; // 0.05% tolerance
-    if (pending.side === "bull") {
-      // price must rise above zone.high by margin OR next candle bullish (if requireNextCandle)
-      if (price > (pending.zone.high * (1 + marginPct))) {
-        pending.state = "confirmed"; pending.confirmedAt = now; pending.confirmedPrice = price;
-        _pending.set(pending.id, pending);
+
+    // fetch fresh multi TFs (smallest tf first)
+    const multi = await fetchMultiTF(rec.symbol, _opts.tfs);
+    const price = multi[_opts.tfs[0]]?.price ?? Object.values(multi).find(x=>x.price)?.price ?? 0;
+
+    // 1) price crossing zone edge
+    const margin = 0.0006; // ~0.06%
+    if (rec.side === "bull") {
+      if (rec.zone && typeof rec.zone.high === "number" && price > rec.zone.high * (1 + margin)) {
+        rec.state = "confirmed"; rec.confirmedAt = now; rec.confirmedPrice = price;
+        _pendingMap.set(rec.id, rec);
+        persistPendingMapToStore();
         return true;
       }
-    } else {
-      if (price < (pending.zone.low * (1 - marginPct))) {
-        pending.state = "confirmed"; pending.confirmedAt = now; pending.confirmedPrice = price;
-        _pending.set(pending.id, pending);
+    } else { // bear
+      if (rec.zone && typeof rec.zone.low === "number" && price < rec.zone.low * (1 - margin)) {
+        rec.state = "confirmed"; rec.confirmedAt = now; rec.confirmedPrice = price;
+        _pendingMap.set(rec.id, rec);
+        persistPendingMapToStore();
         return true;
       }
     }
-    // optionally require next candle direction: check latest candle in smallest TF
+
+    // 2) next candle direction on smallest TF (optional)
     if (_opts.confirmByNextCandle) {
-      const smallTF = _opts.tfs[0]; // assume fastest tf first
+      const smallTF = _opts.tfs[0];
       const candles = (multi[smallTF] && multi[smallTF].data) ? multi[smallTF].data : [];
       if (candles.length >= 2) {
-        const lastC = candles.at(-1);
-        const prev = candles.at(-2);
-        if (pending.side === "bull" && lastC.close > lastC.open && lastC.close > prev.close) {
-          pending.state = "confirmed"; pending.confirmedAt = now; pending.confirmedPrice = lastC.close;
-          _pending.set(pending.id, pending);
+        const lastC = candles.at(-1), prev = candles.at(-2);
+        if (rec.side === "bull" && lastC.close > lastC.open && lastC.close > prev.close) {
+          rec.state = "confirmed"; rec.confirmedAt = now; rec.confirmedPrice = lastC.close;
+          _pendingMap.set(rec.id, rec);
+          persistPendingMapToStore();
           return true;
         }
-        if (pending.side === "bear" && lastC.close < lastC.open && lastC.close < prev.close) {
-          pending.state = "confirmed"; pending.confirmedAt = now; pending.confirmedPrice = lastC.close;
-          _pending.set(pending.id, pending);
+        if (rec.side === "bear" && lastC.close < lastC.open && lastC.close < prev.close) {
+          rec.state = "confirmed"; rec.confirmedAt = now; rec.confirmedPrice = lastC.close;
+          _pendingMap.set(rec.id, rec);
+          persistPendingMapToStore();
           return true;
         }
       }
     }
+
     return false;
   } catch (e) {
     console.warn("tryConfirmPending err:", e);
@@ -277,215 +339,265 @@ async function tryConfirmPending(pending) {
   }
 }
 
-// formatting message for confirmed reversal
-function formatConfirmedMessage(pending) {
-  const sideLabel = pending.side === "bull" ? "Bullish" : "Bearish";
-  const tp = ""; // TP logic can be added later
-  let microText = "";
-  if (pending.microMl) {
-    microText = `\nMicroML: ${pending.microMl.label} ${pending.microMl.prob ? `(${Number(pending.microMl.prob).toFixed(1)}%)` : ""}`;
-  }
-  const support = pending.supportingTFs ? pending.supportingTFs.join(", ") : "";
+// -------------------- Format message --------------------
+function formatConfirmedMessage(rec) {
+  const sideLabel = rec.side === "bull" ? "Bullish" : "Bearish";
+  const micro = rec.microMl ? `\nMicroML: ${rec.microMl.label} ${rec.microMl.prob ? `(${Number(rec.microMl.prob).toFixed(1)}%)` : ""}` : "";
+  const mlMain = rec.mlMain ? `\nML(15m): ${rec.mlMain.label} ${rec.mlMain.prob ? `(${Number(rec.mlMain.prob).toFixed(1)}%)` : ""}` : "";
   return [
     `🟢 REVERSAL CONFIRMED — ${sideLabel}`,
-    `Symbol: ${pending.symbol} | Entry Price: ${Number(pending.confirmedPrice||pending.priceAtPending).toFixed(2)}`,
-    `Score: ${pending.score}%`,
-    microText ? microText : "",
-    `Pattern supports: ${support}`,
-    `Zone: ${formatZone(pending.zone)}`,
-    `ID: ${pending.id}`
+    `Symbol: ${rec.symbol}`,
+    `EntryPrice: ${Number(rec.confirmedPrice || rec.priceAtPending).toFixed(2)}`,
+    `Score: ${rec.score}%`,
+    `Pattern support: ${ (rec.supportingTFs || []).join(", ") }`,
+    `Zone: ${ rec.zone ? `${Number(rec.zone.low).toFixed(4)} - ${Number(rec.zone.high).toFixed(4)}` : "n/a" }`,
+    micro ? micro : "",
+    mlMain ? mlMain : "",
+    `ID: ${rec.id}`
   ].filter(Boolean).join("\n");
 }
 
-// Main scan loop
+// -------------------- Main scan loop --------------------
 async function scanOnce(symbol) {
   try {
-    // fetch all TFs
+    // fetch multi TFs
     const multi = await fetchMultiTF(symbol, _opts.tfs);
-    // detect patterns per TF
+    // detect per TF
     const dets = {};
     for (const tf of _opts.tfs) {
-      const candles = (multi[tf] && multi[tf].data) ? multi[tf].data : [];
+      const candles = (multi[tf] && Array.isArray(multi[tf].data)) ? multi[tf].data : [];
       dets[tf] = detectPatternsForTF(candles);
     }
-    // aggregate
+
     const agg = aggregateDetections(dets, _opts.weights);
+
+    // If no aggregate side, still check pendings for confirmation
     if (!agg.side || agg.supportCount < 1) {
-      // still might be pending waiting for confirm -> check pending
-      await checkPendings(symbol);
+      await checkAllPendings(symbol);
       return;
     }
 
-    // volume check on each supporting TF
-    let volOk = true;
+    // adjust per-TF score based on volume
     for (const tf of _opts.tfs) {
       const d = dets[tf];
       if (!d) continue;
-      // check vol for that tf's last candle
-      const candles = (multi[tf] && multi[tf].data) ? multi[tf].data : [];
+      const candles = (multi[tf] && Array.isArray(multi[tf].data)) ? multi[tf].data : [];
       const lc = last(candles);
-      const avg = avgVolume(candles, 20);
-      if (!lc) { volOk = false; continue; }
-      const rvol = (lc.vol || lc.volume || lc.v || 0) / Math.max(1, avg);
+      const avg = avgVol(candles, 20);
+      const rvol = (lc?.vol ?? lc?.volume ?? 0) / Math.max(1, avg);
       if (rvol < _opts.volumeRVolThreshold) {
-        // reduce score if vol not confirming
-        d.score = Math.max(20, (d.score || 0) - 20);
+        // penalize score if volume is low
+        d.score = Math.max(20, (d.score || 0) - 18);
+      } else {
+        // small boost if volume spike
+        if (rvol > 1.5) d.score = Math.min(95, (d.score || 0) + 8);
       }
     }
 
     const combinedScore = agg.avgScore || 50;
-    // require support count and combined score
+
+    // require minimum support and score
     if (agg.supportCount >= _opts.requireSupportCount && combinedScore >= _opts.minScorePct) {
-      // calculate micro ML (fast)
+      // micro-ML (fast) optional
       let microMl = null;
-      if (_opts.enableML) {
-        try { microMl = await runMicroPrediction(symbol, _opts.microLookback/1).catch(()=>null); } catch(e){}
+      if (_opts.microAlert || _opts.enableML) {
+        try {
+          microMl = await runMicroPrediction(symbol, _opts.microLookbackSec).catch(()=>null);
+        } catch {}
       }
 
-      // final combined scoring: ML boosts score
-      let finalScore = combinedScore;
-      if (microMl && microMl.prob) {
-        // microMl.prob in percent e.g. 34. -> boost
-        const mlBoost = Math.max(-20, Math.min(40, (microMl.prob - 50) * 0.4)); // scale
-        finalScore = Math.round(finalScore + mlBoost);
+      // micro-immediate alert logic (lightweight) — only if configured and microMl strongly confident
+      if (_opts.microAlert && microMl && typeof microMl.prob === "number" && microMl.prob >= _opts.microAlertProbThresh) {
+        // send a micro alert but as a softer message to avoid spam; we still create pending and wait for confirmation
+        const microMsg = [
+          `⚡ MICRO-ML SIGNAL — ${microMl.label} (${Number(microMl.prob).toFixed(1)}%)`,
+          `Symbol: ${symbol} | Patterns: ${agg.supportingTFs.join(", ")}`,
+          `CombinedScore: ${combinedScore}% | zone: ${agg.zone ? `${agg.zone.low.toFixed(4)}-${agg.zone.high.toFixed(4)}` : "n/a"}`,
+          `Note: This is a micro/fast signal. Waiting for confirmation before full alert.`
+        ].join("\n");
+
+        // rate-limited (micro alerts constrained by global limiter too)
+        if (allowSendFor(symbol)) {
+          try { await _sendFunc(microMsg); noteSent(symbol); } catch(e){ /* ignore */ }
+        }
       }
 
-      // check pending limits
-      const pendingCountForSymbol = Array.from(_pending.values()).filter(p => p.symbol === symbol && p.state === "pending").length;
-      if (pendingCountForSymbol >= _opts.maxPendingPerSymbol) {
-        console.log("max pending reached for", symbol);
-        await checkPendings(symbol);
+      // Re-check pending count for symbol
+      const existingPendingForSymbol = Array.from(_pendingMap.values()).filter(p => p.symbol === symbol && p.state === "pending").length;
+      if (existingPendingForSymbol >= _opts.maxPendingPerSymbol) {
+        await checkAllPendings(symbol);
         return;
       }
 
-      // create pending if not already similar one exists (avoid duplicates)
+      // dedupe: avoid creating pending in same zone
       const zone = agg.zone || { low: 0, high: 0 };
-      const existsSimilar = Array.from(_pending.values()).some(p => p.symbol === symbol && p.side === agg.side && p.state === "pending" && Math.abs((p.zone.low + p.zone.high)/2 - (zone.low + zone.high)/2) / Math.max(1, zone.high) < 0.005);
+      const existsSimilar = Array.from(_pendingMap.values()).some(p => {
+        if (!p || p.symbol !== symbol || p.side !== agg.side || p.state !== "pending") return false;
+        if (!p.zone || !zone) return false;
+        const midA = (p.zone.low + p.zone.high) / 2;
+        const midB = (zone.low + zone.high) / 2;
+        return Math.abs(midA - midB) / Math.max(1, Math.abs(midB)) < _opts.debounceSimilarZonePct;
+      });
       if (existsSimilar) {
-        await checkPendings(symbol);
+        await checkAllPendings(symbol);
         return;
       }
 
-      // create pending
-      const currentPrice = multi[_opts.tfs[0]]?.price || 0;
-      const pending = await createPending(symbol, agg.side, zone, agg.supportingTFs, finalScore, { dets }, currentPrice, microMl);
-      console.log("created pending", pending.id, pending.side, pending.score, "zone", formatZone(pending.zone));
-
-      // After creating pending, run deeper ML prediction async (non-block)
+      // create pending and optionally run main ML async to adjust score
+      const priceNow = multi[_opts.tfs[0]]?.price ?? 0;
+      const pending = await createPending(symbol, agg.side, zone, agg.supportingTFs, combinedScore, dets, priceNow, microMl);
+      // async: run main ML (longer) to adjust final pending score (non-blocking)
       if (_opts.enableML) {
         (async () => {
           try {
-            const full = await runMLPrediction(symbol, _opts.tfs[_opts.tfs.length-1]).catch(()=>null);
-            if (full && pending) {
-              pending.fullMl = full;
-              // adjust pending score
-              if (full && typeof full.probBull === "number") {
-                const mlScore = (pending.side === "bull") ? full.probBull : full.probBear;
-                // scale to [-20..+40]
-                const boost = (mlScore - 50) * 0.5;
-                pending.score = Math.max(1, Math.min(100, Math.round(pending.score + boost)));
-                _pending.set(pending.id, pending);
+            const fullMl = await runMLPrediction(symbol, _opts.tfs[_opts.tfs.length-1]).catch(()=>null);
+            if (fullMl) {
+              // attach main ML to pending
+              const p = _pendingMap.get(pending.id);
+              if (!p) return;
+              p.mlMain = fullMl;
+              // adjust pending.score modestly
+              const mlProb = (p.side === "bull") ? fullMl.probBull : fullMl.probBear;
+              if (typeof mlProb === "number") {
+                const boost = Math.round((mlProb - 50) * 0.4); // scale down
+                p.score = clamp(Math.round((p.score || 0) + boost), 1, 100);
+                _pendingMap.set(p.id, p);
+                persistPendingMapToStore();
               }
             }
-          } catch(e){}
+          } catch (e) {}
         })();
       }
     }
-
-    // finally check existing pendings to attempt confirmation
-    await checkPendings(symbol);
-
+    // finally check pendings for confirmation
+    await checkAllPendings(symbol);
   } catch (e) {
-    console.warn("scanOnce error:", e);
+    console.warn("scanOnce error:", e?.message ?? e);
   }
 }
 
-// check all pending entries for symbol or globally
-async function checkPendings(symbol = null) {
-  const pendings = Array.from(_pending.values()).filter(p => p.state === "pending" && (symbol ? p.symbol === symbol : true));
+// -------------------- Check & confirm all pendings --------------------
+async function checkAllPendings(symbol = null) {
+  const pendings = Array.from(_pendingMap.values()).filter(p => p.state === "pending" && (!symbol || p.symbol === symbol));
   for (const p of pendings) {
-    const confirmed = await tryConfirmPending(p).catch(()=>false);
-    if (confirmed) {
-      // send only if rate limiter allows
-      if (allowSend(p.symbol)) {
-        const msg = formatConfirmedMessage(p);
-        try {
-          await _sendFunc(msg);
-          noteSent(p.symbol);
-        } catch (e) {
-          console.warn("sendFunc error", e);
-        }
-      } else {
-        console.log("rate-limited, not sending confirmed:", p.id);
-      }
-      // mark pending state and register outcome later via recordOutcome (when realized)
-      p.sent = true;
-      p.state = "confirmed";
-      p.confirmedAt = nowTs();
-      _pending.set(p.id, p);
-
-      // schedule outcome recording after some delay (feedback windows)
-      // we attempt to record outcome after 60s & 300s windows (if ML wants)
-      (async () => {
-        // quick wait then compute realizedReturn
-        await sleep(60 * 1000);
-        try {
-          const multi = await fetchMultiTF(p.symbol, [_opts.tfs[0]]);
-          const priceNow = multi[_opts.tfs[0]]?.price || 0;
-          const realizedReturn = p.side === "bull" ? (priceNow - (p.confirmedPrice || p.priceAtPending))/Math.max(1, (p.confirmedPrice || p.priceAtPending)) : ((p.confirmedPrice || p.priceAtPending) - priceNow)/Math.max(1, (p.confirmedPrice || p.priceAtPending));
-          // record outcome
-          if (p.mlPredictionId) {
-            await recordOutcome(p.mlPredictionId, { realizedReturn, correct: realizedReturn > 0 }).catch(()=>null);
+    try {
+      const confirmed = await tryConfirmPending(p);
+      if (confirmed) {
+        // gate with ML main contradiction: if mlMain exists and strongly opposite, optionally skip sending
+        if (p.mlMain && typeof p.mlMain.prob === "number") {
+          const mlProb = p.side === "bull" ? (p.mlMain.probBull ?? 50) : (p.mlMain.probBear ?? 50);
+          // if mlMain strongly contradictory (e.g., prob for opposite > 80), block send (conservative)
+          const oppositeProb = p.side === "bull" ? (p.mlMain.probBear ?? 0) : (p.mlMain.probBull ?? 0);
+          if (oppositeProb > 90) {
+            p.state = "blocked_by_ml";
+            _pendingMap.set(p.id, p);
+            persistPendingMapToStore();
+            continue;
           }
-        } catch(e){}
-      })();
+        }
+
+        // send confirmation message (rate-limited)
+        if (allowSendFor(p.symbol)) {
+          const msg = formatConfirmedMessage(p);
+          try {
+            await _sendFunc(msg);
+            noteSent(p.symbol);
+          } catch (e) {
+            // if send fails, still mark as confirmed but not sent
+            console.warn("sendFunc error:", e?.message ?? e);
+          }
+        } else {
+          console.log("reversal_watcher: rate-limited, not sending confirmed:", p.id);
+        }
+        // mark sent / confirmed
+        p.sent = true;
+        p.state = "confirmed";
+        p.confirmedAt = nowTs();
+        _pendingMap.set(p.id, p);
+        persistPendingMapToStore();
+
+        // schedule feedback checks to call recordOutcome
+        (async (pendingRec) => {
+          for (const win of _opts.feedbackWindowsSec || []) {
+            await new Promise(r => setTimeout(r, win * 1000));
+            try {
+              // fetch latest price on smallest tf
+              const multi = await fetchMultiTF(pendingRec.symbol, [_opts.tfs[0]]);
+              const priceNow = multi[_opts.tfs[0]]?.price ?? 0;
+              const entryPrice = pendingRec.confirmedPrice || pendingRec.priceAtPending || 0;
+              const realizedReturn = pendingRec.side === "bull"
+                ? (priceNow - entryPrice) / Math.max(1, entryPrice)
+                : (entryPrice - priceNow) / Math.max(1, entryPrice);
+              // record outcome to ML store (if we had mlPredictionId)
+              if (pendingRec.mlPredictionId) {
+                await recordOutcome(pendingRec.mlPredictionId, { realizedReturn, correct: realizedReturn > 0 }).catch(()=>null);
+              }
+              // optionally store realized in pending
+              pendingRec.outcome = pendingRec.outcome || {};
+              pendingRec.outcome[win] = { priceNow, realizedReturn, ts: nowTs() };
+              _pendingMap.set(pendingRec.id, pendingRec);
+              persistPendingMapToStore();
+            } catch (e) { /* ignore feedback errors */ }
+          }
+        })(p);
+      }
+    } catch (e) {
+      console.warn("checkAllPendings inner err:", e);
     }
-    // expire old pending after confirmWindowMs handled in tryConfirmPending
   }
 }
 
-// Start watcher
-export function startReversalWatcher(symbol = "BTCUSDT", opts = {}, sendFunc = async (m)=>{ console.log("send:",m); }) {
+// -------------------- Public API --------------------
+export function startReversalWatcher(symbol = "BTCUSDT", opts = {}, sendFunc = async (m)=>{ console.log("send:", m); }) {
   if (_running) {
     console.log("reversal_watcher: already running");
-    return;
+    return false;
   }
   _opts = Object.assign({}, DEFAULTS, opts || {});
   _sendFunc = sendFunc;
   _running = true;
-  console.log("reversal_watcher: STARTED for", symbol, "cfg:", JSON.stringify(_opts));
+  _pendingMap = new Map();
+  restorePendingFromStore(); // restore persisted pending if any
 
   // initial immediate scan
-  (async () => {
-    try { await scanOnce(symbol); } catch(e) { console.warn(e); }
-  })();
+  (async () => { try { await scanOnce(symbol); } catch (e) { console.warn(e); } })();
 
+  // interval loop
   _timer = setInterval(async () => {
     try {
       await scanOnce(symbol);
     } catch (e) {
-      console.warn("watcher interval err:", e);
+      console.warn("reversal_watcher interval error:", e);
     }
   }, _opts.pollIntervalMs);
 
+  console.log("reversal_watcher: started for", symbol, "opts:", JSON.stringify(_opts));
   return true;
 }
 
-// Stop watcher
 export async function stopReversalWatcher() {
-  if (!_running) return;
+  if (!_running) return false;
   try {
     clearInterval(_timer);
-  } catch(e){}
+  } catch (e) {}
   _timer = null;
   _running = false;
-  _pending.clear();
-  console.log("reversal_watcher: STOPPED");
+  _pendingMap.clear();
+  console.log("reversal_watcher: stopped");
   return true;
 }
 
-// Export small helpers (useful for testing)
+export function getWatcherState() {
+  return {
+    running: _running,
+    pending: Array.from(_pendingMap.values()),
+    accuracy: (typeof calculateAccuracy === "function") ? calculateAccuracy() : { accuracy: 0, samples: 0 },
+    lastSentAt: _lastSentAt
+  };
+}
+
 export default {
   startReversalWatcher,
-  stopReversalWatcher
+  stopReversalWatcher,
+  getWatcherState
 };
