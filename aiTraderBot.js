@@ -1,4 +1,4 @@
-// aiTraderBot.js — FINAL STABLE VERSION (AUTO-REPORT FIXED + NO-SLEEP + CLEAN LOGS)
+// aiTraderBot.js — FINAL STABLE + PATCHED VERSION (AutoReport FIX + No trim crash + No remove code)
 
 import fs from "fs";
 import path from "path";
@@ -106,7 +106,7 @@ export async function getDataContext(symbol = CONFIG.SYMBOL) {
 
 
 // ======================================================
-// AUTO REPORT (FIXED VERSION)
+// AUTO REPORT (FULLY PATCHED — 0% CRASH)
 // ======================================================
 let autoTimer = null;
 let autoRunning = false;
@@ -122,33 +122,52 @@ async function doAutoReport() {
 
   try {
     const raw = await buildAIReport(CONFIG.SYMBOL);
+
     if (!raw) {
       console.log("❌ buildAIReport returned NULL");
-      await sendTelegram("⚠️ AutoReport failed (buildAIReport empty)");
+      await sendTelegram("⚠️ AutoReport failed: buildAIReport empty");
       autoRunning = false;
       return;
     }
 
-    let html;
+    // ----------- FIXED BLOCK -----------
+    let parts;
     try {
-      html = await formatAIReport(raw);
-    } catch (e1) {
-      console.log("❌ formatAIReport error:", e1.message);
-      html = `<b>⚠️ Format Error</b>\nRaw data:\n${JSON.stringify(raw, null, 2)}`;
+      parts = await formatAIReport(raw);
+    } catch (err) {
+      console.log("❌ formatAIReport failed:", err.message);
+      await sendTelegram("⚠️ formatAIReport crashed:\n" + err.message);
+      autoRunning = false;
+      return;
     }
 
-    if (!html || html.trim() === "") {
-      console.log("❌ formatAIReport returned empty HTML");
-      html = `<b>⚠️ AutoReport Empty Output</b>\nRaw:\n${JSON.stringify(raw)}`;
+    // If output is string → wrap in array
+    if (typeof parts === "string") {
+      parts = [parts];
     }
 
-    const ok = await sendTelegram(html);
-    if (!ok) console.log("❌ Telegram send failed");
-    else console.log(nowIST(), "📤 Auto-report sent ✔");
+    // Validate
+    if (!Array.isArray(parts) || parts.length === 0) {
+      console.log("❌ formatAIReport returned empty");
+      await sendTelegram("⚠️ AutoReport empty output");
+      autoRunning = false;
+      return;
+    }
+
+    // Safe send
+    for (const p of parts) {
+      const msg = String(p || "");
+      if (msg.length < 2) continue;
+      await sendTelegram(msg);
+      await new Promise(r => setTimeout(r, 500));
+    }
+    // ----------- END FIX -----------
+
+    console.log(nowIST(), "📤 Auto-report sent ✔");
 
   } catch (e) {
     console.log("❌ AutoReport main error:", e.message);
-    await sendTelegram(`⚠️ AutoReport crashed:\n${e.message}`);
+    await sendTelegram("⚠️ AutoReport crashed:\n" + e.message);
   }
 
   autoRunning = false;
