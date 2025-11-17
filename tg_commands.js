@@ -1,23 +1,20 @@
 // =============================================================
-// tg_commands.js — FINAL FULL VERSION
-// Old-Style Imports EXACTLY like Your Repo
-// No TelegramBot imports
-// Works with aiTraderBot.js auto-report
+// tg_commands.js — FINAL CLEAN VERSION (NO DUPLICATES)
 // =============================================================
 
 // -------------------------
 // OLD IMPORT STYLE (Correct)
 // -------------------------
-import ML from "./ml_module_v8_6.js";      // ✔ EXACT as your repo
-import News from "./news_social.js";       // ✔ EXACT as your repo
-
+import ML from "./ml_module_v8_6.js";      
+import News from "./news_social.js";       
 import CONFIG from "./config.js";
-import { fetchMultiTF, fetchMarketData } from "./utils.js";
+
+import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 
 // -------------------------
-// Extract ML Functions
+// Extract ML functions
 // -------------------------
 const {
   runMLPrediction,
@@ -28,26 +25,28 @@ const {
 } = ML;
 
 // -------------------------
-// Extract News Functions
+// Extract news functions
 // -------------------------
 const { fetchNewsBundle } = News;
 
-// -------------------------
-// Generic helpers
-// -------------------------
+
+// =============================================================
+// SAFE TELEGRAM SENDER WILL BE IMPORTED FROM main BOT FILE
+// (NO TELEGRAM IMPORT HERE — EXACTLY LIKE YOUR PROJECT)
+// =============================================================
+
+let bot = null;
+export function attachBot(instance) {
+  bot = instance;
+}
+
+
+// =============================================================
+// HELPERS
+// =============================================================
 const NF = (n, d = 2) =>
   typeof n === "number" && Number.isFinite(n) ? n.toFixed(d) : "N/A";
 
-function nowIST() {
-  return new Date().toLocaleString("en-IN", {
-    hour12: true,
-    timeZone: "Asia/Kolkata",
-  });
-}
-
-// =============================================================
-// TIMEFRAME BLOCK (EXACT UI YOU PROVIDED)
-// =============================================================
 function tfBlock(tf, o) {
   return `
 🕒 ${tf} — ${o.sig}
@@ -59,11 +58,13 @@ SL: ${o.sl}
 `.trim();
 }
 
+
 // =============================================================
-// BUILD AI REPORT (RAW DATA GENERATOR)
+// ⭐ BUILD AI REPORT  — SINGLE CLEAN VERSION
 // =============================================================
 export async function buildAIReport(symbol = CONFIG.SYMBOL) {
   try {
+    // MULTI TF MARKET DATA
     const multi = await fetchMultiTF(symbol);
 
     const tfs = ["1m", "5m", "15m", "30m", "1h"];
@@ -93,8 +94,10 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL) {
       };
     }
 
-    // ML + Micro
+    // ML Forecast
     const ml = await runMLPrediction(symbol);
+
+    // Micro ML
     const micro = await runMicroPrediction(symbol);
 
     // News
@@ -103,7 +106,10 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL) {
     return {
       symbol,
       price: multi.price,
-      time: nowIST(),
+      time: new Date().toLocaleString("en-IN", {
+        hour12: true,
+        timeZone: "Asia/Kolkata"
+      }),
       tf: tfObj,
       ml,
       micro,
@@ -111,28 +117,26 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL) {
     };
 
   } catch (err) {
-    console.log("buildAIReport ERROR:", err.message);
+    console.log("buildAIReport ERROR:", err);
     return null;
   }
 }
 
+
 // =============================================================
-// FORMAT AI REPORT → EXACT FINAL UI (Your Saved Version)
+// ⭐ FORMAT AI REPORT — EXACT UI YOU SAVED
 // =============================================================
 export async function formatAIReport(raw) {
   if (!raw) return "<b>⚠️ Empty Report</b>";
 
   const { symbol, price, time, tf, ml, news } = raw;
 
-  // Helper to format TP line
   function tpJoin(list) {
     if (!list || !list.length) return "N/A";
     return list.map(v => NF(v)).join(" / ");
   }
 
-  // ---------------------------------------------------------
-  //  MULTI-TF BLOCKS (EXACT STYLE YOU GAVE)
-  // ---------------------------------------------------------
+  // TF BLOCKS
   const block1m = tfBlock("1M", {
     sig: tf["1m"].sig,
     rsi: tf["1m"].rsi,
@@ -203,57 +207,35 @@ export async function formatAIReport(raw) {
     sl: tf["1h"].sl
   });
 
-  // ---------------------------------------------------------
-  // OVERALL BIAS (Fusion score derive)
-  // ---------------------------------------------------------
+  // Overall bias calc
+  const sigScore = { "🟢 BUY": 1, "🔴 SELL": -1, "🟡 NEUTRAL": 0, "⚪": 0 };
+
   let fs = 0;
-  const sigMap = { "🟢 BUY": 1, "🔴 SELL": -1, "🟡 NEUTRAL": 0, "⚪": 0 };
+  ["1m", "5m", "15m", "30m", "1h"].forEach(tfid => {
+    fs += sigScore[tf[tfid].sig] || 0;
+  });
 
-  for (const key of ["1m", "5m", "15m", "30m", "1h"]) {
-    fs += sigMap[tf[key].sig] || 0;
-  }
+  let bias = "⚪ Neutral";
+  if (fs > 1) bias = "🟢 BUY";
+  if (fs < -1) bias = "🔴 SELL";
 
-  let finalBias = "⚪ Neutral";
-  if (fs > 1) finalBias = "🟢 BUY";
-  if (fs < -1) finalBias = "🔴 SELL";
-
-  const total = 5;
   const buyProb = ((fs + 2.5) / 5) * 100;
   const sellProb = 100 - buyProb;
 
-  // ---------------------------------------------------------
-  // AI DRIVEN TP (simple aggregation)
-  // ---------------------------------------------------------
-  const bullTP1 = NF(tf["1h"].r);
-  const bullTP2 = NF(tf["30m"].r);
-
-  const bearTP1 = NF(tf["1m"].s);
-  const bearTP2 = NF(tf["5m"].s);
-
-  const neutralSL = NF(tf["15m"].sl);
-
-  // ---------------------------------------------------------
-  // MACHINE LEARNING FORECAST (RAW ML)
-  // ---------------------------------------------------------
+  // ML summary
   const mlDir = ml.direction || "Neutral";
   const mlConf = NF(ml.confidence || 0);
-
   const mlSellTP = NF(ml.sell_tp || 0);
   const mlBuyTP = NF(ml.buy_tp || 0);
-
   const mlQuote = ml.quote || "AI forecast active";
 
-  // ---------------------------------------------------------
-  // NEWS BUNDLE
-  // ---------------------------------------------------------
+  // News
   const newsImpact = news.impact || "Low";
   const newsSentiment = NF(news.sentiment || 0);
   const headline = news.headline || "No major events";
 
-  // ---------------------------------------------------------
-  // FINAL MASTER UI — EXACTLY SAME AS YOU SAVED
-  // ---------------------------------------------------------
-  const ui = `
+  // FINAL UI
+  return `
 🔥 ${symbol} — AI Market Intelligence
 Time (IST): ${time}
 Price: ${NF(price)}
@@ -274,15 +256,9 @@ ${block1h}
 ━━━━━━━━━━━━━━━━━━
 
 🧭 OVERALL BIAS
-Bias: ${finalBias}
+Bias: ${bias}
 Fusion Score: ${fs}
 Buy ${NF(buyProb)}% | Sell ${NF(sellProb)}%
-━━━━━━━━━━━━━━━━━━
-
-🎯 OVERALL TP (AI Driven)
-Bullish TP: ${bullTP1} – ${bullTP2}
-Bearish TP: ${bearTP1} – ${bearTP2}
-SL (Neutral Invalidation): ${neutralSL}
 ━━━━━━━━━━━━━━━━━━
 
 🤖 MACHINE LEARNING FORECAST (AI TP Guarantee Mode)
@@ -297,340 +273,20 @@ ML Targets:
 • ML Buy TP (Hedge): <b>${mlBuyTP}</b>
 ━━━━━━━━━━━━━━━━━━
 
-📰 NEWS IMPACT (Connected to ML)
+📰 NEWS IMPACT
 Impact: ${newsImpact}
 Sentiment: ${newsSentiment}%
 Headline: *“${headline}”*
 ━━━━━━━━━━━━━━━━━━
 `;
-
-  return ui.trim();
-}
-
-// =============================================================
-// TELEGRAM COMMAND HANDLERS
-// =============================================================
-
-// Main manual command: /report
-bot.onText(/\/report/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  try {
-    await safeSend(chatId, "⏳ Generating AI report...");
-    const raw = await buildAIReport("BTCUSDT");   // default symbol
-    const html = await formatAIReport(raw);
-
-    await safeSend(chatId, html);
-  } catch (e) {
-    await safeSend(chatId, "❌ Error generating report:\n" + e.message);
-  }
-});
-
-// Simple ping command
-bot.onText(/\/ping/, async (msg) => {
-  await safeSend(msg.chat.id, "🏓 Pong! Bot is alive.");
-});
-
-// Help command
-bot.onText(/\/help/, async (msg) => {
-  const txt = `
-<b>📘 AI Trader Commands</b>
-
-<b>/report</b> → Full AI Market Intelligence report  
-<b>/ping</b> → Bot check  
-<b>/help</b> → Help Menu  
-
-System: ML v8.6 • News Engine v3.0 • Elliott v4.1
-  `.trim();
-
-  await safeSend(msg.chat.id, txt);
-});
-
-
-// =============================================================
-// BUILD AI REPORT (Central brain for assembling data)
-// =============================================================
-export async function buildAIReport(symbol = "BTCUSDT") {
-  try {
-    // 1. MULTI-TF MARKET DATA
-    const multi = await fetchMultiTF(symbol);
-
-    // 2. ML FORECAST
-    const mlPred = await runMLPrediction(symbol);
-
-    // 3. NEWS BUNDLE
-    const news = await fetchNewsBundle(symbol);
-
-    // 4. Timestamp
-    const time = new Date().toLocaleString("en-IN", {
-      hour12: true,
-      timeZone: "Asia/Kolkata"
-    });
-
-    return {
-      symbol,
-      price: multi.price,
-      time,
-      tf: multi.tframes,  // 1m,5m,15m,30m,1h blocks
-      ml: mlPred,
-      news: {
-        sentiment: news.sentiment || 0.5,
-        impact: news.impact || "Low",
-        headline: news.items?.[0]?.title || "No major headline"
-      }
-    };
-
-  } catch (e) {
-    return {
-      error: true,
-      message: e.message,
-      symbol,
-      time: new Date().toISOString()
-    };
-  }
 }
 
 
 // =============================================================
-// EXPORT for aiTraderBot.js
+// EXPORT CLEAN
 // =============================================================
 export default {
-  bot,
-  buildAIReport,
-  formatAIReport
-};
-
-// tg_commands.js — FINAL CLEAN VERSION
-// ---------------------------------------------------
-// ONLY ONE IMPORT BLOCK — NOTHING REPEATED
-
-import TelegramBot from "node-telegram-bot-api";
-import CONFIG from "./config.js";
-
-import { fetchMultiTF } from "./utils.js";
-import * as indicators from "./core_indicators.js";
-import { analyzeElliott } from "./elliott_module.js";
-
-import {
-  runMLPrediction,
-  runMicroPrediction,
-  calculateAccuracy,
-  recordPrediction,
-  recordOutcome
-} from "./ml_module_v8_6.js";
-
-import newsModule from "./news_social.js";
-
-
-// =============================================================
-// TELEGRAM BOT (OLD STYLE — EXACTLY LIKE YOUR PROJECT)
-// =============================================================
-export const bot = new TelegramBot(
-  CONFIG.TELEGRAM.BOT_TOKEN,
-  { polling: true }
-);
-
-
-// =============================================================
-// SAFE TELEGRAM SENDER (AUTO SPLIT)
-// =============================================================
-async function safeSend(chatId, text) {
-  if (!text) return;
-
-  const MAX = 3900;
-  if (text.length <= MAX) {
-    return bot.sendMessage(chatId, text, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
-  }
-
-  for (let i = 0; i < text.length; i += MAX) {
-    await bot.sendMessage(chatId, text.substring(i, i + MAX), {
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    });
-  }
-}
-
-
-// =============================================================
-// SMALL HELPERS
-// =============================================================
-const nf = (v, d = 2) =>
-  (typeof v === "number" && Number.isFinite(v))
-    ? Number(v).toFixed(d)
-    : "N/A";
-
-function shortSig(score) {
-  if (score >= 0.7) return "🟩 Strong Buy";
-  if (score >= 0.2) return "🟦 Buy";
-  if (score > -0.2 && score < 0.2) return "🟨 Neutral";
-  if (score <= -0.2 && score > -0.7) return "🟧 Sell";
-  return "🟥 Strong Sell";
-}
-
-
-// =============================================================
-// BUILD AI REPORT
-// =============================================================
-export async function buildAIReport(symbol = "BTCUSDT") {
-  try {
-    const multi = await fetchMultiTF(symbol);
-
-    const ml = await runMLPrediction(symbol);
-    const micro = await runMicroPrediction(symbol);
-    const news = await newsModule.fetchNewsBundle(symbol);
-
-    const time = new Date().toLocaleString("en-IN", {
-      hour12: true,
-      timeZone: "Asia/Kolkata"
-    });
-
-    return {
-      ok: true,
-      symbol,
-      price: multi.price,
-      tf: multi.tframes,
-      time,
-      ml,
-      micro,
-      news,
-      mlAcc: calculateAccuracy().accuracy
-    };
-
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
-
-// =============================================================
-// FORMAT AI REPORT — EXACT YOUR UI
-// =============================================================
-export async function formatAIReport(r) {
-  if (!r || !r.ok) return "❌ Failed to generate report.";
-
-  const S = r.symbol;
-  const P = nf(r.price, 2);
-  const T = r.time;
-
-  const tf = r.tf;
-
-  function makeTF(tfKey, label) {
-    const d = tf[tfKey];
-    if (!d) return "";
-
-    return `
-🕒 ${label} — ${shortSig(d.fusion)}
-
-RSI ${nf(d.rsi)} | MACD ${nf(d.macd)} | Vol ${d.vol} | ATR ${nf(d.atr)}
-Elliott: ${d.ellLabel} | Conf ${nf(d.ellConf)}%
-S: ${nf(d.support)} | R: ${nf(d.resistance)}
-TP 🎯: ${d.tpA || "—"}${d.tpB ? " / " + d.tpB : ""}${d.tpC ? " / " + d.tpC : ""}
-SL: ${nf(d.sl)}
-`.trim();
-  }
-
-  const N = r.news || {};
-  const newsImpact = N.impact || "Low";
-  const newsSentiment = Math.round((N.sentiment || 0.5) * 1000) / 10;
-  const headline = N.items?.[0]?.title || "No major headline";
-
-  const ml = r.ml || {};
-  const mlDir = ml.label || "Neutral";
-  const mlConf = nf(ml.maxProb || ml.prob || 0, 2);
-
-  const mlSellTP = ml.shortTP || "—";
-  const mlBuyTP = ml.longTP || "—";
-  const mlQuote = ml.quote || "Model aligned with market volatility.";
-
-  const f15 = tf["15m"]?.fusion || 0;
-  const fusion = shortSig(f15);
-
-  let buyProb = Math.min(100, Math.max(0, Math.round(((f15 + 1) / 2) * 100)));
-  const sellProb = 100 - buyProb;
-
-
-  // =================== COMPLETE UI ===================
-  return `
-🔥 <b>${S} — AI Market Intelligence</b>
-Time (IST): ${T}
-Price: <b>${P}</b>
-━━━━━━━━━━━━━━━━━━
-
-<b>📊 MULTI-TIMEFRAME PANEL</b>
-(Short | Clean | Cluster-Free)
-
-${makeTF("1m", "1M")}
-${makeTF("5m", "5M")}
-${makeTF("15m", "15M")}
-${makeTF("30m", "30M")}
-${makeTF("1h", "1H")}
-━━━━━━━━━━━━━━━━━━
-
-<b>🧭 OVERALL BIAS</b>
-Bias: <b>${fusion}</b>
-Fusion Score: ${f15}
-Buy ${buyProb}% | Sell ${sellProb}%
-━━━━━━━━━━━━━━━━━━
-
-<b>🤖 MACHINE LEARNING FORECAST</b>
-Direction: <b>${mlDir}</b>  
-ML Confidence: <b>${mlConf}%</b>
-
-📌 ML Says:  
-“${mlQuote}”
-
-ML Targets:
-• ML Sell TP: <b>${mlSellTP}</b>  
-• ML Buy TP (Hedge): <b>${mlBuyTP}</b>
-━━━━━━━━━━━━━━━━━━
-
-<b>📰 NEWS IMPACT</b>
-Impact: <b>${newsImpact}</b>  
-Sentiment: <b>${newsSentiment}%</b>
-Headline: “${headline}”
-━━━━━━━━━━━━━━━━━━
-
-<i>AI Engine v9 — Market, ML, Elliott, News Unified</i>
-  `.trim();
-}
-
-
-// =============================================================
-// TG COMMANDS
-// =============================================================
-bot.onText(/\/report/, async (msg) => {
-  const id = msg.chat.id;
-
-  await safeSend(id, "⏳ Generating AI Market Intelligence...");
-
-  const raw = await buildAIReport("BTCUSDT");
-  const html = await formatAIReport(raw);
-
-  await safeSend(id, html);
-});
-
-bot.onText(/\/help/, (msg) =>
-  safeSend(msg.chat.id, `
-<b>📘 Commands</b>
-/report → Full AI Report  
-/ping → Check bot  
-/help → Help  
-`)
-);
-
-bot.onText(/\/ping/, (msg) =>
-  safeSend(msg.chat.id, "🏓 Pong!")
-);
-
-
-// =============================================================
-// EXPORT
-// =============================================================
-export default {
-  bot,
+  attachBot,
   buildAIReport,
   formatAIReport
 };
