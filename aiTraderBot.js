@@ -60,7 +60,7 @@ function nowIST() {
 // ======================================================
 export async function sendTelegram(text) {
   try {
-    if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
+    if (!CONFIG.TELEGRAM?.BOT_TOKEN || !CONFIG.TELEGRAM?.CHAT_ID) {
       console.log("⚠️ Missing Telegram credentials");
       return false;
     }
@@ -81,10 +81,10 @@ export async function sendTelegram(text) {
       }
     );
 
-    return r.data.ok;
+    return r.data?.ok ?? false;
 
   } catch (e) {
-    console.log("Telegram error:", e.message);
+    console.log("Telegram error:", e?.message ?? e);
     return false;
   }
 }
@@ -124,24 +124,46 @@ async function doAutoReport() {
     // 1️⃣ BUILD REPORT
     const raw = await buildAIReport(CONFIG.SYMBOL);
     if (!raw) {
-      console.log("❌ buildAIReport returned NULL");
+      console.log("❌ buildAIReport returned NULL or falsy");
       await sendTelegram("⚠️ AutoReport failed (buildAIReport empty)");
       autoRunning = false;
       return;
     }
 
-    // 2️⃣ FORMAT REPORT
+    // 2️⃣ FORMAT REPORT (DEFENSIVE: ensure string)
     let html;
     try {
       html = await formatAIReport(raw);
+
+      // Defensive: if formatAIReport returned non-string, coerce to string
+      if (typeof html !== "string") {
+        console.log("⚠️ formatAIReport returned non-string:", typeof html);
+        // If it's an object (likely) try to stringify concisely but avoid circular crash
+        try {
+          html = typeof html === "object" ? JSON.stringify(html, (k, v) => (typeof v === 'function' ? '[fn]' : v), 2) : String(html);
+        } catch (e) {
+          html = String(html || "");
+        }
+      }
+
     } catch (e1) {
-      console.log("❌ formatAIReport error:", e1.message);
-      html = `<b>⚠️ Format Error</b>\nRaw data:\n${JSON.stringify(raw, null, 2)}`;
+      console.log("❌ formatAIReport error:", e1?.message ?? e1);
+      // Provide useful fallback message
+      try {
+        html = `<b>⚠️ Format Error</b>\nError: ${String(e1?.message ?? e1)}\n\nRaw data:\n${JSON.stringify(raw, null, 2)}`;
+      } catch (e2) {
+        html = `<b>⚠️ Format Error</b>\nError while formatting report.`;
+      }
     }
 
-    if (!html || html.trim() === "") {
-      console.log("❌ formatAIReport returned empty HTML");
-      html = `<b>⚠️ AutoReport Empty Output</b>\nRaw:\n${JSON.stringify(raw)}`;
+    // final safety — avoid trim crash (guarantee html is string)
+    if (!html || typeof html !== "string" || html.trim() === "") {
+      console.log("❌ formatAIReport returned empty or invalid HTML");
+      try {
+        html = `<b>⚠️ AutoReport Empty Output</b>\nRaw:\n${JSON.stringify(raw, null, 2)}`;
+      } catch (e) {
+        html = `<b>⚠️ AutoReport Empty Output</b>\nRaw: (unable to stringify)`;
+      }
     }
 
     // 3️⃣ SEND TO TELEGRAM
@@ -150,8 +172,10 @@ async function doAutoReport() {
     else console.log(nowIST(), "📤 Auto-report sent ✔");
 
   } catch (e) {
-    console.log("❌ AutoReport main error:", e.message);
-    await sendTelegram(`⚠️ AutoReport crashed:\n${e.message}`);
+    console.log("❌ AutoReport main error:", e?.message ?? e);
+    try {
+      await sendTelegram(`⚠️ AutoReport crashed:\n${String(e?.message ?? e)}`);
+    } catch {}
   }
 
   autoRunning = false;
@@ -200,7 +224,7 @@ setInterval(async () => {
   }
 
   try {
-    await axios.get("http://localhost:10000/ping", { timeout: 4000 });
+    await axios.get("http://localhost:" + (PORT || 10000) + "/ping", { timeout: 4000 });
     console.log("💓 Localhost KeepAlive OK");
   } catch (e) {
     console.log("⚠️ Localhost KeepAlive failed");
@@ -213,22 +237,25 @@ setInterval(async () => {
 // ======================================================
 // REVERSAL WATCHER START
 // ======================================================
-startReversalWatcher(
-  CONFIG.SYMBOL,
-  {
-    pollIntervalMs: 20000,
-    tfs: ["1m", "5m", "15m"],
-    weights: { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
-    minAlertConfidence: 65,
-    microLookback: 60,
-    feedbackWindowsSec: [60, 300]
-  },
-  async (msg) => {
-    await sendTelegram(msg);
-  }
-);
-
-console.log("⚡ Reversal Watcher ACTIVE");
+try {
+  startReversalWatcher(
+    CONFIG.SYMBOL,
+    {
+      pollIntervalMs: 20000,
+      tfs: ["1m", "5m", "15m"],
+      weights: { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
+      minAlertConfidence: 65,
+      microLookback: 60,
+      feedbackWindowsSec: [60, 300]
+    },
+    async (msg) => {
+      try { await sendTelegram(msg); } catch (e) { console.log("ReversalWatcher -> Telegram send failed", e?.message ?? e); }
+    }
+  );
+  console.log("⚡ Reversal Watcher ACTIVE");
+} catch (e) {
+  console.log("⚠️ Failed to start Reversal Watcher:", e?.message ?? e);
+}
 
 
 // ======================================================
@@ -241,9 +268,11 @@ async function shutdown() {
   console.log("🛑 Shutting down...");
   try {
     if (autoTimer) clearInterval(autoTimer);
-    try { await stopReversalWatcher(); } catch {}
+    try { await stopReversalWatcher(); } catch (err) { /* ignore */ }
     if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
-  } catch {}
+  } catch (err) {
+    console.log("Error during shutdown:", err?.message ?? err);
+  }
   process.exit(0);
 }
 
