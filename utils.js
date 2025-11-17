@@ -205,8 +205,3 @@ export async function keepAlive() {
 // -----------------------------------------------------
 // EXPORTS
 // -----------------------------------------------------
-export {
-  cachePath,
-  readCache,
-  writeCache
-};
