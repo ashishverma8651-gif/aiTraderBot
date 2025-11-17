@@ -17,7 +17,7 @@ import {
   calculateAccuracy,
   recordPrediction,
   recordOutcome
-} from "./ml_module_8_6.js";
+} from "./ml_module_v8_6.js";
 
 import newsModule from "./news_social.js";
 
