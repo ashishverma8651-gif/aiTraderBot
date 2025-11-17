@@ -6,7 +6,7 @@
 import CONFIG from "./config.js";
 import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
-import { analyzeElliott } from "./elliott_module_v1.3.js";
+import { analyzeElliott } from "./elliott_module.js";
 import {
   runMLPrediction,
   runMicroPrediction,
