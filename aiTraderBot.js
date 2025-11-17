@@ -20,12 +20,7 @@ function alreadyRunning() {
   try {
     if (!fs.existsSync(LOCK_FILE)) return false;
     const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
-    try { 
-      process.kill(pid, 0); 
-      return true; 
-    } catch { 
-      return false; 
-    }
+    try { process.kill(pid, 0); return true; } catch { return false; }
   } catch {
     return true;
   }
@@ -39,6 +34,7 @@ if (alreadyRunning()) {
 try { fs.writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
 global.__aiTrader_running = true;
 
+
 // ======================================================
 // SIMPLE SERVER
 // ======================================================
@@ -50,12 +46,14 @@ app.get("/ping", (req, res) => res.send("pong"));
 
 app.listen(PORT, () => console.log("🚀 Server live on", PORT));
 
+
 // ======================================================
 // HELPERS
 // ======================================================
 function nowIST() {
   return new Date().toLocaleString("en-IN", { hour12: true, timeZone: "Asia/Kolkata" });
 }
+
 
 // ======================================================
 // TELEGRAM SENDER (SAFE)
@@ -91,6 +89,8 @@ export async function sendTelegram(text) {
   }
 }
 
+
+
 // ======================================================
 // Market Data Context
 // ======================================================
@@ -102,6 +102,8 @@ export async function getDataContext(symbol = CONFIG.SYMBOL) {
     return { price: 0, candles: [] };
   }
 }
+
+
 
 // ======================================================
 // AUTO REPORT (FIXED VERSION)
@@ -145,6 +147,7 @@ async function doAutoReport() {
     else console.log(nowIST(), "📤 Auto-report sent ✔");
 
   } catch (e) {
+    console.log("❌ AutoReport main error:", e.message);
     await sendTelegram(`⚠️ AutoReport crashed:\n${e.message}`);
   }
 
@@ -153,26 +156,29 @@ async function doAutoReport() {
 
 function startAuto() {
   const ms = 15 * 60 * 1000;
+
   setTimeout(doAutoReport, 3000);
   autoTimer = setInterval(doAutoReport, ms);
+
   console.log("⏱ AutoReport scheduled every 15m");
 }
 
 startAuto();
 
+
+
 // ======================================================
 // PUBLIC URL Auto-detect
 // ======================================================
 function detectPublicURL() {
-  return (
-    process.env.RENDER_EXTERNAL_URL ||
-    process.env.RENDER_URL ||
-    process.env.WEBSITE_URL ||
-    ""
-  ).replace(/\/+$/, "");
+  return (process.env.RENDER_EXTERNAL_URL ||
+          process.env.RENDER_URL ||
+          process.env.WEBSITE_URL ||
+          "").replace(/\/+$/, "");
 }
 
 const PUBLIC_URL = detectPublicURL();
+
 
 // ======================================================
 // KEEPALIVE (NO-SLEEP)
@@ -199,6 +205,8 @@ setInterval(async () => {
 
 }, 3 * 60 * 1000);
 
+
+
 // ======================================================
 // REVERSAL WATCHER START
 // ======================================================
@@ -218,6 +226,8 @@ startReversalWatcher(
 );
 
 console.log("⚡ Reversal Watcher ACTIVE");
+
+
 
 // ======================================================
 // CLEAN EXIT
