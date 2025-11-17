@@ -1,4 +1,4 @@
-// aiTraderBot.js — FINAL (FORCE NO-SLEEP VERSION)
+// aiTraderBot.js — FINAL STABLE VERSION (AUTO-REPORT FIXED + NO-SLEEP + CLEAN LOGS)
 
 import fs from "fs";
 import path from "path";
@@ -36,7 +36,7 @@ global.__aiTrader_running = true;
 
 
 // ======================================================
-// SERVER
+// SIMPLE SERVER
 // ======================================================
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
@@ -56,15 +56,22 @@ function nowIST() {
 
 
 // ======================================================
-// Telegram Sender
+// TELEGRAM SENDER (SAFE)
 // ======================================================
-async function sendTelegram(text) {
+export async function sendTelegram(text) {
   try {
-    if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) return;
+    if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
+      console.log("⚠️ Missing Telegram credentials");
+      return false;
+    }
 
-    const clean = String(text || "").replace(/[-=_]{3,}/g, "\n").trim();
+    const clean = String(text || "").trim();
+    if (!clean || clean.length < 2) {
+      console.log("⚠️ Telegram send skipped: empty message");
+      return false;
+    }
 
-    await axios.post(
+    const r = await axios.post(
       `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`,
       {
         chat_id: CONFIG.TELEGRAM.CHAT_ID,
@@ -73,15 +80,19 @@ async function sendTelegram(text) {
         disable_web_page_preview: true
       }
     );
+
+    return r.data.ok;
+
   } catch (e) {
     console.log("Telegram error:", e.message);
+    return false;
   }
 }
 
 
 
 // ======================================================
-// Data Fetcher
+// Market Data Context
 // ======================================================
 export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
@@ -95,28 +106,61 @@ export async function getDataContext(symbol = CONFIG.SYMBOL) {
 
 
 // ======================================================
-// AUTO REPORT (15m)
+// AUTO REPORT (FIXED VERSION)
 // ======================================================
 let autoTimer = null;
+let autoRunning = false;
 
 async function doAutoReport() {
+  if (autoRunning) {
+    console.log(nowIST(), "⏳ Auto-report skipped (already running)");
+    return;
+  }
+
+  autoRunning = true;
   console.log(nowIST(), "⏳ Auto-report triggered");
 
   try {
-    const r = await buildAIReport(CONFIG.SYMBOL);
-    const html = await formatAIReport(r);
-    await sendTelegram(html);
-    console.log(nowIST(), "📤 Auto-report sent");
+    // 1️⃣ BUILD REPORT
+    const raw = await buildAIReport(CONFIG.SYMBOL);
+    if (!raw) {
+      console.log("❌ buildAIReport returned NULL");
+      await sendTelegram("⚠️ AutoReport failed (buildAIReport empty)");
+      autoRunning = false;
+      return;
+    }
+
+    // 2️⃣ FORMAT REPORT
+    let html;
+    try {
+      html = await formatAIReport(raw);
+    } catch (e1) {
+      console.log("❌ formatAIReport error:", e1.message);
+      html = `<b>⚠️ Format Error</b>\nRaw data:\n${JSON.stringify(raw, null, 2)}`;
+    }
+
+    if (!html || html.trim() === "") {
+      console.log("❌ formatAIReport returned empty HTML");
+      html = `<b>⚠️ AutoReport Empty Output</b>\nRaw:\n${JSON.stringify(raw)}`;
+    }
+
+    // 3️⃣ SEND TO TELEGRAM
+    const ok = await sendTelegram(html);
+    if (!ok) console.log("❌ Telegram send failed");
+    else console.log(nowIST(), "📤 Auto-report sent ✔");
 
   } catch (e) {
-    console.log("Auto report error:", e.message);
+    console.log("❌ AutoReport main error:", e.message);
+    await sendTelegram(`⚠️ AutoReport crashed:\n${e.message}`);
   }
+
+  autoRunning = false;
 }
 
 function startAuto() {
   const ms = 15 * 60 * 1000;
 
-  setTimeout(doAutoReport, 3000); // first report after 3s
+  setTimeout(doAutoReport, 3000); // First report after 3 sec
   autoTimer = setInterval(doAutoReport, ms);
 
   console.log("⏱ AutoReport scheduled every 15m");
@@ -140,12 +184,11 @@ const PUBLIC_URL = detectPublicURL();
 
 
 // ======================================================
-// FORCE KEEPALIVE BLOCK (NEVER SLEEPS)
+// KEEPALIVE (NO-SLEEP)
 // ======================================================
 console.log("🔧 KeepAlive system enabled");
 
 setInterval(async () => {
-  // 1️⃣ PRIMARY — Public URL ping
   if (PUBLIC_URL) {
     try {
       await axios.get(PUBLIC_URL + "/ping", { timeout: 6000 });
@@ -156,7 +199,6 @@ setInterval(async () => {
     }
   }
 
-  // 2️⃣ FALLBACK — Localhost ping (always works)
   try {
     await axios.get("http://localhost:10000/ping", { timeout: 4000 });
     console.log("💓 Localhost KeepAlive OK");
@@ -164,32 +206,25 @@ setInterval(async () => {
     console.log("⚠️ Localhost KeepAlive failed");
   }
 
-}, 3 * 60 * 1000); // every 3 min
+}, 3 * 60 * 1000);
 
 
 
 // ======================================================
-// REVERSAL WATCHER
-// ======================================================
-// ======================================================
-// REVERSAL WATCHER (Option-D Multiframe + ML + Feedback)
+// REVERSAL WATCHER START
 // ======================================================
 startReversalWatcher(
   CONFIG.SYMBOL,
   {
-    pollIntervalMs: 20000,        // 20 sec scan
-    tfs: ["1m", "5m", "15m"],     // multi-timeframe
-    weights: {                    // TF importance
-      "1m": 0.25,
-      "5m": 0.35,
-      "15m": 0.40
-    },
-    minAlertConfidence: 65,       // threshold
-    microLookback: 60,            // small ML window
-    feedbackWindowsSec: [60, 300] // 1m & 5m accuracy feedback
+    pollIntervalMs: 20000,
+    tfs: ["1m", "5m", "15m"],
+    weights: { "1m": 0.25, "5m": 0.35, "15m": 0.40 },
+    minAlertConfidence: 65,
+    microLookback: 60,
+    feedbackWindowsSec: [60, 300]
   },
   async (msg) => {
-    await sendTelegram(msg);      // NO prefix (module already adds formatting)
+    await sendTelegram(msg);
   }
 );
 
