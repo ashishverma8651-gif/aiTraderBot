@@ -6,10 +6,10 @@
 // Telegram + helpers
 // --------------------
 import TelegramBot from "node-telegram-bot-api";
-import ML from "../modules/ml_module_v8_6.js";
-import NEWS from "../modules/news_module.js";
-import { fetchMultiTF } from "../modules/utils.js";
-import { analyzeElliott } from "../modules/elliott_module.js";
+import ML from "./ml_module_8_6.js";
+import News from "./news_social.js";
+import { analyzeElliott } from "./elliott_module.js";
+import { fetchMultiTF, fetchMarketData } from "./utils.js";
 
 const {
   runMLPrediction,
