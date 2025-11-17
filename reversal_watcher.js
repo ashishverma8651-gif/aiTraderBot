@@ -1,111 +1,71 @@
-// reversal_watcher.js — SIMPLE + STABLE VERSION
+// reversal_watcher.js — STABLE V10 (No Spam / No Errors)
 
-import { fetchMultiTF } from "./utils.js";
+import { fetchMarketData } from "./utils.js";
 import { runMicroPrediction, runMLPrediction } from "./ml_module_v8_6.js";
 
-let _timer = null;
-let _running = false;
-let _sendFunc = null;
+let timer = null;
+let active = false;
 
-const TF = "15m";
+export function startReversalWatcher(symbol, cfg, sendFn) {
+  if (active) return;
+  active = true;
 
-// ----------- Candle Pattern ------------
-function detectReversal(c) {
-  if (!c || c.length < 2) return null;
+  console.log("⚡ Reversal Watcher started");
 
-  const prev = c[c.length - 2];
-  const cur = c[c.length - 1];
+  const poll = async () => {
+    try {
+      const tf = "15m";
+      const r = await fetchMarketData(symbol, tf, 60);
 
-  // Bullish Engulfing
-  if (
-    prev.close < prev.open &&
-    cur.close > cur.open &&
-    cur.open <= prev.close &&
-    cur.close >= prev.open
-  ) {
-    return { side: "bull", pattern: "Bullish Engulfing" };
-  }
+      if (!r || !r.data || r.data.length < 20) {
+        console.log("⚠️ No data for watcher");
+        return;
+      }
 
-  // Bearish Engulfing
-  if (
-    prev.close > prev.open &&
-    cur.close < cur.open &&
-    cur.open >= prev.close &&
-    cur.close <= prev.open
-  ) {
-    return { side: "bear", pattern: "Bearish Engulfing" };
-  }
+      const candles = r.data;
+      const last = candles[candles.length - 1];
+      const prev = candles[candles.length - 2];
 
-  return null;
+      // SIMPLE + STABLE PATTERN DETECTOR
+      const bullish = last.close > last.open && prev.close < prev.open;
+      const bearish = last.close < last.open && prev.close > prev.open;
+
+      let pattern = null;
+      if (bullish) pattern = "Bullish Reversal (Engulfing)";
+      if (bearish) pattern = "Bearish Reversal (Engulfing)";
+
+      if (!pattern) return;
+
+      // ML CONFIDENCE
+      const micro = await runMicroPrediction(symbol, candles);
+      const ml = await runMLPrediction(symbol, candles);
+
+      if (!ml || !ml.confidence) return;
+
+      if (ml.confidence < cfg.minAlertConfidence) return;
+
+      const msg = `
+🔥 <b>${pattern}</b>
+<b>${symbol}</b> — ${tf}
+Price: <b>${last.close}</b>
+ML: <b>${ml.direction} ${ml.confidence}%</b>
+Micro: ${micro?.signal || "-"}
+Time: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
+      `;
+
+      await sendFn(msg.trim());
+
+    } catch (err) {
+      console.log("scan error:", err.message);
+    }
+  };
+
+  timer = setInterval(poll, cfg.pollIntervalMs || 20000);
+  poll(); // run instantly once
 }
 
-// ----------- Formatting -------------
-function fmtMsg({ side, pattern, volSpike, ml, price, symbol }) {
-  const arrow = side === "bull" ? "🔥 REVERSAL DETECTED (Bullish)" : "🔥 REVERSAL DETECTED (Bearish)";
-
-  return (
-`${arrow}
-Symbol: ${symbol}
-Pattern: ${pattern} (${TF})
-Volume: ${volSpike.toFixed(1)}× spike
-ML: ${ml.label} ${ml.probMaxPercent}%
-Entry: ${price}`
-  );
-}
-
-// ----------- Core Scan -------------
-async function scan(symbol) {
-  try {
-    const multi = await fetchMultiTF(symbol, [TF]);
-    const data = multi[TF]?.data || [];
-    if (!data.length) return;
-
-    const det = detectReversal(data);
-    if (!det) return;
-
-    // volume
-    const last = data.at(-1);
-    const avg = data.slice(-20).reduce((s, c) => s + (c.vol || c.volume || 0), 0) / 20;
-    const volSpike = (last.vol || last.volume || 0) / Math.max(1, avg);
-
-    // ML
-    const ml = await runMLPrediction(symbol, TF);
-
-    // build message
-    const msg = fmtMsg({
-      side: det.side,
-      pattern: det.pattern,
-      volSpike,
-      ml,
-      price: last.close,
-      symbol
-    });
-
-    await _sendFunc(msg);
-
-  } catch (e) {
-    console.log("scan error:", e);
-  }
-}
-
-// ----------- Public Exports -------------
-export function startReversalWatcher(symbol, sendFunc, intervalMs = 15000) {
-  if (_running) return;
-
-  _running = true;
-  _sendFunc = sendFunc;
-
-  _timer = setInterval(() => scan(symbol), intervalMs);
-
-  console.log("Reversal Watcher started");
-}
 
 export function stopReversalWatcher() {
-  if (_timer) clearInterval(_timer);
-  _running = false;
-  console.log("Reversal Watcher stopped");
-}
-
-export function getWatcherState() {
-  return { running: _running };
+  active = false;
+  if (timer) clearInterval(timer);
 }
