@@ -1,11 +1,12 @@
 {
   "name": "ai-trader-bot",
   "version": "11.0.0",
+  "description": "AI Trader v11.0 — multi-source ML + Elliott + Telegram + WebSocket + KeepAlive + Reversal Watcher",
   "main": "aiTraderBot.js",
   "type": "module",
 
   "scripts": {
-    "start": "node aiTraderBot.js"
+    "start": "node --expose-gc aiTraderBot.js"
   },
 
   "dependencies": {
@@ -21,6 +22,6 @@
   },
 
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
