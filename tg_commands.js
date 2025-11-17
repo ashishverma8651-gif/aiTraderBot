@@ -1,5 +1,4 @@
-// tg_commands_v9_final_part1.js
-// AI Trader TG command — FIXED version (part 1/3)
+// tg_commands_v9_final.js — AI Trader TG command (v9 compatible)
 // Uses: elliott_module.js, ml_module_v8_6.js, core_indicators.js, utils.js, news_social.js
 // Exports: buildAIReport(symbol) -> report object, formatAIReport(report) -> HTML string
 
@@ -14,9 +13,9 @@ import {
   calculateAccuracy,
   recordPrediction,
   recordOutcome
-} from "./ml_module_v8_6.js"; // <-- ensure this matches your actual file
+} from "./ml_module_v8_6.js"; // using your file
 
-import newsModule from "./news_social.js"; // news_social.js exports default { fetchNewsBundle }
+import newsModule from "./news_social.js";
 
 // -----------------------------
 // Small helpers
@@ -24,8 +23,19 @@ import newsModule from "./news_social.js"; // news_social.js exports default { f
 const nf = (v, d = 2) =>
   (typeof v === "number" && Number.isFinite(v)) ? Number(v).toFixed(d) : "N/A";
 
-function clamp(v, lo = -1, hi = 1) {
+function clamp(v, lo = -Infinity, hi = Infinity) {
   return Math.max(lo, Math.min(hi, v));
+}
+function pctClamp(p) { // ensure finite 0..100
+  if (!Number.isFinite(p)) return 0;
+  return Math.round(Math.max(0, Math.min(100, p)) * 100) / 100;
+}
+function safeToPct(val) {
+  // Accept val in 0..1 or 0..100; return 0..100
+  if (val == null || Number.isNaN(Number(val))) return null;
+  const n = Number(val);
+  if (n >= 0 && n <= 1) return n * 100;
+  return n;
 }
 
 function fusionLabel(score) {
@@ -36,10 +46,9 @@ function fusionLabel(score) {
   return { label: "Strong Sell", emoji: "⛔" };
 }
 
-function safeNum(v, fallback = 0) { return Number.isFinite(Number(v)) ? Number(v) : fallback; }
-
 // -----------------------------
 // Fusion scoring per TF
+// (kept same as your earlier logic)
 function computeFusionScore(indObj = {}, ellObj = {}) {
   try {
     let score = 0;
@@ -87,11 +96,9 @@ function computeOverallFusion(mtf) {
 }
 
 function computeBuySellProb(overallFusion, mtf) {
-  // Base buy/sell from fusion
   let buy = (overallFusion + 1) / 2 * 100;
   let sell = 100 - buy;
 
-  // incorporate Elliott average (weighted by confidence)
   let ellSum = 0, ellW = 0;
   for (const m of mtf) {
     const ell = m.ell;
@@ -105,16 +112,15 @@ function computeBuySellProb(overallFusion, mtf) {
   buy += ellAvg * 10;
   sell = 100 - buy;
 
-  // small TF bias bonus
   const bullishTFs = mtf.filter(m => (m.fusionScore ?? 0) > 0.2).length;
   const bearishTFs = mtf.filter(m => (m.fusionScore ?? 0) < -0.2).length;
   const biasDiff = bullishTFs - bearishTFs;
   if (biasDiff > 0) buy += Math.min(8, biasDiff * 2);
   else if (biasDiff < 0) sell += Math.min(8, Math.abs(biasDiff) * 2);
 
-  // clamp/normalize
   buy = Math.max(0, Math.min(100, buy));
   sell = Math.max(0, Math.min(100, sell));
+
   const sum = buy + sell;
   if (sum > 0) {
     buy = Math.round((buy / sum) * 10000) / 100;
@@ -123,8 +129,6 @@ function computeBuySellProb(overallFusion, mtf) {
 
   return { buy, sell, ellAvg: Number(ellAvg.toFixed(3)) };
 }
-// tg_commands_v9_final_part2.js (part 2/3)
-// helpers continued, Elliott safe wrapper, target resolution, main builder
 
 // -----------------------------
 // TF block builder
@@ -165,7 +169,7 @@ function buildHeatmap(mtfData) {
 }
 
 // -----------------------------
-// Safely call Elliott (IMPROVED support/resistance extraction)
+// Safely call Elliott
 async function safeElliottForCandles(candles) {
   try {
     const ell = await analyzeElliott(candles);
@@ -243,12 +247,10 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     }
 
     let overallFusion = computeOverallFusion(mtf);
-    // initial probs (before ML/news)
     const probs = computeBuySellProb(overallFusion, mtf);
 
     const price = mtf.find(x=>x.tf==="15m")?.price || mtf[0]?.price || 0;
 
-    // collect candidate targets across TFs, dedupe keep best confidence
     const allTargets = mtf.flatMap(m => (m.targets || []).map(t => ({ ...t, tf: m.tf })));
     const uniqMap = new Map();
     for (const t of allTargets) {
@@ -283,168 +285,198 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     let micro = null;
     try { micro = await runMicroPrediction(symbol, "1m"); } catch (e) { micro = null; }
 
-    // historic accuracy
+    // accuracy
     let mlAcc = 0;
     try { const acc = calculateAccuracy(); mlAcc = acc?.accuracy ?? 0; } catch (e) { mlAcc = 0; }
 
-    // News (robust handling)
+    // News
     let news = null;
-    try {
-      // newsModule default export contains fetchNewsBundle
-      if (typeof newsModule.fetchNewsBundle === "function") news = await newsModule.fetchNewsBundle(symbol);
-      else if (typeof newsModule === "function") news = await newsModule(symbol);
-      else news = { ok:false, sentiment:0.5, impact:"Low", items:[] };
-    } catch (e) {
-      news = { ok:false, sentiment:0.5, impact:"Low", items:[] };
-    }
+    try { news = await newsModule.fetchNewsBundle(symbol); } catch (e) { news = { ok:false, sentiment:0.5, impact:"Low", items:[] }; }
 
-    // Adaptive weighting: nudge fusion using ML & News (improved)
-    const mlWeight = 0.22; // small nudge
-    let newsWeight = 0.12;
+    // Adaptive weighting: nudge fusion using ML & News
+    const mlWeight = 0.25;
+    let newsWeight = 0.10;
     const impact = (news && news.impact) ? (""+news.impact).toLowerCase() : "low";
-    if (impact === "high") newsWeight = 0.36;
-    else if (impact === "moderate") newsWeight = 0.22;
-    else newsWeight = 0.12;
+    if (impact === "high") newsWeight = 0.40;
+    else if (impact === "moderate") newsWeight = 0.25;
+    else newsWeight = 0.10;
 
-    // process ML probs robustly
+    // --- ML bias computation (do NOT force 33/33/33)
     let mlLabel = null;
     let mlProbMax = null;
     let mlProbBull = null, mlProbBear = null, mlProbNeutral = null;
 
     if (ml && typeof ml === "object") {
       if (typeof ml.label === "string") mlLabel = ml.label;
-      if (typeof ml.prob === "number") mlProbMax = Number(ml.prob);
-      if (typeof ml.probBull === "number") mlProbBull = Number(ml.probBull);
-      if (typeof ml.probBear === "number") mlProbBear = Number(ml.probBear);
-      if (typeof ml.probNeutral === "number") mlProbNeutral = Number(ml.probNeutral);
+      // prefer probs object
       if (ml.probs && typeof ml.probs === "object") {
-        if (typeof ml.probs.bull === "number") mlProbBull = ml.probs.bull * 100;
-        if (typeof ml.probs.bear === "number") mlProbBear = ml.probs.bear * 100;
-        if (typeof ml.probs.neutral === "number") mlProbNeutral = ml.probs.neutral * 100;
+        if (typeof ml.probs.bull === "number") mlProbBull = safeToPct(ml.probs.bull);
+        if (typeof ml.probs.bear === "number") mlProbBear = safeToPct(ml.probs.bear);
+        if (typeof ml.probs.neutral === "number") mlProbNeutral = safeToPct(ml.probs.neutral);
       }
+      // legacy fields
+      if (typeof ml.probBull === "number" && mlProbBull == null) mlProbBull = safeToPct(ml.probBull);
+      if (typeof ml.probBear === "number" && mlProbBear == null) mlProbBear = safeToPct(ml.probBear);
+      if (typeof ml.probNeutral === "number" && mlProbNeutral == null) mlProbNeutral = safeToPct(ml.probNeutral);
+      if (typeof ml.prob === "number" && mlProbMax == null) mlProbMax = safeToPct(ml.prob);
     }
 
-    // if per-class present → normalize to percent
+    // Normalize per-class probabilities if any present
     if (mlProbBull != null || mlProbBear != null || mlProbNeutral != null) {
-      mlProbBull = mlProbBull ?? 0;
-      mlProbBear = mlProbBear ?? 0;
-      mlProbNeutral = mlProbNeutral ?? 0;
-      if (mlProbBull <= 1 && mlProbBear <= 1 && mlProbNeutral <= 1) {
-        mlProbBull *= 100; mlProbBear *= 100; mlProbNeutral *= 100;
-      }
+      mlProbBull = pctClamp(mlProbBull ?? 0);
+      mlProbBear = pctClamp(mlProbBear ?? 0);
+      mlProbNeutral = pctClamp(mlProbNeutral ?? 0);
+
+      // fix rounding drift to sum 100
+      let s = mlProbBull + mlProbBear + mlProbNeutral;
+      if (s <= 0) { mlProbBull = mlProbBear = mlProbNeutral = 33.33; s = 100; }
+      mlProbBull = Math.round((mlProbBull / s) * 10000) / 100;
+      mlProbBear = Math.round((mlProbBear / s) * 10000) / 100;
+      mlProbNeutral = Math.round((mlProbNeutral / s) * 10000) / 100;
+
       mlProbMax = Math.max(mlProbBull, mlProbBear, mlProbNeutral);
       const idx = [mlProbBull, mlProbBear, mlProbNeutral].indexOf(mlProbMax);
       mlLabel = idx === 0 ? "Bullish" : idx === 1 ? "Bearish" : "Neutral";
     } else if (mlProbMax == null && ml && typeof ml === "object") {
-      if (typeof ml.predictionConfidence === "number") mlProbMax = Number(ml.predictionConfidence);
-      else if (typeof ml.confidence === "number") mlProbMax = Number(ml.confidence);
-      else if (typeof ml.maxProb === "number") mlProbMax = Number(ml.maxProb);
+      // fallback: other fields that might be in 0..1 or 0..100
+      const candidate = ml.predictionConfidence ?? ml.confidence ?? ml.score ?? null;
+      if (candidate != null) mlProbMax = safeToPct(candidate);
+    } else if (mlProbMax != null) {
+      mlProbMax = pctClamp(mlProbMax);
     }
 
-    // mlBias + newsBias application (careful, not overpower fusion)
+    // mlBias: +1 for bullish, -1 for bearish
     let mlBias = 0;
     if (mlLabel) {
       if (String(mlLabel).toLowerCase().includes("bull")) mlBias = +1;
       else if (String(mlLabel).toLowerCase().includes("bear")) mlBias = -1;
     }
 
-    // apply ML & News nudges
+    // nudge fusion using ML and news
     let boosted = clamp(overallFusion + mlBias * mlWeight, -1, 1);
-    const newsSent = (news && typeof news.sentiment === "number") ? news.sentiment : 0.5; // 0..1
-    const newsBias = ((newsSent - 0.5) * 2); // -1..1
+    const newsSent = (news && typeof news.sentiment === "number") ? news.sentiment : 0.5;
+    const newsBias = ((newsSent - 0.5) * 2);
     boosted = clamp(boosted + newsBias * newsWeight, -1, 1);
     overallFusion = Number(boosted.toFixed(3));
 
     const probsBoosted = computeBuySellProb(overallFusion, mtf);
 
-// tg_commands_v9_final_part3.js (part 3/3)
-// ML TP selection, formatting and export
-
     // -----------------------------
-    // ML TP selection (robust & direction aligned)
+    // ML TP selection: prefer direct ML TP if valid AND direction-aligned
     // -----------------------------
     function pickMLTPFromModel(mlObj) {
       if (!mlObj || typeof mlObj !== "object") return null;
-      const directTp = mlObj.tp || mlObj.tpEstimate || mlObj.tpEstimateValue || mlObj.tpValue || mlObj.tp_estimate || mlObj.tpEstimate;
-      const directSide = mlObj.tpSide || mlObj.side || mlObj.direction || mlObj.tpSide?.toString?.();
+      const directTp = mlObj.tp || mlObj.tpEstimate || mlObj.tpEstimateValue || mlObj.tpValue || mlObj.tp_estimate;
+      const directSideRaw = mlObj.tpSide || mlObj.side || mlObj.direction || mlObj.tpSide?.toString?.();
+      const directSide = directSideRaw ? String(directSideRaw).toLowerCase() : null;
       if (directTp != null && !Number.isNaN(Number(directTp))) {
         return {
           tp: Number(directTp),
-          confidence: Math.round((mlObj.tpConfidence ?? mlObj.tp_conf ?? (mlProbMax ?? 0))),
+          confidence: Math.round( (mlObj.tpConfidence ?? mlObj.tp_conf ?? (mlProbMax ?? 0)) ),
           side: (directSide ? String(directSide) : (String(mlLabel || "Neutral")))
         };
       }
       return null;
     }
 
-    function scoreTargetWithML(t, mlObj) {
+    function scoreTargetWithML(t, mlMaxPct) {
       const tConf = Number(t.confidence || 0) / 100;
-      let mlScore = 0.0;
-      if (mlProbMax != null) mlScore = (Number(mlProbMax) / 100);
-      return mlScore * 0.72 + tConf * 0.28;
+      const mlScore = (mlMaxPct != null) ? (Number(mlMaxPct) / 100) : 0.5;
+      // combine: ML weight 70% + target confidence 30%
+      return mlScore * 0.7 + tConf * 0.3;
     }
 
-    // direct ML TP
+    let mlChosenTP = null;
     const directMlTP = pickMLTPFromModel(ml);
-    let mlLongTP = null, mlShortTP = null;
-
-    // If model gave explicit TPs or long/short TPs, use them (but verify side)
     if (directMlTP) {
+      // normalize direct side to long/short/both
       const s = String(directMlTP.side || "").toLowerCase();
-      const sideNorm = s.includes("bull") || s.includes("long") ? "long" : s.includes("bear") || s.includes("short") ? "short" : "both";
-      if (sideNorm === "long") mlLongTP = { tp: Number(directMlTP.tp), confidence: directMlTP.confidence };
-      else if (sideNorm === "short") mlShortTP = { tp: Number(directMlTP.tp), confidence: directMlTP.confidence };
-      else mlLongTP = { tp: Number(directMlTP.tp), confidence: directMlTP.confidence };
-    }
-
-    // If model provided separate fields
-    if (ml && typeof ml === "object") {
-      if (!mlLongTP && (ml.longTP || ml.tpLong)) {
-        const v = ml.longTP || ml.tpLong;
-        if (!Number.isNaN(Number(v))) mlLongTP = { tp: Number(v), confidence: Math.round(ml.longTPConfidence ?? ml.tpLongConf ?? (mlProbMax || 0)) };
-      }
-      if (!mlShortTP && (ml.shortTP || ml.tpShort)) {
-        const v = ml.shortTP || ml.tpShort;
-        if (!Number.isNaN(Number(v))) mlShortTP = { tp: Number(v), confidence: Math.round(ml.shortTPConfidence ?? ml.tpShortConf ?? (mlProbMax || 0)) };
-      }
-    }
-
-    // fallback: use annotatedTargets guided by ml direction / probs
-    const maxProb = Math.max(mlProbMax ?? 0, probsBoosted.buy ?? 0);
-    const mlDirection = (mlLabel || (ml && ml.direction) || (ml && ml.label) || (maxProb > 55 && (probsBoosted.buy > probsBoosted.sell) ? "Bullish" : (probsBoosted.sell > probsBoosted.buy ? "Bearish" : "Neutral")));
-
-    if (!mlLongTP || !mlShortTP) {
-      // score annotated targets and pick best for each side
+      const side = (s.includes("bull") || s.includes("long")) ? "long" : (s.includes("bear") || s.includes("short")) ? "short" : "both";
+      mlChosenTP = { tp: directMlTP.tp, confidence: directMlTP.confidence || Math.round(mlProbMax || 0), side };
+    } else {
+      // Score annotatedTargets individually and pick best match for each side
       let bestLong = null, bestLongScore = -Infinity;
       let bestShort = null, bestShortScore = -Infinity;
       for (const t of annotatedTargets) {
-        const score = scoreTargetWithML(t, ml);
+        const score = scoreTargetWithML(t, mlProbMax);
         if (Number(t.tp) > price) {
           if (score > bestLongScore) { bestLongScore = score; bestLong = t; }
         } else if (Number(t.tp) < price) {
           if (score > bestShortScore) { bestShortScore = score; bestShort = t; }
         }
       }
-      if (!mlLongTP && bestLong) mlLongTP = { tp: Number(bestLong.tp), confidence: bestLong.confidence || Math.round(mlProbMax||0) };
-      if (!mlShortTP && bestShort) mlShortTP = { tp: Number(bestShort.tp), confidence: bestShort.confidence || Math.round(mlProbMax||0) };
+      if (bestLong) mlChosenTP = { tp: Number(bestLong.tp), confidence: bestLong.confidence || Math.round((mlProbMax||0)), side: "long" };
+      if (bestShort && (!mlChosenTP || (bestShort.confidence || 0) > (mlChosenTP.confidence || 0))) {
+        // keep bestShort if it's stronger
+        if (!mlChosenTP) mlChosenTP = { tp: Number(bestShort.tp), confidence: bestShort.confidence || Math.round((mlProbMax||0)), side: "short" };
+        else {
+          // if both exist, we will choose direction-aligned ones below
+        }
+      }
     }
 
-    // Final safety: ensure side alignment
+    // Pick mlLongTP / mlShortTP, but only if direction-aligned
+    let mlLongTP = null, mlShortTP = null;
+    // check model-provided explicit fields first
+    if (ml && typeof ml === "object") {
+      if (ml.longTP || ml.tpLong) {
+        const v = ml.longTP || ml.tpLong;
+        if (!Number.isNaN(Number(v))) mlLongTP = { tp: Number(v), confidence: Math.round(ml.longTPConfidence ?? ml.tpLongConf ?? (mlProbMax || 0)) };
+      }
+      if (ml.shortTP || ml.tpShort) {
+        const v = ml.shortTP || ml.tpShort;
+        if (!Number.isNaN(Number(v))) mlShortTP = { tp: Number(v), confidence: Math.round(ml.shortTPConfidence ?? ml.tpShortConf ?? (mlProbMax || 0)) };
+      }
+    }
+
+    // fallback to chosen mlChosenTP
+    if (!mlLongTP) {
+      if (mlChosenTP && mlChosenTP.side === "long" && Number(mlChosenTP.tp) > price) {
+        mlLongTP = { tp: mlChosenTP.tp, confidence: mlChosenTP.confidence || Math.round(mlProbMax || 0) };
+      } else {
+        // use best annotated long (but only if fusion/overall bias not strongly opposite)
+        if (longs[0]) mlLongTP = { tp: Number(longs[0].tp), confidence: longs[0].confidence || 20 };
+      }
+    }
+    if (!mlShortTP) {
+      if (mlChosenTP && mlChosenTP.side === "short" && Number(mlChosenTP.tp) < price) {
+        mlShortTP = { tp: mlChosenTP.tp, confidence: mlChosenTP.confidence || Math.round(mlProbMax || 0) };
+      } else {
+        if (shorts[0]) mlShortTP = { tp: Number(shorts[0].tp), confidence: shorts[0].confidence || 20 };
+      }
+    }
+
+    // Final guard: ensure mlLongTP is above price and mlShortTP is below price. Otherwise set null
     if (mlLongTP && Number(mlLongTP.tp) <= price) mlLongTP = null;
     if (mlShortTP && Number(mlShortTP.tp) >= price) mlShortTP = null;
 
-    // If still missing for chosen ML direction, create conservative ATR-based TP
-    const tf15 = mtf.find(x => x.tf === "15m");
-    const atr15 = tf15?.indicators?.ATR || (tf15?.price ? Number(tf15.price) * 0.005 : 0);
-    if (mlDirection && mlDirection.toLowerCase().includes("bull") && !mlLongTP) {
-      mlLongTP = { tp: Number((price + (atr15 || Math.max(price*0.001, 1)) * 2).toFixed(2)), confidence: Math.round(Math.max(30, mlProbMax || 40)) };
+    // If ML direction strongly bearish (mlProbMax > 60 and mlLabel=Bearish), then drop longTP suggestions
+    if (mlLabel && String(mlLabel).toLowerCase().includes("bear") && (mlProbMax || 0) >= 60) {
+      mlLongTP = null;
     }
-    if (mlDirection && mlDirection.toLowerCase().includes("bear") && !mlShortTP) {
-      mlShortTP = { tp: Number((price - (atr15 || Math.max(price*0.001, 1)) * 2).toFixed(2)), confidence: Math.round(Math.max(30, mlProbMax || 40)) };
+    if (mlLabel && String(mlLabel).toLowerCase().includes("bull") && (mlProbMax || 0) >= 60) {
+      mlShortTP = null;
     }
 
     // Build final report object
-    const report = {
+    // Normalize mlProbs for report: if we had per-class values use them, else if ml.probs exists use that, else fallback to mlProbMax
+    const mlProbsObj = {};
+    if (mlProbBull != null && mlProbBear != null && mlProbNeutral != null) {
+      mlProbsObj.bull = mlProbBull;
+      mlProbsObj.bear = mlProbBear;
+      mlProbsObj.neutral = mlProbNeutral;
+      mlProbsObj.max = mlProbMax;
+    } else if (ml && ml.probs && typeof ml.probs === "object") {
+      mlProbsObj.bull = pctClamp(safeToPct(ml.probs.bull ?? ml.probs.BULL ?? null) ?? 0);
+      mlProbsObj.bear = pctClamp(safeToPct(ml.probs.bear ?? ml.probs.BEAR ?? null) ?? 0);
+      mlProbsObj.neutral = pctClamp(safeToPct(ml.probs.neutral ?? ml.probs.NEUTRAL ?? null) ?? 0);
+      mlProbsObj.max = pctClamp(mlProbsObj.bull || mlProbsObj.bear || mlProbsObj.neutral || (mlProbMax || 0));
+    } else {
+      mlProbsObj.max = pctClamp(mlProbMax ?? (ml?.maxProb ?? null) ?? 0);
+      // leave others undefined
+    }
+
+    return {
       ok: true,
       symbol,
       price,
@@ -459,22 +491,15 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       ml,
       micro,
       mlAcc,
-      mlDirection,
+      mlDirection: mlLabel || "Neutral",
       mlLongTP,
       mlShortTP,
-      mlProbs: {
-        max: mlProbMax,
-        bull: mlProbBull,
-        bear: mlProbBear,
-        neutral: mlProbNeutral
-      },
+      mlProbs: mlProbsObj,
       news,
       newsWeight,
       mlWeight,
       generatedAt: new Date().toISOString()
     };
-
-    return report;
 
   } catch (e) {
     return { ok:false, error: e?.message || String(e) };
@@ -538,21 +563,29 @@ export async function formatAIReport(report) {
         )
         .join(" | ") || "n/a";
 
+    // Build ML prob display safely
     let mlProbDisplay = "N/A";
-    if (report.mlProbs) {
+    if (report.mlProbs && Object.keys(report.mlProbs).length) {
       const mp = report.mlProbs;
       if (mp.bull != null && mp.bear != null && mp.neutral != null) {
         mlProbDisplay = `Bull: ${nf(mp.bull,2)}% | Bear: ${nf(mp.bear,2)}% | Neutral: ${nf(mp.neutral,2)}%`;
       } else if (mp.max != null) {
         mlProbDisplay = `${nf(mp.max,2)}% (max)`;
       }
-    } else if (report.ml && typeof report.ml.prob === "number") {
-      mlProbDisplay = `${nf(report.ml.prob,2)}% (max)`;
+    } else if (report.ml && typeof report.ml.probs === "object") {
+      const m = report.ml.probs;
+      const b = pctClamp(safeToPct(m.bull ?? m.BULL ?? m.b ?? null) ?? 0);
+      const r = pctClamp(safeToPct(m.bear ?? m.BEAR ?? m.r ?? null) ?? 0);
+      const n = pctClamp(safeToPct(m.neutral ?? m.NEUTRAL ?? m.n ?? null) ?? 0);
+      mlProbDisplay = `Bull: ${nf(b,2)}% | Bear: ${nf(r,2)}% | Neutral: ${nf(n,2)}%`;
+    } else if (report.ml && typeof report.ml.maxProb === "number") {
+      mlProbDisplay = `${nf(pctClamp(safeToPct(report.ml.maxProb) ?? report.ml.maxProb),2)}% (max)`;
     }
 
     const mlLongTxt = report.mlLongTP ? `${nf(Number(report.mlLongTP.tp), 2)} [${report.mlLongTP.confidence}%]` : "N/A";
     const mlShortTxt = report.mlShortTP ? `${nf(Number(report.mlShortTP.tp), 2)} [${report.mlShortTP.confidence}%]` : "N/A";
 
+    // News block formatting (news.sentiment is 0..1)
     let newsTxt = "News: N/A";
     if (report.news) {
       const n = report.news;
