@@ -510,12 +510,3 @@ export async function checkReversalSignal(symbol, tf = "15m", opts = {}) {
   }
 }
 
-// Keep only named exports
-export {
-  runMLPrediction,
-  runMicroPrediction,
-  checkReversalSignal,
-  calculateAccuracy,
-  recordPrediction,
-  recordOutcome
-};
