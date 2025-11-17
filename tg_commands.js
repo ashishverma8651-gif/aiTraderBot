@@ -1,6 +1,10 @@
-// tg_commands.js — ML-connected detailed report (style B) — FIXED
-// AI Trader: Elliott + Fusion + ML v8.x + News
-// Exports: buildAIReport(symbol) -> report object, formatAIReport(report) -> HTML string
+/*
+  tg_commands_v9_final.js — AI Trader TG Command (v9 Compatible)
+  Uses: elliott_module.js, ml_module_v9_0.js, core_indicators.js, utils.js, news_social.js
+  Exports:
+     buildAIReport(symbol) -> report object
+     formatAIReport(report) -> formatted HTML
+*/
 
 import CONFIG from "./config.js";
 import { fetchMultiTF } from "./utils.js";
@@ -13,13 +17,13 @@ import {
   calculateAccuracy,
   recordPrediction,
   recordOutcome
-} from "./ml_module_v8_6.js";
+} from "./ml_module_v9_0.js";
 
 import newsModule from "./news_social.js";
 
-// -----------------------------
-// Small helpers
-// -----------------------------
+// ----------------------------------
+// Helpers
+// ----------------------------------
 const nf = (v, d = 2) =>
   (typeof v === "number" && Number.isFinite(v)) ? Number(v).toFixed(d) : "N/A";
 
@@ -266,7 +270,7 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     const longs = annotatedTargets.filter(t => Number(t.tp) > price).sort((a,b)=>b.confidence - a.confidence);
     const shorts = annotatedTargets.filter(t => Number(t.tp) < price).sort((a,b)=>b.confidence - a.confidence);
 
-    // -----------------------------
+// -----------------------------
     // ML: main prediction (15m) + micro (optional)
     // -----------------------------
     let ml = null;
@@ -292,15 +296,11 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     else newsWeight = 0.10;
 
     // --- ML bias computation (do NOT force 33/33/33)
-    // If ML returns class probs, use them directly; else use ml.prob as max-prob %
     let mlLabel = null;
     let mlProbMax = null;
     let mlProbBull = null, mlProbBear = null, mlProbNeutral = null;
 
     if (ml && typeof ml === "object") {
-      // common shapes:
-      // option A: { label: "Bullish", prob: 62.4, probBull: 62.4, probBear: 20, probNeutral: 17.6, tp: 95482.4, tpSide: "Long" }
-      // option B: { probs: { bull:0.6, bear:0.2, neutral:0.2 }, tp:..., tpSide: ... }
       if (typeof ml.label === "string") mlLabel = ml.label;
       if (typeof ml.prob === "number") mlProbMax = Number(ml.prob);
       if (typeof ml.probBull === "number") mlProbBull = Number(ml.probBull);
@@ -313,12 +313,10 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       }
     }
 
-    // if only per-class present, set max
     if (mlProbBull != null || mlProbBear != null || mlProbNeutral != null) {
       mlProbBull = mlProbBull ?? 0;
       mlProbBear = mlProbBear ?? 0;
       mlProbNeutral = mlProbNeutral ?? 0;
-      // if they are in 0..1 scale convert
       if (mlProbBull <= 1 && mlProbBear <= 1 && mlProbNeutral <= 1) {
         mlProbBull *= 100; mlProbBear *= 100; mlProbNeutral *= 100;
       }
@@ -326,13 +324,11 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       const idx = [mlProbBull, mlProbBear, mlProbNeutral].indexOf(mlProbMax);
       mlLabel = idx === 0 ? "Bullish" : idx === 1 ? "Bearish" : "Neutral";
     } else if (mlProbMax == null && ml && typeof ml === "object") {
-      // fallback: try ml.predictionConfidence, ml.confidence, ml.score
       if (typeof ml.predictionConfidence === "number") mlProbMax = Number(ml.predictionConfidence);
       else if (typeof ml.confidence === "number") mlProbMax = Number(ml.confidence);
       else if (typeof ml.score === "number") mlProbMax = Number(ml.score);
     }
 
-    // mlBias: +1 for bullish, -1 for bearish
     let mlBias = 0;
     if (mlLabel) {
       if (String(mlLabel).toLowerCase().includes("bull")) mlBias = +1;
@@ -348,11 +344,10 @@ export async function buildAIReport(symbol = "BTCUSDT") {
     const probsBoosted = computeBuySellProb(overallFusion, mtf);
 
     // -----------------------------
-    // ML TP selection: prefer direct ML TP if present, else score candidate targets
+    // ML TP selection
     // -----------------------------
     function pickMLTPFromModel(mlObj) {
       if (!mlObj || typeof mlObj !== "object") return null;
-      // prefer direct numeric tp fields
       const directTp = mlObj.tp || mlObj.tpEstimate || mlObj.tpEstimateValue || mlObj.tpValue || mlObj.tp_estimate;
       const directSide = mlObj.tpSide || mlObj.side || mlObj.direction || mlObj.tpSide?.toString?.();
       if (directTp != null && !Number.isNaN(Number(directTp))) {
@@ -365,26 +360,20 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       return null;
     }
 
-    // scoring function for candidate targets using ML model outputs + target confidence
     function scoreTargetWithML(t, mlObj) {
-      // t.confidence in 0..100
       const tConf = Number(t.confidence || 0) / 100;
       let mlScore = 0.0;
-      if (mlProbMax != null) mlScore = (Number(mlProbMax) / 100); // 0..1
-      // Combine 70% ML score + 30% target confidence
+      if (mlProbMax != null) mlScore = (Number(mlProbMax) / 100);
       return mlScore * 0.7 + tConf * 0.3;
     }
 
-    // try direct ML TP first
     let mlChosenTP = null;
     const directMlTP = pickMLTPFromModel(ml);
     if (directMlTP) {
-      // Convert side to 'long'/'short' normalization
       const s = String(directMlTP.side || "").toLowerCase();
       const side = s.includes("bull") || s.includes("long") ? "long" : s.includes("bear") || s.includes("short") ? "short" : null;
       mlChosenTP = { tp: directMlTP.tp, confidence: directMlTP.confidence || Math.round(mlProbMax || 0), side: side || "both" };
     } else {
-      // Score annotatedTargets individually and pick best match for each side
       let bestLong = null, bestLongScore = -Infinity;
       let bestShort = null, bestShortScore = -Infinity;
       for (const t of annotatedTargets) {
@@ -397,13 +386,11 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       }
       if (bestLong) mlChosenTP = { tp: Number(bestLong.tp), confidence: bestLong.confidence || Math.round((mlProbMax||0)), side: "long" };
       if (bestShort && (!mlChosenTP || (bestShort.confidence || 0) > (mlChosenTP.confidence || 0))) {
-        // if both exist, keep both in separate fields below
+        // keep bestShort separate if needed later
       }
     }
 
-    // Pick ML long/short TP values for the report:
     let mlLongTP = null, mlShortTP = null;
-    // if direct model provided both sides maybe in ml.longTP/ml.shortTP
     if (ml && typeof ml === "object") {
       if (ml.longTP || ml.tpLong) {
         const v = ml.longTP || ml.tpLong;
@@ -414,11 +401,10 @@ export async function buildAIReport(symbol = "BTCUSDT") {
         if (!Number.isNaN(Number(v))) mlShortTP = { tp: Number(v), confidence: Math.round(ml.shortTPConfidence ?? ml.tpShortConf ?? (mlProbMax || 0)) };
       }
     }
-    // fallback to chosen mlChosenTP plus best candidate pick
+
     if (!mlLongTP) {
       if (mlChosenTP && mlChosenTP.side === "long") mlLongTP = { tp: mlChosenTP.tp, confidence: mlChosenTP.confidence || Math.round(mlProbMax || 0) };
       else {
-        // pick best annotated long
         mlLongTP = (mlChosenTP && mlChosenTP.side === "both" && Number(mlChosenTP.tp) > price) ? { tp: mlChosenTP.tp, confidence: mlChosenTP.confidence } : (longs[0] ? { tp: Number(longs[0].tp), confidence: longs[0].confidence } : null);
       }
     }
@@ -448,7 +434,6 @@ export async function buildAIReport(symbol = "BTCUSDT") {
       mlDirection: mlLabel || "Neutral",
       mlLongTP,
       mlShortTP,
-      // expose detailed ML prob fields so format function can print precise values
       mlProbs: {
         max: mlProbMax,
         bull: mlProbBull,
@@ -523,7 +508,6 @@ export async function formatAIReport(report) {
         )
         .join(" | ") || "n/a";
 
-    // Build ML prob display (use per-class if available; else use max)
     let mlProbDisplay = "N/A";
     if (report.mlProbs) {
       const mp = report.mlProbs;
@@ -536,11 +520,9 @@ export async function formatAIReport(report) {
       mlProbDisplay = `${nf(report.ml.prob,2)}% (max)`;
     }
 
-    // ML-chosen TP (prefer mlLongTP/mlShortTP fields)
     const mlLongTxt = report.mlLongTP ? `${nf(Number(report.mlLongTP.tp), 2)} [${report.mlLongTP.confidence}%]` : "N/A";
     const mlShortTxt = report.mlShortTP ? `${nf(Number(report.mlShortTP.tp), 2)} [${report.mlShortTP.confidence}%]` : "N/A";
 
-    // News block
     let newsTxt = "News: N/A";
     if (report.news) {
       const n = report.news;
@@ -590,8 +572,7 @@ SL (short): ${slShort}
 <b>ML Prediction</b>
 Label: <b>${report.mlDirection || (report.ml?.label || "N/A")}</b>
 Probability (max / breakdown): ${mlProbDisplay}
-TP Multiplier (model): ${report.ml?.tpMul ?? (report.ml?.tpEstimateMultiplier ?? "N/A")}
-ML-chosen TP: Long: ${mlLongTxt} | Short: ${mlShortTxt}
+TP (ML): Long: ${mlLongTxt} | Short: ${mlShortTxt}
 ML Accuracy (historic): ${report.mlAcc ?? "N/A"}%
 
 <b>Micro ML</b>
