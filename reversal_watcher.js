@@ -2,7 +2,15 @@
 // Ultra simple, clean, accurate reversal detector
 
 import { fetchMultiTF } from "./utils.js";
-import { runMicroPrediction, runMLPrediction } from "./ml_module_v9.js";
+// ML (v8_6) — stable
+import {
+  runMicroPrediction,
+  runMLPrediction,
+  recordPrediction,
+  recordOutcome,
+  calculateAccuracy
+} from "./ml_module_v8_6.js";
+
 
 let _timer = null;
 let _running = false;
