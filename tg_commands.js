@@ -581,3 +581,9 @@ function dirEmoji(d) {
 }
 
 const capitalize = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+
+export default {
+  buildAIReport,
+  formatAIReport,
+  sendSplitReport
+};
