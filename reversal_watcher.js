@@ -351,4 +351,4 @@ export async function scanReversal(symbol) {
   return scan(symbol);
 }
 
-export { markOutcome, getStats };
+
