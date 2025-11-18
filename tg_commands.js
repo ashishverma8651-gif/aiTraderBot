@@ -1,16 +1,20 @@
-// tg_commands.js — v12 merged & hardened
-// Exports: buildAIReport(symbol, opts), formatAIReport(report), sendSplitReport(report, sendTelegramFunc)
-// Backwards-compatible with your existing imports and ML/News default export shapes.
+// tg_commands_v12_fixed.js
+// FINAL merged & fixed (v12-compatible)
+// - Keeps old-style default ML import (ml_module_v8_6.js style)
+// - Robust Elliott integration (analyzeElliott default export accepted)
+// - ATR selection/fallback, ML confidence calibration, TP floor, Hedge engine
+// - Exports: buildAIReport, formatAIReport, sendSplitReport
+// - Split into parts for delivery; join to use as single file.
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v8_6.js";     // default export object expected (defensive)
-import News from "./news_social.js";      // default export object expected (defensive)
+import ML from "./ml_module_v8_6.js";     // default export object expected
+import News from "./news_social.js";      // default export object expected
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
 import * as indicators from "./core_indicators.js";
-import { analyzeElliott } from "./elliott_module.js";
+import ElliottModule from "./elliott_module.js"; // both named/default safe
 
-// defensive extraction of ML functions from default export
+// Defensive extraction
 const {
   runMLPrediction,
   runMicroPrediction,
@@ -19,11 +23,16 @@ const {
   recordOutcome
 } = ML || {};
 
-// defensive extraction of News function
-const { fetchNewsBundle } = News || { fetchNewsBundle: async () => ({ ok:false, sentiment:0.5, impact:"low", items:[] }) };
+const fetchNewsBundle = (News && (News.fetchNewsBundle || News.default && News.default.fetchNewsBundle)) ?
+    (News.fetchNewsBundle || News.default.fetchNewsBundle) :
+    async (sym) => ({ ok:false, sentiment:0.5, impact:"low", items:[], headline:"No major events" });
+
+const analyzeElliott = (ElliottModule && (ElliottModule.analyzeElliott || ElliottModule.default && ElliottModule.default.analyzeElliott)) ?
+    (ElliottModule.analyzeElliott || ElliottModule.default.analyzeElliott) :
+    async (c)=>({ ok:false, sentiment:0, confidence:0, pivots:[], targets:[] });
 
 // -------------------- Constants & small helpers --------------------
-const MAX_TG_CHARS = 3800; // safe per Telegram (4096) with margin
+const MAX_TG_CHARS = 3800;
 const IS_INDIA = { locale: "en-IN", hour12: true, timeZone: "Asia/Kolkata" };
 
 const nf = (v, d = 2) => (typeof v === "number" && Number.isFinite(v)) ? Number(v).toFixed(d) : "N/A";
@@ -34,14 +43,13 @@ const ellipsis = (s, n = 120) => (typeof s === "string" && s.length > n) ? s.sli
 function nowIST(iso) {
   try {
     const d = iso ? new Date(iso) : new Date();
-    if (isNaN(d.getTime())) return new Date().toLocaleString("en-IN", IS_INDIA);
+    if (Number.isNaN(d.getTime())) return new Date().toLocaleString("en-IN", IS_INDIA);
     return d.toLocaleString("en-IN", IS_INDIA);
   } catch (e) {
     return new Date().toString();
   }
 }
 
-// split long message into safe parts while keeping logical blocks together
 function splitIntoSafeParts(blocks, maxChars = MAX_TG_CHARS) {
   const parts = [];
   let cur = "";
@@ -75,13 +83,10 @@ function splitIntoSafeParts(blocks, maxChars = MAX_TG_CHARS) {
   if (cur) parts.push(cur);
   return parts;
 }
-
 // -------------------- Core: buildAIReport --------------------
 export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = {}) {
   try {
     const tfs = Array.isArray(opts.tfs) && opts.tfs.length ? opts.tfs : ["1m","5m","15m","30m","1h"];
-
-    // fetch multi-timeframe data
     const mtfRaw = await fetchMultiTF(symbol, tfs);
 
     const blocks = [];
@@ -90,7 +95,6 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       const candles = Array.isArray(entry.data) ? entry.data : [];
       const price = isNum(entry.price) && entry.price > 0 ? entry.price : (candles?.at(-1)?.close ?? 0);
 
-      // indicators (fallback safe defaults)
       const ind = {
         RSI: (typeof indicators.computeRSI === "function") ? indicators.computeRSI(candles) : 50,
         MACD: (typeof indicators.computeMACD === "function") ? indicators.computeMACD(candles) : { hist: 0 },
@@ -99,10 +103,8 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
         volumeTrend: (typeof indicators.volumeTrend === "function") ? indicators.volumeTrend(candles) : "STABLE",
       };
 
-      // volume analysis
       const vol = (typeof indicators.analyzeVolume === "function") ? indicators.analyzeVolume(candles) : { status: "N/A", strength: 0 };
 
-      // Elliott (safe)
       let ell = null;
       try { ell = await analyzeElliott(candles); } catch (e) { ell = null; }
       const ellSummary = (() => {
@@ -114,7 +116,6 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
         } catch { return { support: null, resistance: null, confidence: null, patterns: [] }; }
       })();
 
-      // targets (from ell or atr fallback)
       let targets = [];
       if (ell && Array.isArray(ell.targets) && ell.targets.length) {
         targets = ell.targets.map(t => ({
@@ -122,84 +123,93 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
           confidence: Math.round(Number(t.confidence ?? ell.confidence ?? 40)),
           source: t.source || t.type || tf,
           ageDays: Number(t.ageDays ?? 0)
-        })).filter(t => isNum(t.tp) && t.tp > 0);
+        })).filter(t => isNum(t.tp) && t.tp>0);
       } else {
-        const fallbackAtr = Math.max(ind.ATR || 0, price * 0.002 || 1);
+        const fallbackAtr = Math.max(ind.ATR || 0, Math.max(price * 0.002, 1));
         targets = [
           { tp: Number((price + fallbackAtr * 2).toFixed(8)), confidence: 30, source: "ATR_UP" },
           { tp: Number((price - fallbackAtr * 2).toFixed(8)), confidence: 30, source: "ATR_DOWN" }
         ];
       }
 
-      // fib (if available)
       let fib = null;
       try { if (typeof indicators.computeFibLevelsFromCandles === "function") fib = indicators.computeFibLevelsFromCandles(candles); } catch(e){ fib = null; }
 
       blocks.push({ tf, price, candles, indicators: ind, vol, ell, ellSummary, targets, fib });
     }
 
-    // fusion scoring per block
-    const computeFusionScore = (indObj = {}, ellObj = {}) => {
-      let s = 0, w = 0;
+    // fusion per block
+    const computeFusionScore = (indObj={}, ellObj={}) => {
+      let s=0, w=0;
       const rsi = Number(indObj?.RSI ?? 50);
-      s += ((rsi - 50) / 50) * 0.4; w += 0.4;
+      s += ((rsi-50)/50) * 0.4; w += 0.4;
       const macdh = Number(indObj?.MACD?.hist ?? 0); const atr = Math.max(1, Number(indObj?.ATR ?? 1));
-      s += (Math.tanh(macdh / atr) * 0.35); w += 0.35;
-      s += (indObj?.priceTrend === "UP" ? 0.15 : indObj?.priceTrend === "DOWN" ? -0.15 : 0); w += 0.15;
-      s += (indObj?.volumeTrend === "INCREASING" ? 0.08 : indObj?.volumeTrend === "DECREASING" ? -0.08 : 0); w += 0.08;
-      const ellSent = Number(ellObj?.sentiment ?? 0); const ellConf = clamp(Number(ellObj?.confidence ?? 0) / 100, 0, 1);
+      s += (Math.tanh(macdh/atr) * 0.35); w += 0.35;
+      s += (indObj?.priceTrend==="UP"?0.15:indObj?.priceTrend==="DOWN"?-0.15:0); w += 0.15;
+      s += (indObj?.volumeTrend==="INCREASING"?0.08:indObj?.volumeTrend==="DECREASING"?-0.08:0); w += 0.08;
+      const ellSent = Number(ellObj?.sentiment ?? 0); const ellConf = clamp(Number(ellObj?.confidence ?? 0)/100,0,1);
       s += ellSent * (0.25 * ellConf); w += 0.25 * ellConf;
-      if (w === 0) return 0;
-      return Number(clamp(s / w, -1, 1).toFixed(3));
+      if (w===0) return 0;
+      return Number(clamp(s/w, -1, 1).toFixed(3));
     };
 
     for (const b of blocks) {
-      try { b.fusionScore = computeFusionScore(b.indicators, b.ell || { sentiment: 0, confidence: 0 }); } catch (e) { b.fusionScore = 0; }
+      try { b.fusionScore = computeFusionScore(b.indicators, b.ell || { sentiment:0, confidence:0 }); } catch (e) { b.fusionScore = 0; }
     }
 
     // overall fusion weighted
-    const TF_WEIGHTS = { "1m": 0.05, "5m": 0.1, "15m": 0.4, "30m": 0.2, "1h": 0.25 };
-    let s = 0, ws = 0;
-    for (const b of blocks) { const w = TF_WEIGHTS[b.tf] ?? 0.1; s += (b.fusionScore || 0) * w; ws += w; }
-    let overallFusion = ws ? Number(clamp(s / ws, -1, 1).toFixed(3)) : 0;
+    const TF_WEIGHTS = { "1m":0.05, "5m":0.1, "15m":0.4, "30m":0.2, "1h":0.25 };
+    let s=0, ws=0;
+    for (const b of blocks) { const w = TF_WEIGHTS[b.tf] ?? 0.1; s += (b.fusionScore||0)*w; ws += w; }
+    let overallFusion = ws ? Number(clamp(s/ws, -1, 1).toFixed(3)) : 0;
 
-    // collect unique targets across TFs (dedupe by rounded)
+    // collect unique targets across TFs, prefer recent + high conf
     const tgtMap = new Map();
     for (const b of blocks) {
-      for (const t of (b.targets || [])) {
-        const tp = Number(t.tp || 0); if (!isNum(tp) || tp <= 0) continue;
+      for (const t of (b.targets||[])) {
+        const tp = Number(t.tp||0); if (!isNum(tp) || tp<=0) continue;
         const key = Math.round(tp);
         const conf = clamp(Number(t.confidence ?? 40), 0, 100);
         const existing = tgtMap.get(key);
         if (!existing) tgtMap.set(key, { tp, confidence: Math.round(conf), source: t.source || b.tf, ageDays: t.ageDays || 0 });
         else {
-          if ((conf > existing.confidence) || ((t.ageDays || 0) < (existing.ageDays || 999) && conf >= existing.confidence)) {
+          if ((conf > existing.confidence) || ((t.ageDays||0) < (existing.ageDays||999) && conf >= existing.confidence)) {
             tgtMap.set(key, { tp, confidence: Math.round(conf), source: t.source || b.tf, ageDays: t.ageDays || 0 });
           }
         }
       }
     }
-    const price = blocks.find(x => x.tf === "15m")?.price ?? blocks[0]?.price ?? 0;
-    const allTargets = Array.from(tgtMap.values()).sort((a, b) => b.confidence - a.confidence || Math.abs(a.tp - price) - Math.abs(b.tp - price));
+    const allTargets = Array.from(tgtMap.values()).sort((a,b)=>b.confidence - a.confidence || Math.abs(a.tp - (blocks.find(x=>x.tf==="15m")?.price || 0)) - Math.abs(b.tp - (blocks.find(x=>x.tf==="15m")?.price || 0)));
 
-    const longs = allTargets.filter(t => t.tp > price).slice(0, 4);
-    const shorts = allTargets.filter(t => t.tp < price).slice(0, 4);
-
-    // ML predictions (prefer 15m)
+    const price = blocks.find(x=>x.tf==="15m")?.price ?? blocks[0]?.price ?? 0;
+    const longs = allTargets.filter(t => t.tp > price).slice(0,4);
+    const shorts = allTargets.filter(t => t.tp < price).slice(0,4);
+// -------------------- ML predictions (prefer 15m) --------------------
     let mlMain = null;
     try { mlMain = (typeof runMLPrediction === "function") ? await runMLPrediction(symbol, opts.mlTF || "15m") : null; } catch (e) { mlMain = null; }
     let micro = null;
     try { micro = (typeof runMicroPrediction === "function") ? await runMicroPrediction(symbol, "1m") : null; } catch (e) { micro = null; }
+
+    // FETCH NEWS
+    let news = null;
+    try { news = await fetchNewsBundle(symbol); } catch (e) { news = { ok:false, sentiment:0.5, impact:"low", items:[], headline:"No major events" }; }
+
+    // ATR selection: prefer 15m -> 5m -> 1m -> ell.atr -> price*0.002
+    const atrFromTF = (() => {
+      const p15 = blocks.find(x=>x.tf==="15m")?.indicators?.ATR;
+      const p5 = blocks.find(x=>x.tf==="5m")?.indicators?.ATR;
+      const p1 = blocks.find(x=>x.tf==="1m")?.indicators?.ATR;
+      const ellAtr = blocks.find(x=>x.ell)?.ell?.atr ?? null;
+      return Math.max( (p15||0), (p5||0), (p1||0), (ellAtr||0), price * 0.0008 );
+    })();
 
     // nudge overallFusion using ML & News (small)
     let mlBoost = 0, newsBoost = 0;
     if (mlMain && mlMain.probs) {
       const bprob = Number(mlMain.probs.bull ?? mlMain.probs?.Bull ?? 0);
       const rprob = Number(mlMain.probs.bear ?? mlMain.probs?.Bear ?? 0);
-      if (isNum(bprob) && isNum(rprob)) mlBoost = clamp((bprob - rprob) / 100, -1, 1);
+      if (isNum(bprob) && isNum(rprob)) mlBoost = clamp((bprob - rprob)/100, -1, 1);
     }
-    let news = null;
-    try { news = await fetchNewsBundle(symbol); } catch (e) { news = { ok:false, sentiment:0.5, impact:"low", items:[] }; }
     if (news && typeof news.sentiment === "number") {
       const raw = clamp((news.sentiment - 0.5) * 2, -1, 1);
       const impact = (news.impact || "low").toLowerCase();
@@ -208,23 +218,109 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     }
     overallFusion = clamp(overallFusion + (mlBoost * 0.22) + (newsBoost * 0.18), -1, 1);
 
-    // default SL suggestions using 15m ATR if present
-    const primary = blocks.find(x => x.tf === "15m") || blocks[0] || null;
-    const atr15 = primary?.indicators?.ATR ?? (price * 0.005 || 1);
+    // -------------------- Default SL suggestions --------------------
+    const atr15 = atrFromTF;
     const defaultSLLong = isNum(price) ? Number((price - atr15 * 2).toFixed(2)) : null;
     const defaultSLShort = isNum(price) ? Number((price + atr15 * 2).toFixed(2)) : null;
 
-    // ml accuracy
+    // mlAcc
     let mlAcc = 0;
-    try { mlAcc = (typeof calculateAccuracy === "function") ? (calculateAccuracy()?.accuracy ?? 0) : 0; } catch (e) { mlAcc = 0; }
+    try { mlAcc = (typeof calculateAccuracy === "function") ? (calculateAccuracy()?.accuracy ?? 0) : 0; } catch(e) { mlAcc = 0; }
 
-    // Compose final report base
+    // -------------------- Post-process ML (sanitize & calibrate) --------------------
+    if (mlMain) {
+      try {
+        // normalize shape
+        mlMain.direction = mlMain.direction || mlMain.label || (mlMain.probs && (mlMain.probs.bull > mlMain.probs.bear ? "Bullish" : (mlMain.probs.bear > mlMain.probs.bull ? "Bearish" : "Neutral"))) || "Neutral";
+        mlMain.maxProb = mlMain.maxProb ?? (mlMain.probs ? Math.max(Number(mlMain.probs.bull||0), Number(mlMain.probs.bear||0), Number(mlMain.probs.neutral||0)) : null);
+        // compute cleaned stats
+        const mlDir = String(mlMain.direction || "Neutral").toLowerCase();
+        let mlConf = isNum(mlMain.maxProb) ? Number(mlMain.maxProb) : (isNum(mlMain.tpConfidence) ? Number(mlMain.tpConfidence) : 50);
+
+        // Calibrate ML confidence: penalize when ML contradicts fusion/elliott or when ATR tiny
+        const fusionBias = overallFusion > 0.1 ? "bull" : overallFusion < -0.1 ? "bear" : "neutral";
+        const ellSent = (blocks.find(x=>x.ell)?.ell?.sentiment ?? (blocks.find(x=>x.ellSummary)?.ellSummary?.sentiment)) || 0;
+        const ellConf = (blocks.find(x=>x.ell)?.ell?.confidence ?? blocks.find(x=>x.ellSummary)?.ellSummary?.confidence) || 0;
+
+        if ((fusionBias === "bull" && mlDir.includes("bear")) || (fusionBias === "bear" && mlDir.includes("bull"))) mlConf *= 0.55;
+        if (Math.abs(ellSent) < 0.12 && ellConf < 40) mlConf *= 0.75;
+        if (atr15 < price * 0.0015) mlConf *= 0.65;
+        // news heavy negative/positive may reduce model confidence for short-term TPs
+        const newsImpactVal = (news && news.impact) ? String(news.impact).toLowerCase() : "low";
+        if (newsImpactVal === "high") mlConf *= 0.8;
+
+        mlConf = clamp(Math.round(mlConf), 5, 99);
+
+        // sanitize tpEstimate
+        let primaryTP = isNum(mlMain.tpEstimate) ? Number(mlMain.tpEstimate) : (isNum(mlMain.tp) ? Number(mlMain.tp) : null);
+        // ensure TP distance from price
+        const minTPdist = Math.max(price * 0.002, atr15 * 0.6, 1);
+        if (isNum(primaryTP)) {
+          if (Math.abs(primaryTP - price) < minTPdist) {
+            // push it out in the mlMain direction
+            if (mlDir.includes("bull")) primaryTP = Number((price + minTPdist).toFixed(2));
+            else if (mlDir.includes("bear")) primaryTP = Number((price - minTPdist).toFixed(2));
+            else primaryTP = null;
+          }
+        }
+
+        // if no primaryTP, pick nearest from allTargets consistent with direction
+        function pickNearest(side) {
+          const pool = side === "bull" ? longs : side === "bear" ? shorts : allTargets;
+          if (!Array.isArray(pool) || pool.length === 0) return null;
+          pool.sort((a,b)=> b.confidence - a.confidence || Math.abs(a.tp-price) - Math.abs(b.tp-price));
+          return pool[0]?.tp ?? null;
+        }
+        if (!isNum(primaryTP)) {
+          if (mlDir.includes("bull")) primaryTP = pickNearest("bull");
+          else if (mlDir.includes("bear")) primaryTP = pickNearest("bear");
+          else primaryTP = pickNearest("bull") ?? pickNearest("bear");
+        }
+
+        // hedgeTP determination: opposite side candidate or ATR offset
+        let hedgeTP = null;
+        if (mlDir.includes("bull")) hedgeTP = pickNearest("bear");
+        else if (mlDir.includes("bear")) hedgeTP = pickNearest("bull");
+        else {
+          const longPick = pickNearest("bull"), shortPick = pickNearest("bear");
+          // choose opposite of primary
+          hedgeTP = (isNum(primaryTP) && longPick && Math.abs(primaryTP - longPick) > Math.abs(primaryTP - shortPick)) ? shortPick : (shortPick ?? longPick ?? null);
+        }
+
+        // if hedgeTP equals primaryTP or both null, make a sensible ATR-based hedge
+        if (isNum(primaryTP) && isNum(hedgeTP) && Math.abs(primaryTP - hedgeTP) < (price * 1e-5)) {
+          const offset = Math.max(1, atr15 || price * 0.002);
+          if (mlDir.includes("bull")) hedgeTP = Number((price - offset * 1.5).toFixed(2));
+          else if (mlDir.includes("bear")) hedgeTP = Number((price + offset * 1.5).toFixed(2));
+          else hedgeTP = null;
+        }
+        if (!isNum(hedgeTP) && isNum(primaryTP)) {
+          // fallback small offset opposite
+          const offset = Math.max(1, atr15 || price * 0.002);
+          hedgeTP = mlDir.includes("bull") ? Number((price - offset * 1.5).toFixed(2)) : mlDir.includes("bear") ? Number((price + offset * 1.5).toFixed(2)) : null;
+        }
+
+        // hedge confidence
+        let hedgeConf = Math.round(clamp(100 - mlConf, 10, 90));
+
+        mlMain.sanitized = {
+          direction: mlMain.direction,
+          primaryTP: isNum(primaryTP) ? Number(primaryTP) : null,
+          primaryConf: mlConf,
+          hedgeTP: isNum(hedgeTP) ? Number(hedgeTP) : null,
+          hedgeConf
+        };
+
+      } catch (e) { /* ignore sanitize errors */ }
+    }
+
+    // -------------------- Compose final report object --------------------
     const report = {
       ok: true,
       symbol,
       generatedAt: new Date().toISOString(),
       nowIST: nowIST(),
-      blocks,         // array of per-tf blocks
+      blocks,
       price,
       atr15,
       overallFusion,
@@ -244,133 +340,14 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       defaultSLLong, defaultSLShort
     };
 
-    // --- Post-process ML: sanitize many shapes (old/new/mix) ---
-    if (report.ml) {
-      try {
-        const ml = report.ml;
-
-        // normalize probs if present
-        const probs = ml.probs || ml.Probs || ml.P || null;
-        const bprob = probs ? Number(probs.bull ?? probs.Bull ?? probs[0] ?? 0) : null;
-        const rprob = probs ? Number(probs.bear ?? probs.Bear ?? probs[1] ?? 0) : null;
-
-        // canonical direction
-        ml.direction = ml.direction || ml.label || (bprob != null && rprob != null ? (bprob > rprob ? "Bullish" : (rprob > bprob ? "Bearish" : "Neutral")) : ml.direction || "Neutral");
-
-        // candidates for primary TP: many possible keys across versions
-        let mlPrimaryTP = (isNum(ml.tpEstimate) ? ml.tpEstimate : (isNum(ml.tp) ? ml.tp : (isNum(ml.tpSell) ? ml.tpSell : (isNum(ml.tpBuy) ? ml.tpBuy : null))));
-        // fallback: older names
-        mlPrimaryTP = mlPrimaryTP ?? (isNum(ml.tp_estimate) ? ml.tp_estimate : null);
-
-        let mlPrimaryConf = ml.tpConfidence ?? ml.tp_conf ?? ml.tp_confidence ?? ml.tp_confidence_pct ?? ml.tp_conf_pct ?? null;
-        mlPrimaryConf = mlPrimaryConf ?? (ml.maxProb ?? null) ?? (ml.confidence ?? null);
-
-        // if primary exists but is on opposite side, ignore
-        const dir = String((ml.direction||"Neutral")).toLowerCase();
-        if (isNum(mlPrimaryTP)) {
-          if (dir.includes("bull") && mlPrimaryTP <= price) mlPrimaryTP = null;
-          if (dir.includes("bear") && mlPrimaryTP >= price) mlPrimaryTP = null;
-        }
-
-        // helper to pick nearest from report.longs/shorts
-        const pickNearestTarget = (side) => {
-          const pool = side === "bull" ? report.longs : (side === "bear" ? report.shorts : report.allTargets);
-          if (!Array.isArray(pool) || pool.length === 0) return null;
-          pool.sort((a,b) => b.confidence - a.confidence || Math.abs(a.tp - price) - Math.abs(b.tp - price));
-          return pool[0];
-        };
-
-        if (!isNum(mlPrimaryTP)) {
-          const pick = pickNearestTarget(dir.includes("bull") ? "bull" : dir.includes("bear") ? "bear" : "bull");
-          if (pick) { mlPrimaryTP = pick.tp; mlPrimaryConf = mlPrimaryConf ?? pick.confidence; }
-        }
-
-        // pick hedge (opposite-side target)
-        let mlHedgeTP = null;
-        if (dir.includes("bull")) {
-          const pickOpp = pickNearestTarget("bear");
-          if (pickOpp) mlHedgeTP = pickOpp.tp;
-        } else if (dir.includes("bear")) {
-          const pickOpp = pickNearestTarget("bull");
-          if (pickOpp) mlHedgeTP = pickOpp.tp;
-        } else {
-          // neutral: show best long and best short
-          const longPick = pickNearestTarget("bull");
-          const shortPick = pickNearestTarget("bear");
-          if (longPick) mlPrimaryTP = mlPrimaryTP ?? longPick.tp;
-          if (shortPick) mlHedgeTP = mlHedgeTP ?? shortPick.tp;
-        }
-
-        // Avoid identical Sell/Buy/hedge: if equal or nearly equal, nudge hedge using ATR
-        if (isNum(mlPrimaryTP) && isNum(mlHedgeTP) && Math.abs(mlPrimaryTP - mlHedgeTP) < Math.max(1e-6, price * 1e-6)) {
-          const offset = Math.max(1, report.atr15 || price * 0.002);
-          if (dir.includes("bull")) mlHedgeTP = Number((price - offset * 1.5).toFixed(2));
-          else if (dir.includes("bear")) mlHedgeTP = Number((price + offset * 1.5).toFixed(2));
-          else mlHedgeTP = null;
-        }
-
-        // final sanitize: if primaryTP still null, attempt best available long or short
-        if (!isNum(mlPrimaryTP)) {
-          const fallbackPick = pickNearestTarget("bull") || pickNearestTarget("bear") || report.allTargets?.[0] || null;
-          if (fallbackPick) mlPrimaryTP = fallbackPick.tp;
-        }
-
-        // attach sanitized result to ml
-        ml.sanitized = {
-          direction: ml.direction,
-          primaryTP: isNum(mlPrimaryTP) ? Number(mlPrimaryTP) : null,
-          primaryConf: isNum(mlPrimaryConf) ? Number(mlPrimaryConf) : null,
-          hedgeTP: isNum(mlHedgeTP) ? Number(mlHedgeTP) : null,
-          maxProb: ml.maxProb ?? (bprob != null || rprob != null ? Math.max(Number(bprob||0), Number(rprob||0)) : ml.maxProb ?? null)
-        };
-      } catch (e) {
-        // ignore sanitization problems
-      }
-    }
-
-    // --- Compute Overall TP ranges and Neutral SL robustly ---
-    // Bullish TP range: smallest long TP .. largest long TP (all strictly > price)
-    let bullRange = null, bearRange = null;
-    try {
-      const longsOnly = (report.longs || []).filter(t => isNum(t.tp) && t.tp > price).map(t => t.tp);
-      const shortsOnly = (report.shorts || []).filter(t => isNum(t.tp) && t.tp < price).map(t => t.tp);
-
-      if (longsOnly.length) bullRange = { lo: Math.min(...longsOnly), hi: Math.max(...longsOnly) };
-      if (shortsOnly.length) bearRange = { lo: Math.min(...shortsOnly), hi: Math.max(...shortsOnly) };
-
-      // If ranges missing or inverted, fallback to ATR-based conservative bands
-      const fallbackAtr = Math.max(report.atr15 || 0, price * 0.002 || 1);
-      if (!bullRange) bullRange = { lo: Number((price + fallbackAtr * 1.3).toFixed(2)), hi: Number((price + fallbackAtr * 3).toFixed(2)) };
-      if (!bearRange) bearRange = { lo: Number((price - fallbackAtr * 3).toFixed(2)), hi: Number((price - fallbackAtr * 1.3).toFixed(2)) };
-
-      // ensure bullRange.lo > price (if not, shift)
-      if (bullRange.lo <= price) bullRange.lo = Number((price + fallbackAtr * 0.2).toFixed(2));
-      if (bearRange.hi >= price) bearRange.hi = Number((price - fallbackAtr * 0.2).toFixed(2));
-    } catch (e) {
-      const fallbackAtr = Math.max(report.atr15 || 0, price * 0.002 || 1);
-      bullRange = { lo: Number((price + fallbackAtr * 1.3).toFixed(2)), hi: Number((price + fallbackAtr * 3).toFixed(2)) };
-      bearRange = { lo: Number((price - fallbackAtr * 3).toFixed(2)), hi: Number((price - fallbackAtr * 1.3).toFixed(2)) };
-    }
-
-    // Neutral invalidation SL: choose midpoint between default long SL and default short SL if both present,
-    // otherwise use defaultSLLong or defaultSLShort or price +/- ATR
-    let neutralSL = "N/A";
-    if (isNum(report.defaultSLLong) && isNum(report.defaultSLShort)) {
-      neutralSL = Number(((report.defaultSLLong + report.defaultSLShort) / 2).toFixed(2));
-    } else if (isNum(report.defaultSLLong)) neutralSL = Number(report.defaultSLLong);
-    else if (isNum(report.defaultSLShort)) neutralSL = Number(report.defaultSLShort);
-    else if (isNum(report.atr15) && isNum(price)) neutralSL = Number((price - report.atr15).toFixed(2));
-
-    // Attach computed ranges to report for formatter convenience
-    report._computed = { bullRange, bearRange, neutralSL };
+    // persist prediction (best-effort)
+    try { if (typeof recordPrediction === "function") recordPrediction({ id:`${symbol}_${Date.now()}`, symbol, ml: report.ml }); } catch(e){}
 
     return report;
-
   } catch (err) {
     return { ok:false, error: err?.message || String(err) };
   }
 }
-
 // -------------------- Formatter: produce the exact UI (no braces) --------------------
 export async function formatAIReport(report = {}) {
   try {
@@ -380,7 +357,6 @@ export async function formatAIReport(report = {}) {
     const time = nowIST(report.generatedAt || new Date().toISOString());
     const price = Number(report.price || 0);
 
-    // helper to extract block for a tf
     const getBlock = (tf) => {
       const b = (report.blocks || []).find(x => x.tf === tf);
       if (!b) return null;
@@ -397,9 +373,7 @@ export async function formatAIReport(report = {}) {
       const atr = isNum(b.indicators?.ATR) ? Number(b.indicators.ATR) : "N/A";
 
       const ellConf = b.ellSummary?.confidence ?? 0;
-      const ellShow = (ellConf >= 12 && Array.isArray(b.ellSummary?.patterns) && b.ellSummary.patterns.length) ? b.ellSummary.patterns[0].type : (ellConf >= 12 && b.ell?.pattern ? b.ell.pattern : null);
-      const ellText = ellShow ? ellShow : (b.ell && b.ell.pattern ? b.ell.pattern : "No clear wave");
-
+      const ellShow = (ellConf >= 12 && Array.isArray(b.ellSummary?.patterns) && b.ellSummary.patterns.length) ? b.ellSummary.patterns[0].type : (b.ell?.pattern || "No clear wave");
       const S = b.ellSummary?.support ?? (b.fib?.lo ?? null) ?? "N/A";
       const R = b.ellSummary?.resistance ?? (b.fib?.hi ?? null) ?? "N/A";
 
@@ -410,7 +384,7 @@ export async function formatAIReport(report = {}) {
       const finalSL = (sl === "N/A") ? (tf === "15m" ? nf(report.defaultSLLong,2) : "N/A") : sl;
 
       return {
-        sig: sigText, rsi, macd, vol: volTxt, atr: nf(atr,2), ell: ellText, ellConf: Math.round(ellConf || 0),
+        sig: sigText, rsi, macd, vol: volTxt, atr: nf(atr,2), ell: ellShow, ellConf: Math.round(ellConf || 0),
         s: (isNum(S) ? nf(S,2) : (S || "N/A")), r: (isNum(R) ? nf(R,2) : (R || "N/A")),
         tpLine, sl: finalSL, price: nf(b.price,2)
       };
@@ -418,64 +392,53 @@ export async function formatAIReport(report = {}) {
 
     const b1m = getBlock("1m") || {}, b5m = getBlock("5m") || {}, b15m = getBlock("15m") || {}, b30m = getBlock("30m") || {}, b1h = getBlock("1h") || {};
 
-    // overall bias + fusion
     const finalBias = `${report.biasLabel?.emoji ?? "⚪"} ${report.biasLabel?.label ?? "Neutral"}`;
     const fusionScore = (report.overallFusion != null) ? String(report.overallFusion) : "0";
     const buyProb = nf(report.buyProb,2);
     const sellProb = nf(report.sellProb,2);
 
-    // overall TP (AI Driven) - use computed ranges
-    const bullTP1 = report._computed && report._computed.bullRange ? nf(report._computed.bullRange.lo,2) : "N/A";
-    const bullTP2 = report._computed && report._computed.bullRange ? nf(report._computed.bullRange.hi,2) : "N/A";
-    const bearTP1 = report._computed && report._computed.bearRange ? nf(report._computed.bearRange.lo,2) : "N/A";
-    const bearTP2 = report._computed && report._computed.bearRange ? nf(report._computed.bearRange.hi,2) : "N/A";
+    const longs = report.longs || [];
+    const shorts = report.shorts || [];
+    const bullTP1 = longs.length ? nf(Math.min(...longs.map(x=>x.tp)),2) : (b1h.r || "N/A");
+    const bullTP2 = longs.length ? nf(Math.max(...longs.map(x=>x.tp)),2) : (b30m.r || "N/A");
+    const bearTP1 = shorts.length ? nf(Math.min(...shorts.map(x=>x.tp)),2) : (b1m.s || "N/A");
+    const bearTP2 = shorts.length ? nf(Math.max(...shorts.map(x=>x.tp)),2) : (b5m.s || "N/A");
 
-    const neutralSL = report._computed && report._computed.neutralSL ? nf(report._computed.neutralSL,2) : nf(report.defaultSLLong,2);
+    // neutral invalidation (prefer 15m-based candidate)
+    let neutralSL = "N/A";
+    if (isNum(report.atr15) && isNum(report.price)) {
+      neutralSL = nf(Number((report.price - report.atr15).toFixed(2)),2);
+    } else neutralSL = nf(report.defaultSLLong,2);
 
-    // ML block (sanitized)
+    // ML sanitized
     const ml = report.ml || {};
     const mlDir = (ml.sanitized && ml.sanitized.direction) ? ml.sanitized.direction : (ml.direction || ml.label || "Neutral");
     const mlConf = (() => {
       if (ml.sanitized && isNum(ml.sanitized.primaryConf)) return nf(ml.sanitized.primaryConf,0);
       if (ml.tpConfidence != null) return nf(ml.tpConfidence,0);
       if (ml.maxProb != null) return nf(ml.maxProb,0);
-      // fallback to sanitized maxProb
-      return nf((ml.sanitized && ml.sanitized.maxProb) ? ml.sanitized.maxProb : (ml.maxProb || 0), 0);
+      return nf((ml.probs && (ml.probs.bull || ml.probs.bear || ml.probs.neutral)) ? Math.max(Number(ml.probs.bull||0), Number(ml.probs.bear||0), Number(ml.probs.neutral||0)) : (ml.maxProb || 0), 0);
     })();
 
-    // ML Targets lines (sanitized)
-    const mlPrimaryTP = (ml.sanitized && isNum(ml.sanitized.primaryTP)) ? nf(ml.sanitized.primaryTP,2) : "N/A";
-    const mlHedgeTP = (ml.sanitized && isNum(ml.sanitized.hedgeTP)) ? nf(ml.sanitized.hedgeTP,2) : null;
+    const mlSellTP = (() => {
+      if (ml.sanitized && isNum(ml.sanitized.primaryTP) && String(ml.sanitized.direction || "").toLowerCase().includes("bear")) return nf(ml.sanitized.primaryTP,2);
+      if (shorts && shorts.length) return nf(shorts[0].tp,2);
+      return "N/A";
+    })();
+    const mlBuyTP = (() => {
+      if (ml.sanitized && isNum(ml.sanitized.primaryTP) && String(ml.sanitized.direction || "").toLowerCase().includes("bull")) return nf(ml.sanitized.primaryTP,2);
+      if (longs && longs.length) return nf(longs[0].tp,2);
+      return "N/A";
+    })();
 
-    // Determine how to show ML Sell/Buy TP
-    // If direction bullish -> show Buy as primary, Sell as hedge (if available)
-    // If direction bearish -> show Sell as primary, Buy as hedge
-    let mlSellTP = "N/A", mlBuyTP = "N/A";
-    if (String(mlDir || "").toLowerCase().includes("bull")) {
-      mlBuyTP = mlPrimaryTP;
-      mlSellTP = mlHedgeTP ?? (report.shorts && report.shorts[0] ? nf(report.shorts[0].tp,2) : "N/A");
-    } else if (String(mlDir || "").toLowerCase().includes("bear")) {
-      mlSellTP = mlPrimaryTP;
-      mlBuyTP = mlHedgeTP ?? (report.longs && report.longs[0] ? nf(report.longs[0].tp,2) : "N/A");
-    } else {
-      // neutral: present best long and best short
-      mlBuyTP = (report.longs && report.longs[0]) ? nf(report.longs[0].tp,2) : (mlPrimaryTP !== "N/A" ? mlPrimaryTP : "N/A");
-      mlSellTP = (report.shorts && report.shorts[0]) ? nf(report.shorts[0].tp,2) : (mlHedgeTP ?? "N/A");
-    }
+    const mlHedge = (ml.sanitized && isNum(ml.sanitized.hedgeTP)) ? nf(ml.sanitized.hedgeTP,2) : null;
+    const mlQuote = ellipsis( (ml.explanation || ml.reason || ml.summary || ml.quote || "AI forecast active"), 280 );
 
-    // avoid duplicate lines: if buy==sell show single line and hide hedge duplicate
-    const duplicateTP = (mlBuyTP === mlSellTP) || (mlHedgeTP && (mlHedgeTP === mlPrimaryTP));
-    const showHedge = mlHedgeTP && !duplicateTP;
-
-    const mlQuote = ellipsis((ml.explanation || ml.reason || ml.summary || ml.quote || "AI forecast active"), 280);
-
-    // News
     const news = report.news || {};
     const newsImpact = news.impact || (news.impact === 0 ? "Low" : "Low");
     const newsSentimentPct = (typeof news.sentiment === "number") ? Math.round(news.sentiment * 1000) / 10 : "N/A";
     const headline = (news.items && news.items.length) ? (news.items[0].title || news.items[0].text || news.items[0].link || "—") : (news.headline || "No major events");
 
-    // Build UI exactly as requested (no curly braces)
     const partMain = `
 🔥 ${symbol} — AI Market Intelligence
 Time (IST): ${time}
@@ -505,7 +468,9 @@ Elliott: ${b15m.ell || "N/A"} | ${b15m.ellConf || 0}%
 S: ${b15m.s || "N/A"} | R: ${b15m.r || "N/A"}
 TP 🎯: ${b15m.tpLine || "N/A"}  
 SL: ${b15m.sl || "N/A"}
-
+`.trim();
+// continue UI build (append remaining blocks + summary)
+    const partBottom = `
 🕒 30M — ${b30m.sig || "N/A"}
 RSI ${b30m.rsi || "N/A"} | MACD ${b30m.macd || "N/A"} | Vol ${b30m.vol || "N/A"} | ATR ${b30m.atr || "N/A"}
 Elliott: ${b30m.ell || "N/A"} | ${b30m.ellConf || 0}%
@@ -541,7 +506,7 @@ ML Confidence: ${mlConf}%
 ML Targets:
 • ML Sell TP: <b>${mlSellTP}</b>  
 • ML Buy TP (Hedge): <b>${mlBuyTP}</b>
-${showHedge ? `\n• ML Hedge TP: ${mlHedgeTP}` : ""}
+${mlHedge ? `\n• ML Hedge TP: ${mlHedge}` : "" }
 ━━━━━━━━━━━━━━━━━━
 
 📰 NEWS IMPACT (Connected to ML)
@@ -551,34 +516,31 @@ Headline: *“${ellipsis(headline,200)}”*
 ━━━━━━━━━━━━━━━━━━
 `.trim();
 
-    // Split into safe parts if too long
-    const parts = splitIntoSafeParts([partMain], MAX_TG_CHARS);
+    const full = partMain + "\n\n" + partBottom;
+    const parts = splitIntoSafeParts([full], MAX_TG_CHARS);
     if (parts.length > 1) {
       return parts.map((p,i) => `<b>${symbol} — AI Market Intelligence (Part ${i+1}/${parts.length})</b>\n\n` + p);
     }
-    return [partMain];
-
+    return [full];
   } catch (e) {
     return [`<b>formatAIReport error</b>\n${e?.message || String(e)}`];
   }
 }
 
 // -------------------- sendSplitReport helper --------------------
-// sendTelegramFunc must be async function(text) -> boolean/response
 export async function sendSplitReport(report, sendTelegramFunc) {
   try {
     const parts = await formatAIReport(report);
     if (!parts || !parts.length) return false;
-    for (let i = 0; i < parts.length; i++) {
+    for (let i=0;i<parts.length;i++) {
       const text = parts[i];
       try {
         await sendTelegramFunc(text);
       } catch (e) {
-        // retry once after short wait
-        await new Promise(r => setTimeout(r, 600));
+        await new Promise(r=>setTimeout(r,600));
         try { await sendTelegramFunc(text); } catch {}
       }
-      if (i < parts.length - 1) await new Promise(r => setTimeout(r, 650));
+      if (i < parts.length - 1) await new Promise(r=>setTimeout(r,650));
     }
     return true;
   } catch (e) {
@@ -586,7 +548,7 @@ export async function sendSplitReport(report, sendTelegramFunc) {
   }
 }
 
-// default export for aiTraderBot.js
+// default export
 export default {
   buildAIReport,
   formatAIReport,
