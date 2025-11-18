@@ -352,12 +352,3 @@ export async function scanReversal(symbol) {
 }
 
 export { markOutcome, getStats };
-
-// default export
-export default {
-  startReversalWatcher,
-  stopReversalWatcher,
-  scanReversal,
-  markOutcome,
-  getStats
-};
