@@ -1,12 +1,7 @@
-// ml_module_v12.js
-// ---------------------------------------------------------
-// ML Module v12 — Super-stable (FULL upgrade, Option A applied)
-// - Backwards-compatible exports (default export object used by tg command)
-// - Features: Reversal Engine v2, News-driven risk override, Dynamic TP engine v3,
-//   Smart SL engine, Confidence Stabilizer (temporal EMA + consistency checks),
-//   Trade Quality Rating, Accuracy persistence, Safe I/O
-// - Imports: fetchMultiTF, core_indicators, analyzeElliott, news_social (default export)
-// ---------------------------------------------------------
+// ml_module_v8_6.js
+// ML Module (v12 engine) — placed in repo filename ml_module_v8_6.js
+// Backwards-compatible default export (runMLPrediction, runMicroPrediction, calculateAccuracy, recordPrediction, recordOutcome)
+// Improvements: strict TP/hedge sanitization, confidence calibration, safer fallbacks, clearer outputs
 
 import fs from "fs";
 import path from "path";
@@ -176,8 +171,6 @@ function buildFeaturesFromCandles(candles) {
 
 // ---------------------------
 // Reversal Engine v2
-// - Uses divergence, volume flush, micro-turn, and Elliott end-wave hints
-// Returns { signal: null|"Bullish"/"Bearish", likelihood: 0..100, reasons: [] }
 function detectReversal({ tfCandles, microCandles, feats, microFeats, ell, price, news }) {
   const reasons = [];
   let score = 0;
@@ -186,28 +179,23 @@ function detectReversal({ tfCandles, microCandles, feats, microFeats, ell, price
   const rsi = feats.rsi;
   const macd = feats.macdHist;
   if (rsi != null && microFeats && microFeats.rsi != null) {
-    // check recent two swings: naive local minima detection
     const lastClose = tfCandles.at(-1)?.close ?? price;
-    const priorLow = tfCandles.slice(-10, -3).reduce((s,c)=> (s===null || c.close < s ? c.close : s), null);
-    if (priorLow != null && lastClose < priorLow && rsi > (tfCandles.slice(-5).reduce((a,b)=>a+ (b.rsi ?? 50),0)/5 - 5)) {
-      // price made lower low but RSI not making lower low -> bullish divergence
+    const priorSlice = tfCandles.slice(-12, -3);
+    const priorLow = priorSlice.reduce((s,c)=> (s===null || (c && c.close < s) ? c.close : s), null);
+    if (priorLow != null && lastClose < priorLow && rsi > (priorSlice.reduce((a,b)=>a+ (b.rsi ?? 50),0)/(priorSlice.length||1) - 5)) {
       score += 12; reasons.push("price_lower_low_rsi_higher_low");
     }
   }
-  // MACD divergence (similar)
   if (macd != null) {
-    // if price falling but macd hist improving -> bullish
     const macdRecent = macd;
     const priceRecentSlope = feats.slope;
     if (priceRecentSlope < 0 && macdRecent > 0) { score += 10; reasons.push("macd_positive_while_price_down"); }
     if (priceRecentSlope > 0 && macdRecent < 0) { score -= 10; reasons.push("macd_negative_while_price_up"); }
   }
 
-  // 2) Volume flush detection (exhaustion)
+  // 2) Volume flush detection
   const volRatio = feats.avgVol > 0 ? (feats.lastVol / feats.avgVol) - 1 : 0;
   if (volRatio > 1.2) {
-    // big spike — potential flush
-    // if candle has long tail (look into tfCandles last candle)
     const lastC = tfCandles.at(-1) || {};
     const body = Math.abs((lastC.close ?? price) - (lastC.open ?? price));
     const wickLower = ((lastC.low ?? price) < Math.min(lastC.open ?? price, lastC.close ?? price)) ? 1 : 0;
@@ -216,34 +204,31 @@ function detectReversal({ tfCandles, microCandles, feats, microFeats, ell, price
     }
   }
 
-  // 3) Micro-turn: slope flip in 1m micro timeframe
+  // 3) Micro-turn
   if (microFeats && microFeats.slope != null) {
     if (microFeats.slope > 0.0001 && feats.slope < 0) { score += 8; reasons.push("micro_slope_positive_after_downtrend"); }
     if (microFeats.slope < -0.0001 && feats.slope > 0) { score -= 8; reasons.push("micro_slope_negative_after_uptrend"); }
   }
 
-  // 4) Elliott end-wave hints (exhaustion)
+  // 4) Elliott hints
   if (ell && typeof ell.confidence === "number" && typeof ell.sentiment === "number") {
     if (ell.confidence >= 50) {
-      // ell.sentiment near -1 means bearish exhaustion => bullish reversal possibility (depending on sign interpretation)
       if (ell.sentiment < -0.6) { score += 12; reasons.push("elliott_bear_exhaustion"); }
       if (ell.sentiment > 0.6) { score -= 12; reasons.push("elliott_bull_exhaustion"); }
     }
   }
 
-  // 5) News-driven reversal hints
+  // 5) News
   if (news && typeof news.sentiment === "number") {
-    const ns = news.sentiment; // 0..1
+    const ns = news.sentiment;
     const impact = (news.impact || "low").toString().toLowerCase();
     if (impact === "high") {
-      // high-impact can flip market; if price up but sentiment low -> reversal likely
       if (feats.close && ns < 0.4 && feats.slope > 0.0001) { score -= 14; reasons.push("high_impact_neg_sent_while_price_up"); }
       if (feats.close && ns > 0.6 && feats.slope < -0.0001) { score += 14; reasons.push("high_impact_pos_sent_while_price_down"); }
     }
   }
 
-  // normalize final
-  const likelihood = Math.round(Math.max(0, Math.min(100, 50 + score))); // base 50 +/- score
+  const likelihood = Math.round(Math.max(0, Math.min(100, 50 + score)));
   let signal = null;
   if (likelihood >= 68 && score > 0) signal = "Bullish";
   else if (likelihood >= 68 && score < 0) signal = "Bearish";
@@ -253,11 +238,9 @@ function detectReversal({ tfCandles, microCandles, feats, microFeats, ell, price
 }
 
 // ---------------------------
-// Candidate TP generator (advanced clustering + ATR fallback)
-// returns array of { tp, source, confidence }
+// Candidate TP generator
 function buildCandidateTPsAdvanced(ell, price, atr, candles) {
   const out = [];
-  // 1) Elliott targets if present
   if (ell && Array.isArray(ell.targets) && ell.targets.length) {
     for (const t of ell.targets) {
       const tp = Number(t.tp ?? t.target ?? t.price ?? 0);
@@ -268,19 +251,15 @@ function buildCandidateTPsAdvanced(ell, price, atr, candles) {
       out.push({ tp, source: "Elliott", confidence: Math.round(conf) });
     }
   }
-  // 2) Fib ext from ell (if available)
   if (ell && ell.fib && ell.fib.ext) {
     ["1.272","1.414","1.618","2.0"].forEach(k=>{
       if (ell.fib.ext[k]) out.push({ tp: Number(ell.fib.ext[k]), source: `FIB_${k}`, confidence: 36 });
     });
   }
-  // 3) local swing high/low cluster (from candles)
   try {
     const n = (candles||[]).length;
     if (n > 5) {
-      // simple recent swings (last 50)
       const recent = (candles||[]).slice(-60);
-      // gather local highs
       const highs = [];
       for (let i=2;i<recent.length-2;i++){
         const c = recent[i], p1=recent[i-1], p2=recent[i+1];
@@ -296,26 +275,22 @@ function buildCandidateTPsAdvanced(ell, price, atr, candles) {
     }
   } catch (e) {}
 
-  // 4) ATR-projection both sides as fallback
   if (!out.length) {
     out.push({ tp: Number((price + (atr || price*0.002) * 2).toFixed(8)), source: "ATR_UP", confidence: 30 });
     out.push({ tp: Number((price - (atr || price*0.002) * 2).toFixed(8)), source: "ATR_DOWN", confidence: 30 });
   }
 
-  // dedupe cluster into buckets: round tps and keep highest confidence per bucket
   const map = new Map();
   for (const t of out) {
     const key = Math.round(t.tp);
     if (!map.has(key) || (t.confidence || 0) > (map.get(key).confidence || 0)) map.set(key, t);
   }
-  // sort by closeness to price
   return Array.from(map.values()).sort((a,b)=> Math.abs(a.tp-price) - Math.abs(b.tp-price));
 }
 
 // ---------------------------
-// chooseCandidateTP (RR-safe) reused with added mode param
+// chooseCandidateTPAdvanced (RR-safe)
 function chooseCandidateTPAdvanced(candidates, dir, price, atr, feats, maxRiskRR=20, mode="standard") {
-  // mode: "standard" | "aggressive" | "conservative"
   if (!Array.isArray(candidates) || candidates.length===0) return null;
   const multBase = clamp((feats?.atr || atr || price*0.002) / Math.max(EPS, price), 0.0005, 0.15);
   const volFactor = clamp(multBase / 0.002, 0.5, 4.0);
@@ -326,7 +301,6 @@ function chooseCandidateTPAdvanced(candidates, dir, price, atr, feats, maxRiskRR
   const scored = pool.map(c => {
     const dist = Math.abs(c.tp - price);
     const prox = 1 / (1 + Math.log(1 + dist / Math.max(1, feats?.atr || atr || price*0.002)));
-    // confidence boost if source is Elliott or Fib
     const srcBoost = (c.source && String(c.source).toUpperCase().includes("ELL") ) ? 1.15 : ((String(c.source||"").includes("FIB"))?1.08:1.0);
     const score = (c.confidence || 40) * prox * volFactor * srcBoost;
     return { ...c, score, dist };
@@ -346,7 +320,6 @@ function chooseCandidateTPAdvanced(candidates, dir, price, atr, feats, maxRiskRR
     return { tp: Number(cand.tp), source: cand.source, confidence: cand.confidence, suggestedSL: sl, reason: "best_conf_and_rr", rr: metrics.rr };
   }
 
-  // fallback: ATR fallback
   const top = scored[0];
   if (!top) return null;
   const mult = dir === "Bullish" ? 2.0 : dir === "Bearish" ? 2.0 : 1.5;
@@ -357,14 +330,16 @@ function chooseCandidateTPAdvanced(candidates, dir, price, atr, feats, maxRiskRR
                                : dir === "Bearish" ? Number((price + (feats.atr || atr || price*0.002) * 2).toFixed(8))
                                                     : null;
   const metrics = computeRiskMetrics(price, fallbackTP, sl);
-  return { tp: fallbackTP, source: "AUTO_ATR", confidence: top.confidence || 40, suggestedSL: sl, reason: "fallback_atr", rr: metrics?.rr ?? null };
+  return { tp: fallbackTP, source: "AUTO_ATR", confidence: (top && top.confidence) ? top.confidence : 40, suggestedSL: sl, reason: "fallback_atr", rr: metrics?.rr ?? null };
 }
 
 // ---------------------------
 // Risk helpers
 function computeRiskMetrics(price, tp, sl) {
   if (!isNum(price) || !isNum(tp) || !isNum(sl)) return null;
-  const rr = Math.abs((tp - price) / Math.max(EPS, price - sl));
+  // Ensure denominator non-zero (price - sl) may be negative depending on side; use absolute distance to SL
+  const riskDen = Math.abs(price - sl) < EPS ? EPS : Math.abs(price - sl);
+  const rr = Math.abs((tp - price) / riskDen);
   const percMove = Math.abs((tp - price) / Math.max(EPS, price)) * 100;
   return { rr: isNum(rr) ? rr : null, percMove: isNum(percMove) ? percMove : null };
 }
@@ -403,11 +378,9 @@ function computeStabilityIndex(key) {
   try {
     const list = (STATE.recent && STATE.recent[key]) || [];
     if (!list.length) return 100;
-    // measure variance of dominant direction
     let avgBull=0, avgBear=0;
     for (const p of list) { avgBull += p.probs.bull; avgBear += p.probs.bear; }
     avgBull /= list.length; avgBear /= list.length;
-    // stability: lower variance and consistent dominant -> higher score
     let varSum = 0;
     for (const p of list) {
       varSum += Math.abs(p.probs.bull - avgBull) + Math.abs(p.probs.bear - avgBear);
@@ -426,14 +399,12 @@ function rateTrade({ direction, probs, tpConfidence, rrEstimate, reversal, news 
     const maxProb = Math.max(probs.bull, probs.bear, probs.neutral);
     score += (maxProb - 50) * 0.35; reasons.push("probability");
   }
-  score += (tpConfidence ? (tpConfidence - 40) * 0.25 : 0); // blend
+  score += (tpConfidence ? (tpConfidence - 40) * 0.25 : 0);
   if (rrEstimate && rrEstimate > 0) {
     score += Math.min(10, (Math.log10(Math.max(1, rrEstimate)) * 4));
     reasons.push("rr");
   }
-  // penalize if reversal likely
   if (reversal && reversal.signal) { score -= Math.round(reversal.likelihood * 0.35); reasons.push("reversal_risk"); }
-  // news penalty/bonus
   if (news) {
     const impact = (news.impact || "low").toString().toLowerCase();
     if (impact === "high") score -= 8;
@@ -446,10 +417,9 @@ function rateTrade({ direction, probs, tpConfidence, rrEstimate, reversal, news 
 }
 
 // ---------------------------
-// Core predictor: runMLPrediction (v12)
+// Core predictor: runMLPrediction (v12 engine, exported as part of ml_module_v8_6)
 export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {}) {
   try {
-    // 1) fetch candles
     const tfs = [tf, "1m"];
     const mtf = await fetchMultiTF(symbol, tfs);
     const main = mtf[tf] || { data: [], price: 0 };
@@ -460,22 +430,19 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       return { modelVersion: "ml_module_v12", symbol, tf, direction: "Neutral", probs: { bull:33.33,bear:33.33,neutral:33.33 }, maxProb:33.33, tpEstimate:null, tpConfidence:33, slEstimate:null, explanation: "insufficient data" };
     }
 
-    // 2) features
     const feats = buildFeaturesFromCandles(candles);
     const microCandles = (mtf["1m"] || {}).data || [];
     const microFeats = buildFeaturesFromCandles(microCandles || []);
 
-    // 3) Elliott & News (best-effort)
     let ell = null;
     try { ell = await analyzeElliott(candles); } catch (e) { ell = null; }
     let rawNews = null;
     try { rawNews = await fetchNewsBundle(symbol); } catch (e) { rawNews = null; }
     const news = rawNews ? { sentiment: clamp(Number(rawNews.sentiment ?? 0.5),0,1), impact: rawNews.impact || "low", raw: rawNews } : null;
 
-    // 4) scoring (ATR-adaptive)
+    // scoring
     let bullScore = 0, bearScore = 0;
     const atr = Math.max(feats.atr || 0, price * 0.0006);
-
     const volRatio = clamp(atr / price, 0, 0.06);
     const momWeight = clamp(1 + (volRatio * 10), 0.7, 3.0);
     const slopeWeight = clamp(1 + (volRatio * 6), 0.7, 2.5);
@@ -511,7 +478,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       bearScore += vAdj * 0.2;
     }
 
-    // Elliott influence (if confident)
     let ellSent = 0, ellConf = 0;
     if (ell && isNum(ell.sentiment) && isNum(ell.confidence)) {
       ellSent = clamp(Number(ell.sentiment), -1, 1);
@@ -524,7 +490,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       }
     }
 
-    // News nudging (small, but impact scaled)
     if (news) {
       const newsDir = (news.sentiment - 0.5) * 2;
       const mul = news.impact === "high" ? 1.0 : news.impact === "moderate" ? 0.5 : 0.2;
@@ -533,7 +498,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       bearScore -= nAdj;
     }
 
-    // neutral stability
     const neutralityBase = 0.25;
     const neutralVolPenalty = clamp(volRatio * 6 + Math.min(0.8, Math.max(0, volSpike)) * 0.6, 0, 1.2);
     const neutralStability = neutralityBase - neutralVolPenalty;
@@ -545,7 +509,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
 
     let [pBull, pBear, pNeutral] = softmax3(a,b,c);
 
-    // calibration tilt using ell & news
     if (ellConf > 0) {
       const ellAdj = ellSent * (ellConf/100) * 0.45;
       const [pa,pb,pc] = softmax3(clamp(a + ellAdj, -18, 18), clamp(b - ellAdj, -18, 18), c);
@@ -565,7 +528,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
     probBear = Math.round((probBear / sum) * 10000) / 100;
     probNeutral = Math.round((probNeutral / sum) * 10000) / 100;
 
-    // smoothing
     const key = `${symbol}_${tf}`;
     const sm = smoothProbsEMA(key, { bull: probBull, bear: probBear, neutral: probNeutral }, 0.22);
     probBull = sm.bull; probBear = sm.bear; probNeutral = sm.neutral;
@@ -574,43 +536,110 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
     const maxProb = Math.max(probBull, probBear, probNeutral);
     const dir = maxProb === probBull ? "Bullish" : maxProb === probBear ? "Bearish" : "Neutral";
 
-    // Reversal detection
     const reversal = detectReversal({ tfCandles: candles, microCandles, feats, microFeats, ell, price, news });
 
-    // Candidate TPs (advanced) + selection
     const candidates = buildCandidateTPsAdvanced(ell || {}, price, atr, candles);
     const chosen = chooseCandidateTPAdvanced(candidates, dir, price, atr, feats, 25, (opts.mode || "standard"));
 
-    // final fallback if nothing
+    // ---------- SANITIZE & IMPROVE TP / HEDGE / CONF  ----------
+    // Minimum TP distance
+    const minTPdist = Math.max(price * 0.002, atr * 0.6, 1);
+
     let tpEstimate = chosen && isNum(chosen.tp) ? chosen.tp : (dir === "Bullish" ? Number((price + atr * 2).toFixed(8)) : dir === "Bearish" ? Number((price - atr * 2).toFixed(8)) : null);
     let tpSource = chosen ? chosen.source : "AUTO_ATR";
     let tpConfidence = chosen ? Math.round(clamp(((chosen.confidence||40) * 0.6 + maxProb * 0.4), 1, 99)) : Math.round(maxProb);
     let slEstimate = (chosen && isNum(chosen.suggestedSL)) ? chosen.suggestedSL : (dir === "Bullish" ? Number((price - atr * 2).toFixed(8)) : dir === "Bearish" ? Number((price + atr * 2).toFixed(8)) : null);
 
-    // apply news-driven risk override
-    if (news && news.impact === "high") {
-      // reduce confidence, widen SL, prefer neutral
-      tpConfidence = Math.max(10, Math.round(tpConfidence * 0.7));
-      if (slEstimate && dir === "Bullish") slEstimate = Number((slEstimate - atr * 0.5).toFixed(8));
-      if (slEstimate && dir === "Bearish") slEstimate = Number((slEstimate + atr * 0.5).toFixed(8));
-      // if news sentiment strongly opposite to direction -> demote direction
-      if ((dir === "Bullish" && news.sentiment < 0.4) || (dir === "Bearish" && news.sentiment > 0.6)) {
-        // shift toward neutral
-        probNeutral = Math.min(80, Math.round((probNeutral + 20) * 100) / 100);
+    // if tp too close to price or on wrong side -> try pick candidate on proper side
+    function pickNearestSide(side) {
+      const pool = side === "bull" ? candidates.filter(c=>c.tp>price) : side === "bear" ? candidates.filter(c=>c.tp<price) : candidates;
+      if (!Array.isArray(pool) || pool.length===0) return null;
+      pool.sort((a,b)=> b.confidence - a.confidence || Math.abs(a.tp-price) - Math.abs(b.tp-price));
+      return pool[0] ?? null;
+    }
+
+    if (isNum(tpEstimate)) {
+      if (dir === "Bullish" && tpEstimate <= price + minTPdist) {
+        const pick = pickNearestSide("bull");
+        if (pick && Math.abs(pick.tp - price) >= minTPdist) {
+          tpEstimate = pick.tp; tpSource = pick.source; tpConfidence = Math.max(tpConfidence, pick.confidence);
+          slEstimate = Number((price - Math.max(pick.confidence/100, atr) * 2).toFixed(8));
+        } else {
+          tpEstimate = Number((price + minTPdist).toFixed(8));
+        }
+      } else if (dir === "Bearish" && tpEstimate >= price - minTPdist) {
+        const pick = pickNearestSide("bear");
+        if (pick && Math.abs(pick.tp - price) >= minTPdist) {
+          tpEstimate = pick.tp; tpSource = pick.source; tpConfidence = Math.max(tpConfidence, pick.confidence);
+          slEstimate = Number((price + Math.max(pick.confidence/100, atr) * 2).toFixed(8));
+        } else {
+          tpEstimate = Number((price - minTPdist).toFixed(8));
+        }
+      }
+    } else {
+      // try to pick nearest candidate consistent with dir
+      const pick = dir === "Bullish" ? pickNearestSide("bull") : dir === "Bearish" ? pickNearestSide("bear") : (pickNearestSide("bull") || pickNearestSide("bear"));
+      if (pick) {
+        tpEstimate = pick.tp; tpSource = pick.source; tpConfidence = Math.max(tpConfidence, pick.confidence);
+        slEstimate = pick.suggestedSL ?? slEstimate;
       }
     }
 
-    // risk estimate (RR): approximate from chosen or fallback
+    // Final guard: ensure tpEstimate is not equal to price and has sensible rounding
+    if (isNum(tpEstimate) && Math.abs(tpEstimate - price) < minTPdist) {
+      tpEstimate = dir === "Bullish" ? Number((price + minTPdist).toFixed(8)) : dir === "Bearish" ? Number((price - minTPdist).toFixed(8)) : tpEstimate;
+    }
+
+    // Hedge determination: choose true opposite-side candidate if possible
+    let hedgeTP = null;
+    if (dir === "Bullish") {
+      const opp = pickNearestSide("bear");
+      if (opp && Math.abs(opp.tp - price) >= minTPdist) hedgeTP = opp.tp;
+    } else if (dir === "Bearish") {
+      const opp = pickNearestSide("bull");
+      if (opp && Math.abs(opp.tp - price) >= minTPdist) hedgeTP = opp.tp;
+    } else {
+      const oppB = pickNearestSide("bear"), oppL = pickNearestSide("bull");
+      hedgeTP = oppB?.tp ?? oppL?.tp ?? null;
+    }
+
+    // Fallback hedge: ATR opposite side offset (tighter than primary)
+    if (!isNum(hedgeTP) && isNum(tpEstimate)) {
+      const hedgeOffset = Math.max(minTPdist * 0.6, atr * 0.6);
+      if (dir === "Bullish") hedgeTP = Number((price - hedgeOffset).toFixed(8));
+      else if (dir === "Bearish") hedgeTP = Number((price + hedgeOffset).toFixed(8));
+      else hedgeTP = null;
+    }
+
+    // Ensure hedge and primary are not identical and are on opposite sides
+    if (isNum(tpEstimate) && isNum(hedgeTP)) {
+      if (Math.abs(tpEstimate - hedgeTP) < Math.max(1, minTPdist/5)) {
+        const nudge = Math.max(minTPdist, atr * 0.6);
+        hedgeTP = dir === "Bullish" ? Number((price - nudge).toFixed(8)) : dir === "Bearish" ? Number((price + nudge).toFixed(8)) : hedgeTP;
+      }
+      // ensure opposite sides
+      if ((dir === "Bullish" && hedgeTP > price) || (dir === "Bearish" && hedgeTP < price)) {
+        // flip hedge to opposite side using offset
+        const offset = Math.max(minTPdist * 0.8, atr * 0.6);
+        hedgeTP = dir === "Bullish" ? Number((price - offset).toFixed(8)) : Number((price + offset).toFixed(8));
+      }
+    }
+
+    // Calibrate final TP confidence: include stability and tradeQuality signals
     const rrEstimateObj = computeRiskMetrics(price, tpEstimate || price, slEstimate || price);
     const rrEstimate = rrEstimateObj?.rr ?? null;
-
-    // stability
     const stabilityIndex = computeStabilityIndex(key);
-
-    // trade quality rating
     const tradeQuality = rateTrade({ direction: dir, probs: { bull: probBull, bear: probBear, neutral: probNeutral }, tpConfidence, rrEstimate, reversal, news });
 
-    // Explanation and final object
+    // If ML direction strongly contradicts recent fusion/elliott, reduce confidence more
+    // (fusion/elliott info is best derived externally; we give hooks here — caller tg_commands adjusts further)
+    // final tpConfidence tweak
+    let finalTpConfidence = Math.round(clamp(tpConfidence * (stabilityIndex / 100) * (Math.max(0.6, tradeQuality.score/100)), 5, 99));
+
+    // Safety: if maxProb is extreme but RR unreasonable, reduce confidence
+    if (finalTpConfidence > 85 && rrEstimate && rrEstimate < 0.2) finalTpConfidence = Math.round(finalTpConfidence * 0.7);
+
+    // Explanation
     const explanationParts = [
       `slope:${Number(feats.slope.toFixed(6))}`,
       `mom5:${(feats.mom5*100).toFixed(2)}%`,
@@ -626,12 +655,14 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       direction: dir,
       probs: { bull: probBull, bear: probBear, neutral: probNeutral },
       maxProb,
-      tpEstimate,
+      tpEstimate: isNum(tpEstimate) ? Number(tpEstimate) : null,
       tpSource,
-      tpConfidence,
-      slEstimate,
+      tpConfidence: finalTpConfidence,
+      slEstimate: isNum(slEstimate) ? Number(slEstimate) : null,
       rrEstimate,
-      reversal,    // { signal, likelihood, reasons }
+      hedgeTP: isNum(hedgeTP) ? Number(hedgeTP) : null,
+      hedgeConfidence: isNum(hedgeTP) ? Math.round(clamp(100 - finalTpConfidence, 10, 90)) : null,
+      reversal,
       newsSummary: news ? { sentiment: news.sentiment, impact: news.impact } : null,
       stabilityIndex,
       tradeQuality,
@@ -641,7 +672,6 @@ export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {})
       features: { slope: feats.slope, mom5: feats.mom5, rsi: feats.rsi, atr: feats.atr }
     };
 
-    // persist non-blocking
     try { recordPrediction({ id:`${symbol}_${tf}_${Date.now()}`, symbol, tf, ml: mlObj }); } catch (e) {}
 
     return mlObj;
