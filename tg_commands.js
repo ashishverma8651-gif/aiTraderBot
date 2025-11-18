@@ -2,7 +2,7 @@
 // Exports: buildAIReport(symbol, opts), formatAIReport(report), sendSplitReport(report, sendTelegramFunc)
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v12.js";     // ✔ Use your new ML v12 default-export object
+import ML from "./ml_module_v8_6.js";     // ✔ Use your new ML v12 default-export object
 import News from "./news_social.js";     // ✔ same as before
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
