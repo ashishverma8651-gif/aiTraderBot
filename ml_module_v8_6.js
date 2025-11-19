@@ -1,550 +1,575 @@
-// ml_module_v10_pro.js
-// ML Module v10 PRO - single-file upgrade
-// Exports:
-//   runMLPrediction(symbol, tf, opts)
-//   runMicroPrediction(symbol, tf, opts)
-//   calculateAccuracy()
-//   recordPrediction(pred)
-//   recordOutcome(outcome)
-//   getAccuracyReport()
-//   getAccuracyByTF(tf)
-//   getRRStats()
-//   markPredictionOutcome(id, outcome)   // mark win/loss and update tracker
+// ml_module_v8_6.js
+// V11 Ultra implementation (exported under legacy filename ml_module_v8_6.js)
+// NOTE: This file intentionally uses the ml_module_v8_6.js filename so existing code that imports
+// "./ml_module_v8_6.js" will now receive the V11 Ultra implementation.
 //
-// Usage: replace previous ml_module file with this content.
-// Dependencies: fs, path, fetchMultiTF (from ./utils.js), indicators (./core_indicators.js), analyzeElliott (./elliott_module.js)
+// Exports (ES module):
+// - runMLPrediction(symbol, tf, opts)
+// - runMicroPrediction(symbol, tf)
+// - calculateAccuracy()
+// - recordPrediction(pred)
+// - recordOutcome(outcome)
+// - markOutcome(symbol, alertId, success, trueLabel)
+// - getStats()
+// - trainAdaptive(batch)
+// - resetStats()
+// - default export object containing the above
+//
+// Dependencies expected in your project:
+// ./utils.js (fetchMultiTF), ./elliott_module.js (analyzeElliott), ./news_social.js (optional).
+// If running in an environment without TFJS, the code will fallback to deterministic candle vision.
 
 import fs from "fs";
 import path from "path";
 import { fetchMultiTF } from "./utils.js";
-import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
+import News from "./news_social.js";
 
-// --------------------------- CONFIG & PERSISTENCE ---------------------------
-const LOG_DIR = process.env.ML_LOG_DIR || "./.ml_logs";
-const PRED_FILE = path.join(LOG_DIR, "predictions.json");         // stored predictions
-const OUT_FILE = path.join(LOG_DIR, "outcomes.json");            // stored outcomes
-const STATS_FILE = path.join(LOG_DIR, "accuracy_stats.json");    // aggregated stats
-const DEBUG_CSV = path.join(LOG_DIR, "debug.csv");
+const fetchNewsBundle = (News && (News.fetchNewsBundle || (News.default && News.default.fetchNewsBundle)))
+  ? (News.fetchNewsBundle || News.default.fetchNewsBundle)
+  : async (s) => ({ ok: false, sentiment: 0.5, impact: "low", items: [], headline: "No news" });
+
+// Try to load tfjs-node if available (optional). Use require inside try/catch so file runs in ESM Node.
+let tf = null;
+let useTF = false;
+try {
+  // eslint-disable-next-line no-undef
+  tf = (() => {
+    try { return require("@tensorflow/tfjs-node"); } catch (e) { return null; }
+  })();
+  if (tf) useTF = true;
+} catch (e) {
+  tf = null;
+  useTF = false;
+}
+
+// -------------------- Persistence & Paths --------------------
+const LOG_DIR = process.env.ML_LOG_DIR || "./.ml_v11_logs";
+const PRED_FILE = path.join(LOG_DIR, "predictions_v11.json");
+const OUT_FILE = path.join(LOG_DIR, "outcomes_v11.json");
+const STATS_FILE = path.join(LOG_DIR, "stats_v11.json");
+const MODEL_FILE = path.join(LOG_DIR, "cnn_model_meta.json");
 
 try { if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) {}
 
+// -------------------- In-memory storage & stats --------------------
 let memPreds = [];
 let memOuts = [];
-let _stats = { total:0, wins:0, losses:0, byTF:{}, byRegime:{}, lastUpdated: null, predictions: [] };
+let _stats = { total: 0, wins: 0, losses: 0, alerts: [], adaptiveWeights: null, lastUpdated: null };
 
-// helper file read/write (safe)
+try {
+  if (fs.existsSync(STATS_FILE)) {
+    const raw = fs.readFileSync(STATS_FILE, "utf8");
+    if (raw) _stats = JSON.parse(raw);
+  }
+} catch (e) { /* ignore load error */ }
+
+// -------------------- Safe JSON helpers --------------------
 function readJsonSafe(file) {
   try {
-    if (!fs.existsSync(file)) return null;
+    if (!fs.existsSync(file)) return [];
     const txt = fs.readFileSync(file, "utf8");
-    return JSON.parse(txt || "null");
-  } catch (e) { return null; }
+    return JSON.parse(txt || "[]");
+  } catch (e) {
+    return [];
+  }
 }
 function writeJsonSafe(file, obj) {
   try {
     fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
     return true;
-  } catch (e) { return false; }
+  } catch (e) {
+    return false;
+  }
 }
-(function loadStats() {
+function saveStats() {
   try {
-    const s = readJsonSafe(STATS_FILE);
-    if (s) _stats = s;
+    _stats.lastUpdated = new Date().toISOString();
+    fs.writeFileSync(STATS_FILE, JSON.stringify(_stats, null, 2), "utf8");
   } catch (e) {}
-})();
-
-// --------------------------- NUMERIC HELPERS ---------------------------
-const EPS = 1e-12;
-const clamp = (v, lo=-Infinity, hi=Infinity) => Math.max(lo, Math.min(hi, v));
-const isFiniteNum = n => typeof n === "number" && Number.isFinite(n);
-const nf = (v,d=2) => (isFiniteNum(v) ? Number(v).toFixed(d) : "N/A");
-const avg = a => (Array.isArray(a) && a.length) ? a.reduce((s,x)=>s+x,0)/a.length : 0;
-const boundedPercent = n => { if (!isFiniteNum(n)) return 0; return Math.round(Math.max(0, Math.min(100, n)) * 100) / 100; };
-
-// stable softmax 3
-function softmax3(a,b,c) {
-  const m = Math.max(a,b,c);
-  const ea = Math.exp(a-m), eb = Math.exp(b-m), ec = Math.exp(c-m);
-  const s = ea+eb+ec+EPS; return [ea/s, eb/s, ec/s];
 }
 
-// --------------------------- RECORD HELPERS ---------------------------
+// -------------------- Numeric helpers --------------------
+const EPS = 1e-12;
+const isFiniteNum = n => typeof n === "number" && Number.isFinite(n);
+const clamp = (v, lo = -Infinity, hi = Infinity) => Math.max(lo, Math.min(hi, v));
+const nf = (v, d = 2) => isFiniteNum(v) ? Number(v).toFixed(d) : "N/A";
+
+// -------------------- Record helpers --------------------
 export function recordPrediction(pred) {
   try {
-    const arr = readJsonSafe(PRED_FILE) || [];
+    const arr = readJsonSafe(PRED_FILE);
     arr.push({ ...pred, recordedAt: new Date().toISOString() });
     if (!writeJsonSafe(PRED_FILE, arr)) memPreds.push(pred);
-    // debug csv
-    try {
-      if (!fs.existsSync(DEBUG_CSV)) fs.writeFileSync(DEBUG_CSV, "id,symbol,tf,direction,probs,tp,sl,timestamp\n","utf8");
-      const line = [
-        pred.id || "",
-        pred.symbol || "",
-        pred.tf || "",
-        pred.ml?.direction || pred.direction || "",
-        pred.ml?.probs ? `${pred.ml.probs.bull}/${pred.ml.probs.bear}/${pred.ml.probs.neutral}` : "",
-        pred.ml?.tpEstimate ?? pred.tp ?? "",
-        pred.ml?.slEstimate ?? pred.sl ?? "",
-        new Date().toISOString()
-      ].join(",") + "\n";
-      fs.appendFileSync(DEBUG_CSV, line, "utf8");
-    } catch(e){}
-    // also push into running stats partial
-    try { _stats.predictions = _stats.predictions || []; _stats.predictions.push({ id: pred.id, symbol: pred.symbol, tf: pred.tf, direction: pred.ml?.direction || pred.direction || null, prob: pred.ml?.maxProb || (pred.ml?.probs ? Math.max(pred.ml.probs.bull, pred.ml.probs.bear, pred.ml.probs.neutral) : null), tp: pred.ml?.tpEstimate || pred.tp || null, sl: pred.ml?.slEstimate || pred.sl || null, ts: new Date().toISOString() }); if (_stats.predictions.length>500) _stats.predictions.shift(); } catch(e){}
+
+    _stats.alerts = _stats.alerts || [];
+    _stats.alerts.push({ id: pred.id, symbol: pred.symbol, ts: new Date().toISOString(), meta: pred.meta || null });
+    if (_stats.alerts.length > 500) _stats.alerts.shift();
     saveStats();
-  } catch (e) { memPreds.push(pred); }
+  } catch (e) {
+    memPreds.push(pred);
+  }
 }
 
 export function recordOutcome(outcome) {
   try {
-    const arr = readJsonSafe(OUT_FILE) || [];
+    const arr = readJsonSafe(OUT_FILE);
     arr.push({ ...outcome, recordedAt: new Date().toISOString() });
     if (!writeJsonSafe(OUT_FILE, arr)) memOuts.push(outcome);
-    // update aggregated stats
-    try {
-      _stats.total = (_stats.total||0) + 1;
-      if (outcome.success) _stats.wins = (_stats.wins||0) + 1;
-      else _stats.losses = (_stats.losses||0) + 1;
-      // byTF
-      if (outcome.tf) { _stats.byTF[outcome.tf] = _stats.byTF[outcome.tf] || { wins:0, losses:0, total:0 }; _stats.byTF[outcome.tf].total++; if (outcome.success) _stats.byTF[outcome.tf].wins++; else _stats.byTF[outcome.tf].losses++; }
-      saveStats();
-    } catch(e){}
-  } catch (e) { memOuts.push(outcome); }
+
+    _stats.total = (_stats.total || 0) + 1;
+    if (outcome.success) _stats.wins = (_stats.wins || 0) + 1;
+    else _stats.losses = (_stats.losses || 0) + 1;
+    saveStats();
+  } catch (e) {
+    memOuts.push(outcome);
+  }
 }
 
 export function calculateAccuracy() {
   try {
-    const outs = (readJsonSafe(OUT_FILE) || []).concat(memOuts || []);
-    const total = outs.length;
+    const outs = readJsonSafe(OUT_FILE).concat(memOuts || []);
+    const total = outs.length || (_stats.total || 0);
     if (!total) return { accuracy: 0, total: 0, correct: 0 };
-    const correct = outs.filter(o => o && o.success).length;
-    return { accuracy: Math.round((correct/total)*10000)/100, total, correct };
-  } catch (e) { return { accuracy: 0, total: 0, correct: 0 }; }
+    const correct = outs.filter(o => o && o.success).length || (_stats.wins || 0);
+    const acc = Math.round((correct / total) * 10000) / 100;
+    return { accuracy: acc, total, correct };
+  } catch (e) {
+    return { accuracy: 0, total: 0, correct: 0 };
+  }
 }
 
-// markPredictionOutcome - convenience: link a recorded prediction id to an outcome and update stats.
-export function markPredictionOutcome(id, success=true, info={}) {
+// -------------------- CNN (optional) --------------------
+let cnnModelMeta = null;
+try { if (fs.existsSync(MODEL_FILE)) cnnModelMeta = JSON.parse(fs.readFileSync(MODEL_FILE, "utf8")); } catch (e) { cnnModelMeta = null; }
+
+async function buildTinyCNN() {
+  if (!useTF) return null;
   try {
-    // append to outcomes file
-    const out = { alertId: id, success, info, ts: new Date().toISOString() };
-    recordOutcome(out);
-    // update prediction entry if exists
-    const preds = readJsonSafe(PRED_FILE) || [];
-    const idx = preds.findIndex(p => p.id === id);
-    if (idx >= 0) { preds[idx].outcome = success ? "win" : "loss"; writeJsonSafe(PRED_FILE, preds); }
+    const tfn = tf;
+    const model = tfn.sequential();
+    model.add(tfn.layers.conv2d({ inputShape: [32, 32, 1], filters: 8, kernelSize: 3, activation: "relu" }));
+    model.add(tfn.layers.maxPooling2d({ poolSize: [2, 2] }));
+    model.add(tfn.layers.conv2d({ filters: 16, kernelSize: 3, activation: "relu" }));
+    model.add(tfn.layers.flatten());
+    model.add(tfn.layers.dense({ units: 32, activation: "relu" }));
+    model.add(tfn.layers.dense({ units: 3, activation: "softmax" }));
+    model.compile({ optimizer: tfn.train.adam(0.001), loss: "categoricalCrossentropy", metrics: ["accuracy"] });
+    cnnModelMeta = { builtAt: new Date().toISOString(), trained: false };
+    writeJsonSafe(MODEL_FILE, cnnModelMeta);
+    return model;
+  } catch (e) {
+    return null;
+  }
+}
+
+// -------------------- Candle vision fallback (deterministic) --------------------
+function candleVisionHeuristic(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return { label: "Neutral", probs: { bull: 33, bear: 33, neutral: 33 }, features: {} };
+  const lastN = candles.slice(-6);
+  const bodies = lastN.map(c => Math.abs(c.close - c.open));
+  const ranges = lastN.map(c => c.high - c.low);
+  const upCount = lastN.filter(c => c.close > c.open).length;
+  const downCount = lastN.filter(c => c.close < c.open).length;
+  const avgBody = bodies.reduce((a, b) => a + b, 0) / bodies.length;
+  const avgRange = ranges.reduce((a, b) => a + b, 0) / ranges.length;
+  const lastC = lastN[lastN.length - 1];
+  const body = Math.abs(lastC.close - lastC.open);
+  const upperWick = lastC.high - Math.max(lastC.close, lastC.open);
+  const lowerWick = Math.min(lastC.close, lastC.open) - lastC.low;
+  let bullScore = 0, bearScore = 0;
+  const firstClose = lastN[0].close;
+  const lastClose = lastN[lastN.length - 1].close;
+  const momentum = (lastClose - firstClose) / Math.max(EPS, firstClose);
+  bullScore += clamp(momentum * 10, -8, 8);
+  bearScore -= clamp(momentum * 10, -8, 8);
+  if (lowerWick > body * 2 && upperWick < body * 0.4) bullScore += 3;
+  if (upperWick > body * 2 && lowerWick < body * 0.4) bearScore += 3;
+  if (lastC.close > lastC.open && body > avgRange * 0.6) bullScore += 2;
+  if (lastC.open > lastC.close && body > avgRange * 0.6) bearScore += 2;
+  const vols = lastN.map(c => c.volume || 0);
+  const lastVol = vols[vols.length - 1] || 0;
+  const avgVol = vols.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(1, vols.length - 1);
+  if (avgVol > 0 && lastVol > avgVol * 1.3) {
+    bullScore += (upCount > downCount ? 1.4 : 0.2);
+    bearScore += (downCount > upCount ? 1.4 : 0.2);
+  }
+  const pb = Math.max(0, Math.min(100, 50 + bullScore * 5));
+  const pr = Math.max(0, Math.min(100, 50 + bearScore * 5));
+  let neutral = 100 - (pb + pr);
+  if (neutral < 0) {
+    const s = pb + pr + 1e-9;
+    const scale = 100 / s;
+    return { label: pb > pr ? "Bullish" : "Bearish", probs: { bull: Math.round(pb * scale * 100) / 100, bear: Math.round(pr * scale * 100) / 100, neutral: 0 }, features: { momentum, lowerWick, upperWick, lastVol, avgVol } };
+  }
+  const probs = { bull: Math.round(pb * 100) / 100, bear: Math.round(pr * 100) / 100, neutral: Math.round(neutral * 100) / 100 };
+  const label = probs.bull > probs.bear && probs.bull > probs.neutral ? "Bullish" : probs.bear > probs.bull && probs.bear > probs.neutral ? "Bearish" : "Neutral";
+  return { label, probs, features: { momentum, lowerWick, upperWick, lastVol, avgVol } };
+}
+
+// -------------------- Order-flow proxy features --------------------
+function computeOrderFlowFeatures(candles) {
+  if (!Array.isArray(candles) || candles.length < 3) return {};
+  const n = candles.length;
+  const last = candles[n - 1];
+  const prev = candles[n - 2];
+  const prev2 = candles[n - 3];
+  const delta = (last.close - last.open) * (last.volume || 1);
+  const deltaPrev = (prev.close - prev.open) * (prev.volume || 1);
+  const vel = (last.close - prev.close);
+  const window = candles.slice(Math.max(0, n - 6), n);
+  const swingHigh = Math.max(...window.map(c => c.high));
+  const swingLow = Math.min(...window.map(c => c.low));
+  let sweep = null;
+  if (last.high > swingHigh && last.close < swingHigh) sweep = { side: "BearishSweep", priorHigh: swingHigh };
+  if (last.low < swingLow && last.close > swingLow) sweep = { side: "BullishSweep", priorLow: swingLow };
+  const upWicks = window.map(c => c.high - Math.max(c.close, c.open));
+  const downWicks = window.map(c => Math.min(c.close, c.open) - c.low);
+  const avgUp = upWicks.reduce((a, b) => a + b, 0) / upWicks.length;
+  const avgDown = downWicks.reduce((a, b) => a + b, 0) / downWicks.length;
+  return { delta, deltaPrev, vel, sweep, avgUp, avgDown };
+}
+
+// -------------------- Feature builder (improved) --------------------
+function buildFeaturesFromCandles(candles) {
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+  const n = candles.length;
+  const last = candles[n - 1];
+  const closes = candles.map(c => Number(c.close || 0));
+  const highs = candles.map(c => Number(c.high || 0));
+  const lows = candles.map(c => Number(c.low || 0));
+  const vols = candles.map(c => Number(c.volume || 0));
+  const close = Number(last.close || 0);
+  const mom3 = n >= 4 ? (close - closes[n - 4]) / Math.max(EPS, closes[n - 4]) : 0;
+  const mom10 = n >= 11 ? (close - closes[n - 11]) / Math.max(EPS, closes[n - 11]) : 0;
+  const len = Math.min(30, n);
+  let xmean = 0, ymean = 0, num = 0, den = 0;
+  for (let i = 0; i < len; i++) { xmean += i; ymean += closes[n - len + i]; }
+  xmean /= len; ymean /= len;
+  for (let i = 0; i < len; i++) { const x = i; const y = closes[n - len + i]; num += (x - xmean) * (y - ymean); den += (x - xmean) * (x - xmean); }
+  const slope = den === 0 ? 0 : num / den;
+  const trs = [];
+  for (let i = 1; i < n; i++) {
+    const tr = Math.max(Math.abs(highs[i] - lows[i]), Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+    trs.push(tr);
+  }
+  const atr = trs.length ? trs.slice(-14).reduce((a, b) => a + b, 0) / Math.min(14, trs.length) : 0;
+  let gains = 0, losses = 0;
+  for (let i = Math.max(1, n - 14); i < n; i++) {
+    const diff = (closes[i] - closes[i - 1]);
+    if (diff > 0) gains += diff; else losses += Math.abs(diff);
+  }
+  const avgGain = gains / 14 || 0;
+  const avgLoss = losses / 14 || 0;
+  const rsi = avgGain + avgLoss ? 100 - (100 / (1 + avgGain / Math.max(EPS, avgLoss))) : 50;
+  const avgVol = vols.slice(-20).reduce((a, b) => a + b, 0) / Math.max(1, Math.min(20, vols.length));
+  const of = computeOrderFlowFeatures(candles);
+  return {
+    close,
+    slope,
+    mom3,
+    mom10,
+    atr,
+    rsi,
+    avgVol,
+    lastVol: last.volume || 0,
+    of,
+    high: last.high,
+    low: last.low
+  };
+}
+
+// -------------------- Adaptive Weight Manager --------------------
+if (!_stats.adaptiveWeights) {
+  _stats.adaptiveWeights = {
+    w_ind: 0.45,
+    w_cnn: 0.25,
+    w_of: 0.20,
+    w_news: 0.10,
+    lr: 0.02
+  };
+  saveStats();
+}
+
+function fuseScores(scores, weights) {
+  const newsNorm = (scores.news || 0.5);
+  const ind = clamp(scores.ind || 0.5, 0, 1);
+  const cnn = clamp(scores.cnn || 0.5, 0, 1);
+  const of = clamp(scores.of || 0.5, 0, 1);
+  const w = weights || _stats.adaptiveWeights;
+  const fused = ind * w.w_ind + cnn * w.w_cnn + of * w.w_of + newsNorm * w.w_news;
+  return { fused, breakdown: { ind, cnn, of, news: newsNorm }, weights: w };
+}
+
+function updateAdaptiveWeights(trueLabel, predProb, features = {}) {
+  try {
+    const w = _stats.adaptiveWeights;
+    if (!w) return;
+    const lr = w.lr || 0.02;
+    const y = trueLabel === "Bullish" ? 1 : trueLabel === "Bearish" ? 0 : 0.5;
+    const err = y - predProb;
+    const contrib = (features.breakdown || { ind: 0.5, cnn: 0.5, of: 0.5, news: 0.5 });
+    w.w_ind = clamp(w.w_ind + lr * err * (contrib.ind - 0.5), 0.05, 0.8);
+    w.w_cnn = clamp(w.w_cnn + lr * err * (contrib.cnn - 0.5), 0.05, 0.6);
+    w.w_of = clamp(w.w_of + lr * err * (contrib.of - 0.5), 0.05, 0.6);
+    w.w_news = clamp(w.w_news + lr * err * (contrib.news - 0.5), 0.01, 0.3);
+    const s = w.w_ind + w.w_cnn + w.w_of + w.w_news;
+    w.w_ind /= s; w.w_cnn /= s; w.w_of /= s; w.w_news /= s;
+    _stats.adaptiveWeights = w;
+    saveStats();
+  } catch (e) {}
+}
+
+// -------------------- Indicator Layer --------------------
+function indicatorLayer(feats) {
+  if (!feats) return { score: 0.5, details: {} };
+  const { slope, mom3, mom10, rsi, atr, avgVol, lastVol, close } = feats;
+  let s = 0;
+  s += clamp((Math.tanh(slope / Math.max(1, Math.abs(close || 1))) + 0.5), 0, 1) * 0.5;
+  s += clamp((0.5 + Math.tanh(mom3 * 6) / 2), 0, 1) * 0.3;
+  if (isFiniteNum(rsi)) {
+    const rnorm = clamp((rsi - 30) / 40, 0, 1);
+    s = s * 0.9 + rnorm * 0.1;
+  }
+  if (avgVol > 0) {
+    const volScore = clamp(lastVol / avgVol, 0, 2) / 2;
+    s = s * 0.9 + volScore * 0.1;
+  }
+  return { score: clamp(s, 0, 1), details: { slope, mom3, mom10, rsi, atr } };
+}
+
+// -------------------- CNN layer wrapper --------------------
+async function cnnLayer(candles) {
+  if (!candles || !candles.length) return { score: 0.5, label: "Neutral", probs: { bull: 33, bear: 33, neutral: 33 }, features: {} };
+  if (useTF) {
+    // If user provides trained model they can implement loading logic — fallback to heuristic here.
+    // Keeping deterministic fallback for now to ensure stable behavior.
+  }
+  return candleVisionHeuristic(candles);
+}
+
+// -------------------- News layer --------------------
+function newsLayer(newsObj) {
+  if (!newsObj) return { score: 0.5, meta: {} };
+  const sentiment = typeof newsObj.sentiment === "number" ? newsObj.sentiment : 0.5;
+  const impact = (newsObj.impact || "low").toLowerCase();
+  const impactScale = impact === "high" ? 0.6 : impact === "moderate" ? 0.35 : 0.1;
+  const score = clamp(sentiment, 0, 1);
+  return { score: clamp(score + (Math.random() * 0.01), 0, 1), meta: { sentiment, impact, impactScale } };
+}
+
+// -------------------- TP/SL candidate builder --------------------
+function buildCandidateTPs(feats, price, ell) {
+  const out = [];
+  const atr = Math.max(feats?.atr || 0, price * 0.0005);
+  if (ell && ell.targets && ell.targets.length) {
+    for (const t of ell.targets) {
+      const tp = Number(t.tp || t.price || t.target || 0);
+      if (!isFiniteNum(tp) || tp <= 0) continue;
+      out.push({ tp, source: t.source || "Elliott", confidence: Math.min(100, Math.round(t.confidence || 50)) });
+    }
+  }
+  if (!out.length) {
+    out.push({ tp: price + atr * 2.5, source: "ATR_UP", confidence: 40 });
+    out.push({ tp: price - atr * 2.5, source: "ATR_DOWN", confidence: 40 });
+  }
+  const map = new Map();
+  for (const c of out) {
+    const key = Math.round(c.tp);
+    if (!map.has(key) || (c.confidence || 0) > (map.get(key).confidence || 0)) map.set(key, c);
+  }
+  return [...map.values()].sort((a, b) => Math.abs(a.tp - price) - Math.abs(b.tp - price));
+}
+function chooseTP(candidates, dir, price, feats) {
+  if (!candidates || !candidates.length) return null;
+  const atr = Math.max(feats?.atr || 0, price * 0.0005);
+  const pool = candidates.filter(c => (dir === "Bullish" ? c.tp > price : dir === "Bearish" ? c.tp < price : true));
+  const chosen = (pool.length ? pool : candidates)[0];
+  const sl = dir === "Bullish" ? price - atr * 2.2 : dir === "Bearish" ? price + atr * 2.2 : price - atr * 2.2;
+  return { tp: chosen.tp, source: chosen.source, confidence: chosen.confidence, suggestedSL: sl };
+}
+
+// -------------------- MAIN ML PREDICTOR (V11 Ultra) --------------------
+export async function runMLPrediction(symbol = "BTCUSDT", tfc = "15m", opts = {}) {
+  try {
+    const mtfRaw = await fetchMultiTF(symbol, [tfc, "1m", "5m", "30m", "1h"]);
+    const main = mtfRaw[tfc] || { data: [], price: 0 };
+    const candles = main.data || [];
+    const price = isFiniteNum(main.price) ? main.price : candles?.at(-1)?.close ?? 0;
+
+    if (!candles || candles.length < 6 || price <= 0) {
+      return {
+        modelVersion: "ml_module_v11_ultra",
+        symbol,
+        tf: tfc,
+        direction: "Neutral",
+        probs: { bull: 33.33, bear: 33.33, neutral: 33.33 },
+        maxProb: 33.33,
+        tpEstimate: null,
+        slEstimate: null,
+        explanation: "insufficient data"
+      };
+    }
+
+    const feats = buildFeaturesFromCandles(candles);
+    const indLayer = indicatorLayer(feats);
+    const cnn = await cnnLayer(candles);
+    const of = computeOrderFlowFeatures(candles);
+    const ofScore = (() => {
+      if (!of) return 0.5;
+      let s = 0.5;
+      if (isFiniteNum(of.delta)) s += clamp(Math.tanh(of.delta / Math.max(1, feats.avgVol || 1)), -0.4, 0.4);
+      if (of.sweep && of.sweep.side) s += (of.sweep.side === "BullishSweep") ? 0.15 : -0.15;
+      return clamp(s, 0, 1);
+    })();
+
+    let ell = null;
+    try { if (opts.useElliott !== false) ell = await analyzeElliott(candles); } catch (e) { ell = null; }
+
+    let news = null;
+    try { news = await fetchNewsBundle(symbol); } catch (e) { news = null; }
+    const newsScore = news ? newsLayer(news) : { score: 0.5 };
+
+    const scores = { ind: indLayer.score, cnn: (cnn.probs ? (cnn.probs.bull / 100) : (cnn.score || 0.5)), of: ofScore, news: newsScore.score };
+    const fusion = fuseScores(scores, _stats.adaptiveWeights);
+
+    const bullP = clamp(fusion.fused, 0.01, 0.99);
+    const bearP = clamp(1 - bullP, 0.01, 0.99);
+    const neutralP = clamp(1 - Math.abs(bullP - bearP), 0, 1);
+
+    let pb = bullP * 100;
+    let pr = bearP * 100;
+    let pn = neutralP * 100;
+    const ssum = pb + pr + pn || 1;
+    pb = Math.round((pb / ssum) * 10000) / 100;
+    pr = Math.round((pr / ssum) * 10000) / 100;
+    pn = Math.round((pn / ssum) * 10000) / 100;
+    const probs = { bull: pb, bear: pr, neutral: pn };
+    const maxProb = Math.max(pb, pr, pn);
+    const dir = maxProb === pb ? "Bullish" : maxProb === pr ? "Bearish" : "Neutral";
+
+    const candidates = buildCandidateTPs(feats, price, ell || {});
+    const chosen = chooseTP(candidates, dir, price, feats);
+    const tpEstimate = chosen?.tp ?? null;
+    const slEstimate = chosen?.suggestedSL ?? null;
+    const tpConfidence = chosen ? Math.round(chosen.confidence * 0.6 + maxProb * 0.4) : Math.round(maxProb);
+
+    const explanation = {
+      features: { slope: feats.slope, mom3: feats.mom3, rsi: feats.rsi, atr: feats.atr, avgVol: feats.avgVol },
+      layers: {
+        indicator: indLayer.details,
+        cnn: cnn.features || {},
+        orderflow: of,
+        news: news || null
+      },
+      fusionBreakdown: fusion,
+      ell: ell ? { sentiment: ell.sentiment, confidence: ell.confidence } : null
+    };
+
+    const mlObj = {
+      modelVersion: "ml_module_v11_ultra",
+      symbol,
+      tf: tfc,
+      generatedAt: new Date().toISOString(),
+      direction: dir,
+      probs,
+      maxProb,
+      tpEstimate,
+      tpSource: chosen?.source ?? null,
+      tpConfidence,
+      slEstimate,
+      explanation,
+      rawLayers: { ind: indLayer.score, cnn: (cnn.score || 0.5), of: ofScore, news: newsScore.score },
+      adaptiveWeights: _stats.adaptiveWeights
+    };
+
+    const id = `${symbol}_${tfc}_${Date.now()}`;
+    recordPrediction({ id, symbol, tf: tfc, ml: mlObj, meta: { cnn: cnn.probs || cnn, scores } });
+
+    return mlObj;
+  } catch (e) {
+    return { error: e.toString(), symbol, tf: tfc };
+  }
+}
+
+// -------------------- MICRO predictor --------------------
+export async function runMicroPrediction(symbol = "BTCUSDT", tfc = "1m") {
+  try {
+    const mtf = await fetchMultiTF(symbol, [tfc]);
+    const candles = mtf[tfc]?.data || [];
+    if (!candles || candles.length < 3) {
+      return { modelVersion: "ml_module_v11_ultra-micro", label: "Neutral", prob: 33.33, reason: "insufficient" };
+    }
+    const feats = buildFeaturesFromCandles(candles);
+    const ind = indicatorLayer(feats);
+    const cnn = await cnnLayer(candles);
+    const of = computeOrderFlowFeatures(candles);
+    const ofScore = clamp(0.5 + (of.delta || 0) / Math.max(1, feats.avgVol || 1) / 2, 0, 1);
+    const scores = { ind: ind.score, cnn: cnn.probs ? (cnn.probs.bull / 100) : (cnn.score || 0.5), of: ofScore, news: 0.5 };
+    const fused = fuseScores(scores);
+    const bull = fused.fused;
+    const probBull = Math.round(bull * 10000) / 100;
+    const probBear = Math.round((1 - bull) * 10000) / 100;
+    const label = probBull > 60 ? "Bullish" : probBear > 60 ? "Bearish" : "Neutral";
+    return { modelVersion: "ml_module_v11_ultra-micro", label, prob: Math.max(probBull, probBear), probBull, probBear, raw: { ind: ind.score, cnn: cnn, of: ofScore } };
+  } catch (e) {
+    return { error: e.toString(), label: "Neutral" };
+  }
+}
+
+// -------------------- Adaptive training --------------------
+export async function trainAdaptive(batch = []) {
+  try {
+    if (!Array.isArray(batch) || !batch.length) return { ok: false, message: "no data" };
+    for (const b of batch) {
+      updateAdaptiveWeights(b.trueLabel, b.fusedProb, { breakdown: b.breakdown });
+    }
+    saveStats();
+    return { ok: true, weights: _stats.adaptiveWeights };
+  } catch (e) {
+    return { ok: false, error: e.toString() };
+  }
+}
+
+// -------------------- Mark outcome --------------------
+export function markOutcome(symbol, alertId, success = true, trueLabel = null) {
+  try {
+    recordOutcome({ alertId, symbol, success, ts: new Date().toISOString() });
+    if (typeof trueLabel === "string") {
+      const preds = readJsonSafe(PRED_FILE);
+      const p = preds.find(px => px.id === alertId);
+      if (p && p.meta && p.meta.scores) {
+        const fused = fuseScores(p.meta.scores, _stats.adaptiveWeights);
+        updateAdaptiveWeights(trueLabel, fused.fused, { breakdown: fused.breakdown });
+        saveStats();
+      }
+    }
     return true;
   } catch (e) { return false; }
 }
 
-// save aggregated stats
-function saveStats() {
-  try {
-    _stats.lastUpdated = new Date().toISOString();
-    writeJsonSafe(STATS_FILE, _stats);
-  } catch (e) {}
-}
-
-// --------------------------- FEATURE BUILDERS ---------------------------
-function buildFeaturesFromCandles(candles) {
-  if (!Array.isArray(candles) || candles.length === 0) return null;
-  const n = candles.length;
-  const last = candles[n-1];
-  const closes = candles.map(c=>Number(c.close||0));
-  const highs = candles.map(c=>Number(c.high||c.close||0));
-  const lows = candles.map(c=>Number(c.low||c.close||0));
-  const vols = candles.map(c=>Number(c.volume||c.vol||0));
-  const close = Number(last.close || 0);
-
-  const close5 = n >= 6 ? closes[n-6] : closes[0];
-  const close20 = n >= 21 ? closes[n-21] : closes[0];
-  const mom5 = close5 ? (close - close5) / Math.max(1, close5) : 0;
-  const mom20 = close20 ? (close - close20) / Math.max(1, close20) : 0;
-
-  // slope (linear regress)
-  const len = Math.min(30, n);
-  let num = 0, den = 0, xm = 0, ym = 0;
-  for (let i=0;i<len;i++){ xm += i; ym += closes[n-len+i]; }
-  xm /= len; ym /= len;
-  for (let i=0;i<len;i++){ const x=i; const y=closes[n-len+i]; num += (x-xm)*(y-ym); den += (x-xm)*(x-xm); }
-  const slope = den === 0 ? 0 : num/den;
-
-  // ATR
-  let atr = 0;
-  try {
-    if (indicators.computeATR) atr = indicators.computeATR(candles);
-    else {
-      const trs = [];
-      for (let i=1;i<n;i++){
-        const tr = Math.max(Math.abs(highs[i]-lows[i]), Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1]));
-        trs.push(tr);
-      }
-      const tail = trs.slice(-14);
-      atr = tail.length ? tail.reduce((a,b)=>a+b,0)/tail.length : 0;
-    }
-  } catch(e) { atr = 0; }
-
-  // RSI / MACD
-  let rsi = null, macdHist = null;
-  try { if (indicators.computeRSI) rsi = indicators.computeRSI(candles); if (indicators.computeMACD) macdHist = indicators.computeMACD(candles)?.hist ?? null; } catch(e){}
-
-  const avgVol = avg(vols.slice(-20));
-  const lastVol = vols[n-1] || 0;
-
-  return { close, mom5, mom20, slope, atr, rsi: isFiniteNum(rsi) ? rsi : null, macdHist: isFiniteNum(macdHist) ? macdHist : null, avgVol, lastVol, high: highs[n-1], low: lows[n-1] };
-}
-
-// regime detection (ADX / Bollinger squeeze / ATR vs price)
-function detectRegime(candles) {
-  // lightweight — use ATR/price ratio and RSI dispersion as proxy + optional indicators if available
-  if (!Array.isArray(candles) || candles.length < 20) return "unknown";
-  const feats = buildFeaturesFromCandles(candles);
-  const volRatio = feats.atr / Math.max(1, feats.close);
-  if (volRatio > 0.01) return "volatile";
-  if (volRatio > 0.003) return "trend";
-  // check price movement small -> range
-  const closes = candles.map(c=>c.close);
-  const change = (closes.at(-1) - closes.at(0)) / Math.max(1, Math.abs(closes.at(0)));
-  if (Math.abs(change) < 0.01) return "range";
-  return "trend";
-}
-
-// --------------------------- VOLUME / MICROSTRUCTURE ---------------------------
-function computeVolumeSignals(candles) {
-  // return volume spike, last/avg ratio, CVD-like delta
-  if (!Array.isArray(candles) || candles.length < 6) return { volSpike: 1, volRatio:1, cvd:0 };
-  const vols = candles.map(c=>Number(c.volume||0));
-  const last = vols.at(-1);
-  const avgPast = avg(vols.slice(0, -1)) || 1;
-  const volRatio = last / avgPast;
-  // simplistic CVD: sum((close>open)?vol:-vol)
-  let cvd = 0;
-  for (const c of candles) { cvd += ((c.close > c.open) ? (c.volume||0) : - (c.volume||0)); }
-  return { volSpike: volRatio, volRatio, cvd };
-}
-
-// --------------------------- CANDIDATE TP / HEDGE ENGINE ---------------------------
-function buildCandidateTPsFromElliott(ell, price, atr) {
-  // reuse earlier heuristic but keep small and safe
-  const out = [];
-  if (ell?.targets?.length) {
-    for (const t of ell.targets) {
-      const tp = Number(t.tp ?? t.target ?? t.price ?? 0);
-      if (!isFiniteNum(tp) || tp <= 0) continue;
-      const age = Number(t.ageDays ?? 0);
-      const conf = clamp(Number(t.confidence ?? 50), 0, 100);
-      const adj = conf * (age > 7 ? 0.6 : 1.0);
-      out.push({ tp, source: t.source || t.type || "Elliott", confidence: Math.round(adj) });
-    }
-  }
-  if (!out.length && ell?.fib?.ext) {
-    if (ell.fib.ext["1.272"]) out.push({ tp: Number(ell.fib.ext["1.272"]), source: "FIB_1.272", confidence:40 });
-    if (ell.fib.ext["1.618"]) out.push({ tp: Number(ell.fib.ext["1.618"]), source: "FIB_1.618", confidence:35 });
-  }
-  // ATR fallback
-  if (!out.length) {
-    out.push({ tp: price + (atr || price*0.002)*2, source: "ATR_UP", confidence:30 });
-    out.push({ tp: price - (atr || price*0.002)*2, source: "ATR_DOWN", confidence:30 });
-  }
-  // dedupe keep highest confidence
-  const map = new Map();
-  for (const t of out) {
-    const key = Math.round(t.tp);
-    if (!map.has(key) || (t.confidence || 0) > (map.get(key).confidence || 0)) map.set(key, t);
-  }
-  return Array.from(map.values()).sort((a,b)=>Math.abs(a.tp - price) - Math.abs(b.tp - price));
-}
-
-// risk metrics
-function computeRiskMetrics(price, tp, sl) {
-  if (!isFiniteNum(price) || !isFiniteNum(tp) || !isFiniteNum(sl)) return null;
-  const rr = Math.abs((tp - price) / Math.max(EPS, price - sl));
-  const perc = Math.abs((tp - price) / Math.max(EPS, price)) * 100;
-  return { rr: isFiniteNum(rr) ? rr : null, percMove: isFiniteNum(perc) ? perc : null };
-}
-
-// choose candidate TP with RR sanity and ATR fallback
-function chooseCandidateTP(candidates, dir, price, atr, feats, maxRR=20) {
-  if (!Array.isArray(candidates) || !candidates.length) return null;
-  const baseATR = feats?.atr || atr || price*0.002;
-  const volFactor = clamp((baseATR/price)/0.002, 0.5, 3);
-
-  const dirFilter = dir === "Bullish" ? t => t.tp > price : dir === "Bearish" ? t => t.tp < price : ()=>true;
-  const pool = candidates.filter(dirFilter).length ? candidates.filter(dirFilter) : candidates;
-
-  const scored = pool.map(t => {
-    const dist = Math.abs(t.tp - price);
-    const prox = 1 / (1 + Math.log(1 + dist/Math.max(1, baseATR)));
-    return { ...t, dist, score: (t.confidence||40)*prox*volFactor };
-  }).sort((a,b)=>b.score-a.score);
-
-  for (const cand of scored) {
-    let sl;
-    if (dir === "Bullish") sl = price - baseATR*2;
-    else if (dir === "Bearish") sl = price + baseATR*2;
-    else sl = cand.tp > price ? price - baseATR*1.5 : price + baseATR*1.5;
-
-    const metrics = computeRiskMetrics(price, cand.tp, sl);
-    if (!metrics || !isFiniteNum(metrics.rr) || metrics.rr <= 0 || metrics.rr > maxRR) continue;
-    const minDist = Math.max(baseATR*0.6, price*0.0005);
-    if (cand.dist < minDist) continue;
-    return { tp: Number(cand.tp), source: cand.source, confidence: cand.confidence, suggestedSL: Number(sl.toFixed(8)), rr: metrics.rr, reason:"best_conf_and_rr" };
-  }
-  // fallback
-  const top = scored[0];
-  const fallbackTP = dir === "Bullish" ? price + baseATR*2 : dir === "Bearish" ? price - baseATR*2 : (top ? top.tp : price + baseATR*2);
-  const sl = dir === "Bullish" ? price - baseATR*2 : dir === "Bearish" ? price + baseATR*2 : price - baseATR*2;
-  return { tp: Number(fallbackTP.toFixed(8)), source: "AUTO_ATR", confidence: top?.confidence||40, suggestedSL: Number(sl.toFixed(8)), rr:null, reason:"fallback" };
-}
-
-// hedge logic: returns hedgeTP (opposite-side protective) if required
-function computeHedgeTP(price, dir, atr, opts={mode:"confidence", confThreshold:70}) {
-  // modes: "always", "confidence", "trendOnly"
-  const base = price;
-  const mult = 1.2;
-  if (opts.mode === "always") {
-    if (dir === "Bullish") return price - atr * mult;
-    if (dir === "Bearish") return price + atr * mult;
-  } else if (opts.mode === "confidence") {
-    if ((opts.conf ?? 70) >= opts.confThreshold) {
-      if (dir === "Bullish") return price - atr * mult;
-      if (dir === "Bearish") return price + atr * mult;
-    }
-  } else {
-    // trendOnly fallthrough: same as always for now
-    if (dir === "Bullish") return price - atr * mult;
-    if (dir === "Bearish") return price + atr * mult;
-  }
-  return null;
-}
-
-// --------------------------- ADAPTIVE / SELF-TUNER (Lightweight) ---------------------------
-function selfTuneAdjustments(recentOutcomes = []) {
-  // recentOutcomes: array of { success:bool, regime, prob, rr }
-  // compute winrate and return small weight adjustments
-  if (!Array.isArray(recentOutcomes) || !recentOutcomes.length) return { biasAdj:0, volAdj:1 };
-  const wins = recentOutcomes.filter(r=>r.success).length;
-  const winRate = wins / recentOutcomes.length;
-  // biasAdj: if winRate > 0.6, slightly favor current logic; if <0.4, tighten threshold
-  const biasAdj = (winRate - 0.5) * 0.3; // -0.15..+0.15
-  const volAdj = 1 + (winRate - 0.5) * 0.5; // ~0.75..1.25
-  return { biasAdj, volAdj };
-}
-
-// --------------------------- MULTI-TF FUSION ---------------------------
-async function fetchMultiFeatures(symbol, tfs = ["1m","5m","15m","30m","1h"]) {
-  const mtf = await fetchMultiTF(symbol, tfs);
-  const features = {};
-  for (const tf of tfs) {
-    const entry = mtf[tf] || { data: [], price: 0 };
-    features[tf] = { price: entry.price || entry.data?.at(-1)?.close || 0, feats: buildFeaturesFromCandles(entry.data || []), candles: entry.data || [] };
-  }
-  return features;
-}
-
-// build "consensus" trend score across TFs
-function buildConsensusScore(multiFeatures) {
-  // weight higher TFs more (user-tunable)
-  const weights = { "1m":0.05, "5m":0.1, "15m":0.4, "30m":0.2, "1h":0.25 };
-  let s=0, ws=0;
-  for (const tf in multiFeatures) {
-    const f = multiFeatures[tf].feats;
-    if (!f) continue;
-    const w = weights[tf] ?? 0.1;
-    // score from slope + mom + rsi
-    let sc = 0;
-    sc += clamp((f.slope||0) * 10, -5, 5);
-    sc += clamp((f.mom5||0) * 10, -5, 5);
-    if (isFiniteNum(f.rsi)) sc += (f.rsi - 50) / 10;
-    s += sc * w; ws += w;
-  }
-  return ws ? (s/ws) : 0;
-}
-
-// --------------------------- MAIN ML PREDICTOR (v10 PRO) ---------------------------
-export async function runMLPrediction(symbol = "BTCUSDT", tf = "15m", opts = {}) {
-  // opts: { useMultiTF:true, hedgeMode:"confidence", hedgeConf:70, selfTune:true }
-  try {
-    const cfg = { useMultiTF: true, hedgeMode: "confidence", hedgeConf:70, selfTune:true, ...opts };
-    const tfs = cfg.useMultiTF ? [tf, "1m","5m","30m","1h"] : [tf, "1m"];
-    const mtfRaw = await fetchMultiTF(symbol, tfs);
-
-    const main = mtfRaw[tf] || { data: [], price: 0 };
-    const candles = main.data || [];
-    const price = isFiniteNum(main.price) ? main.price : candles?.at(-1)?.close ?? 0;
-
-    if (!candles?.length || candles.length < 5 || price <= 0) {
-      return { modelVersion:"ml_module_v10_pro", symbol, tf, direction:"Neutral", probs:{bull:33.33,bear:33.33,neutral:33.33}, maxProb:33.33, tpEstimate:null, tpSource:null, tpConfidence:33, slEstimate:null, explanation:"insufficient data" };
-    }
-
-    // multi features
-    const multi = await fetchMultiFeatures(symbol, tfs);
-    const feats = buildFeaturesFromCandles(candles);
-    const microFeats = multi["1m"]?.feats ?? null;
-
-    // regime
-    const regime = detectRegime(candles);
-
-    // volume signals
-    const volSig = computeVolumeSignals(candles);
-
-    // ell
-    let ell = null;
-    try { ell = await analyzeElliott(candles); } catch(e) { ell = null; }
-
-    // consensus
-    const consensus = buildConsensusScore(multi);
-
-    // core scoring: adjustable small weights
-    let bullScore = 0, bearScore = 0;
-    const atr = Math.max(feats.atr || 0, price*0.0005);
-    const volRatio = clamp(atr / price, 0, 0.05);
-
-    const momWeight = clamp(1 + volRatio * 10, 0.7, 3);
-    const slopeWeight = clamp(1 + volRatio * 6, 0.7, 2.5);
-
-    bullScore += clamp(feats.slope * slopeWeight * 12, -12, 12);
-    bearScore -= clamp(feats.slope * slopeWeight * 12, -12, 12);
-    bullScore += clamp(feats.mom5 * momWeight * 10, -12, 12);
-    bearScore -= clamp(feats.mom5 * momWeight * 10, -12, 12);
-
-    if (isFiniteNum(feats.rsi)) { const r=(feats.rsi-50)/50; bullScore += clamp(r * 3.2, -4, 4); bearScore -= clamp(r * 3.2, -4, 4); }
-
-    if (isFiniteNum(feats.macdHist)) { const m = Math.tanh(feats.macdHist/Math.max(1,atr)) * 2; bullScore += clamp(m, -3, 3); bearScore -= clamp(m, -3, 3); }
-
-    if (microFeats) { const mN = microFeats.slope || 0; bullScore += clamp(mN * 6, -2.5, 2.5); bearScore -= clamp(mN * 6, -2.5, 2.5); }
-
-    // volume spike increases magnitude but not direction
-    let volSpike = 0;
-    if (feats.avgVol > 0) {
-      volSpike = feats.lastVol / Math.max(1, feats.avgVol) - 1;
-      const adj = clamp(Math.min(1.5, volSpike), -1.2, 1.2);
-      bullScore += 0.4 * adj;
-      bearScore += 0.4 * adj;
-    }
-
-    // ell weighting (if credible)
-    if (ell && typeof ell.sentiment === "number" && typeof ell.confidence === "number") {
-      const ellSent = clamp(Number(ell.sentiment || 0), -1, 1);
-      const ellConf = clamp(Number(ell.confidence || 0), 0, 100);
-      if (ellConf >= 35) {
-        const scale = ellConf >= 80 ? 1.6 : 1;
-        const ellAdj = ellSent * (0.6 * (ellConf / 100) * scale);
-        bullScore += ellAdj; bearScore -= ellAdj;
-      }
-    }
-
-    // consensus boost
-    bullScore += clamp(consensus, -2, 2);
-    bearScore -= clamp(consensus, -2, 2);
-
-    // Neutral stability logit
-    const neutralityBase = 0.25;
-    const neutralPenalty = clamp(volRatio * 6 + Math.max(0, volSpike) * 0.6, 0, 1.2);
-    const neutralLogit = clamp((neutralityBase - neutralPenalty) * 2, -6, 6);
-
-    // softmax
-    const [pBullRaw, pBearRaw, pNeutralRaw] = softmax3(clamp(bullScore,-12,12), clamp(bearScore,-12,12), neutralLogit);
-    let pBull = boundedPercent(pBullRaw*100), pBear = boundedPercent(pBearRaw*100), pNeutral = boundedPercent(pNeutralRaw*100);
-    const sum = pBull + pBear + pNeutral || 1;
-    pBull = Math.round((pBull/sum)*10000)/100; pBear = Math.round((pBear/sum)*10000)/100; pNeutral = Math.round((pNeutral/sum)*10000)/100;
-    const probs = { bull: pBull, bear: pBear, neutral: pNeutral };
-    const maxProb = Math.max(pBull, pBear, pNeutral);
-    const direction = maxProb === pBull ? "Bullish" : maxProb === pBear ? "Bearish" : "Neutral";
-
-    // candidate TPs & choice
-    const candidates = buildCandidateTPsFromElliott(ell || {}, price, atr);
-    const chosen = chooseCandidateTP(candidates, direction, price, atr, feats, 20);
-    const tpEstimate = chosen?.tp ?? null;
-    const slEstimate = chosen?.suggestedSL ?? null;
-    const tpConfidence = chosen ? Math.round((chosen.confidence||40)*0.65 + maxProb*0.35) : Math.round(maxProb);
-
-    // hedge
-    const hedge = computeHedgeTP(price, direction, atr, { mode: cfg.hedgeMode, conf: Math.round(maxProb), confThreshold: cfg.hedgeConf });
-
-    // explanation
-    const explanation = [
-      `slope:${Number(feats.slope.toFixed(6))}`,
-      `mom5:${(feats.mom5*100).toFixed(2)}%`,
-      isFiniteNum(feats.rsi) ? `rsi:${Number(feats.rsi.toFixed(1))}` : null,
-      ell ? `ell:${ell.sentiment!=null?ell.sentiment:"N/A"}(${ell.confidence||0}%)` : null,
-      `volSpike:${Number((feats.lastVol/Math.max(1,feats.avgVol)-1).toFixed(2))}x`,
-      `atr:${Number(atr.toFixed(8))}`,
-      `regime:${regime}`
-    ].filter(Boolean).join(" | ");
-
-    const mlObj = {
-      modelVersion: "ml_module_v10_pro",
-      symbol, tf, generatedAt: new Date().toISOString(),
-      direction, probs, maxProb, tpEstimate, tpSource: chosen?.source ?? null, tpConfidence, slEstimate, hedgeTP: hedge || null,
-      explanation, rawScores: { bull: bullScore, bear: bearScore, neutralLogit }, ellSummary: ell ? { sentiment: ell.sentiment, confidence: ell.confidence } : null, features: { ...feats, consensus }, regime, volSig
-    };
-
-    // record prediction (non-blocking)
-    try { recordPrediction({ id:`${symbol}_${tf}_${Date.now()}`, symbol, tf, ml: mlObj }); } catch(e){}
-
-    return mlObj;
-  } catch (e) {
-    return { error: String(e), symbol, tf };
-  }
-}
-
-// --------------------------- MICRO PREDICTOR ---------------------------
-export async function runMicroPrediction(symbol="BTCUSDT", tf="1m", opts={}) {
-  try {
-    const mtf = await fetchMultiTF(symbol, [tf]);
-    const candles = mtf[tf]?.data || [];
-    if (candles.length < 3) return { label:"Neutral", prob:33.33, reason: "insufficient micro data" };
-    const feats = buildFeaturesFromCandles(candles);
-    const score = clamp(feats.mom5 * 6 + feats.slope * 5 + ((isFiniteNum(feats.rsi) ? (feats.rsi - 50)/50 : 0)*1.5), -12, 12);
-    const pBull = 100 / (1 + Math.exp(-score));
-    const pBear = 100 - pBull;
-    const pb = boundedPercent(pBull), pa = boundedPercent(pBear);
-    const label = pb > 60 ? "Bullish" : (pa > 60 ? "Bearish" : "Neutral");
-    return { modelVersion: "ml_module_v10_pro-micro", label, prob: Math.max(pb,pa), probBull:pb, probBear:pa, slope: feats.slope };
-  } catch (e) {
-    return { error: String(e), label: "Neutral" };
-  }
-}
-
-// --------------------------- ACCURACY REPORTS ---------------------------
-export function getAccuracyReport() {
+// -------------------- Stats & utilities --------------------
+export function getStats() {
   const acc = calculateAccuracy();
-  const byTF = _stats.byTF || {};
-  const res = { global: acc, stats: _stats, byTF };
-  return res;
+  return { ..._stats, accuracy: acc };
+}
+export function resetStats() {
+  _stats = { total: 0, wins: 0, losses: 0, alerts: [], adaptiveWeights: _stats.adaptiveWeights || null, lastUpdated: null };
+  saveStats();
+  return _stats;
 }
 
-export function getAccuracyByTF(tf) {
-  if (!_stats.byTF || !_stats.byTF[tf]) return { total:0, wins:0, losses:0, accuracy:0 };
-  const o = _stats.byTF[tf];
-  const acc = o.total ? Math.round((o.wins / o.total) * 10000) / 100 : 0;
-  return { ...o, accuracy: acc };
-}
-
-export function getRRStats() {
-  // compute from outcomes file (best-effort)
-  try {
-    const outs = readJsonSafe(OUT_FILE) || [];
-    const rrs = outs.map(o=>o.rr).filter(isFiniteNum);
-    if (!rrs.length) return { avgRR: null, medianRR: null, count:0 };
-    const avgRR = rrs.reduce((a,b)=>a+b,0)/rrs.length;
-    const sorted = rrs.slice().sort((a,b)=>a-b);
-    const mid = Math.floor(sorted.length/2);
-    const median = sorted.length%2 ? sorted[mid] : (sorted[mid-1]+sorted[mid])/2;
-    return { avgRR, medianRR: median, count: rrs.length };
-  } catch (e) { return { avgRR:null, medianRR:null, count:0 }; }
-}
-
-// --------------------------- DEFAULT EXPORT ---------------------------
-export default {
+// -------------------- Default export --------------------
+const defaultExport = {
   runMLPrediction,
   runMicroPrediction,
   calculateAccuracy,
   recordPrediction,
   recordOutcome,
-  getAccuracyReport,
-  getAccuracyByTF,
-  getRRStats,
-  markPredictionOutcome
+  markOutcome,
+  getStats,
+  trainAdaptive,
+  resetStats
 };
+
+export default defaultExport;
