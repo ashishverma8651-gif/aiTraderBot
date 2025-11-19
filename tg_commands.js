@@ -277,7 +277,16 @@ export async function formatAIReport(report = {}) {
       }
     }
 
-    const mlQuote = ellipsis((ml.explanation && typeof ml.explanation === "object") ? `slope:${ml.explanation.features?.slope ?? "N/A"} | mom3:${(ml.explanation.features?.mom3||0).toFixed?.(2)||ml.explanation.features?.mom3 ?? "N/A"} | rsi:${ml.explanation.features?.rsi ?? "N/A"}` : (ml.explanation?.summary || ml.explanation?.reason || ml.explanation || "AI forecast active"), 280);
+    const mlQuote = ellipsis(
+  ml.explanation && typeof ml.explanation === "object"
+    ? `slope:${ml.explanation.features?.slope ?? "N/A"} | ` +
+      `mom3:${((ml.explanation.features?.mom3 ?? 0).toFixed(2))} | ` +
+      `rsi:${ml.explanation.features?.rsi ?? "N/A"}`
+    : (ml.explanation?.summary ||
+       ml.explanation?.reason ||
+       "AI forecast active"),
+  280
+);
 
     const news = report.news || {};
     const newsImpact = news.impact || "Low";
