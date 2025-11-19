@@ -1,25 +1,29 @@
-// tg_commands.js — FINAL (old-style imports, exact UI, no placeholders)
+// tg_commands.js — V11 Ultra integrated (exports same functions)
 // Exports: buildAIReport(symbol, opts), formatAIReport(report), sendSplitReport(report, sendTelegramFunc)
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v8_6.js";     // ✔ EXACT (default export object)
-import News from "./news_social.js";      // ✔ EXACT (default export object)
+import ML from "./ml_module_v8_6.js";     // V11 Ultra inside file named ml_module_v8_6.js
+import News from "./news_social.js";
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
 
-// Extract ML functions from default export
+// Extract ML functions from default export (V11 Ultra provides extra functions)
 const {
   runMLPrediction,
   runMicroPrediction,
   calculateAccuracy,
   recordPrediction,
-  recordOutcome
-} = ML;
+  recordOutcome,
+  markOutcome,
+  getStats,
+  trainAdaptive,
+  resetStats
+} = ML || {};
 
 // Extract News function
-const { fetchNewsBundle } = News;
+const { fetchNewsBundle } = News || { fetchNewsBundle: async () => ({ ok:false, sentiment:0.5, impact:"low", items:[], headline:"No news" }) };
 
 // -------------------- Constants & small helpers --------------------
 const MAX_TG_CHARS = 3800; // safe per Telegram (4096) with margin
@@ -134,7 +138,7 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       blocks.push({ tf, price, candles, indicators: ind, vol, ell, ellSummary, targets, fib });
     }
 
-    // fusion scoring per block
+    // fusion scoring per block (unchanged formula but we will also include ML adaptive weights later)
     const computeFusionScore = (indObj={}, ellObj={}) => {
       let s=0, w=0;
       const rsi = Number(indObj?.RSI ?? 50);
@@ -175,13 +179,17 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     const longs = allTargets.filter(t => t.tp > price).slice(0,4);
     const shorts = allTargets.filter(t => t.tp < price).slice(0,4);
 
-    // ML predictions (prefer 15m)
+    // ML predictions (prefer 15m) — call V11 Ultra runMLPrediction with opts passthrough
     let mlMain = null;
-    try { mlMain = await runMLPrediction(symbol, opts.mlTF || "15m"); } catch (e) { mlMain = null; }
+    try { mlMain = await runMLPrediction(symbol, opts.mlTF || "15m", { useElliott: true }); } catch (e) { mlMain = null; }
     let micro = null;
     try { micro = await runMicroPrediction(symbol, "1m"); } catch (e) { micro = null; }
 
-    // nudge overallFusion using ML & News
+    // Pull adaptive stats from ML (if available)
+    let mlStats = {};
+    try { mlStats = (typeof getStats === "function") ? (await getStats()) : {}; } catch (e) { mlStats = {}; }
+
+    // nudge overallFusion using ML & News (V11 weighting)
     let mlBoost = 0, newsBoost = 0;
     if (mlMain && mlMain.probs) {
       const bprob = Number(mlMain.probs.bull ?? 0);
@@ -196,6 +204,7 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       const mul = impact === "high" ? 1.0 : impact === "moderate" ? 0.6 : 0.25;
       newsBoost = clamp(raw * mul, -1, 1);
     }
+    // V11 fusion nudge
     overallFusion = clamp(overallFusion + (mlBoost * 0.22) + (newsBoost * 0.18), -1, 1);
 
     // default SL suggestions using 15m ATR if present
@@ -204,9 +213,12 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     const defaultSLLong = isNum(price) ? Number((price - atr15 * 2).toFixed(8)) : null;
     const defaultSLShort = isNum(price) ? Number((price + atr15 * 2).toFixed(8)) : null;
 
-    // ml accuracy
+    // ml accuracy (prefer ML's own stats)
     let mlAcc = 0;
-    try { mlAcc = calculateAccuracy()?.accuracy ?? 0; } catch(e) { mlAcc = 0; }
+    try {
+      if (mlStats && mlStats.accuracy != null) mlAcc = mlStats.accuracy;
+      else mlAcc = (typeof calculateAccuracy === "function") ? (calculateAccuracy()?.accuracy ?? 0) : 0;
+    } catch(e) { mlAcc = 0; }
 
     // Compose final report
     const report = {
@@ -228,7 +240,7 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       })(),
       longs, shorts, allTargets,
       ml: mlMain, micro,
-      mlAcc, news,
+      mlAcc, mlStats, news,
       buyProb: Number(((overallFusion + 1) / 2 * 100).toFixed(2)),
       sellProb: Number((100 - ((overallFusion + 1) / 2 * 100)).toFixed(2)),
       defaultSLLong, defaultSLShort
@@ -310,19 +322,23 @@ export async function formatAIReport(report = {}) {
       return nf( ml.probs && ml.probs.max ? ml.probs.max : (ml.maxProb ?? (report.mlProbs?.max ?? 0)), 0 );
     })();
 
-    // ML Targets lines
+    // ML Targets lines (use the V11 outputs where present)
     const mlSellTP = (ml.direction && String(ml.direction).toLowerCase().includes("bear") && isNum(ml.tpEstimate)) ? nf(ml.tpEstimate,2)
-                      : (report.mlShortTP ? nf(report.mlShortTP.tp,2) : (shorts[0] ? nf(shorts[0].tp,2) : "N/A"));
+                      : (report.shorts && report.shorts[0] ? nf(report.shorts[0].tp,2) : "N/A");
     const mlBuyTP = (ml.direction && String(ml.direction).toLowerCase().includes("bull") && isNum(ml.tpEstimate)) ? nf(ml.tpEstimate,2)
-                      : (report.mlLongTP ? nf(report.mlLongTP.tp,2) : (longs[0] ? nf(longs[0].tp,2) : "N/A"));
+                      : (report.longs && report.longs[0] ? nf(report.longs[0].tp,2) : "N/A");
 
-    const mlQuote = ellipsis( (ml.explanation || ml.reason || ml.summary || ml.quote || "AI forecast active"), 280 );
+    const mlQuote = ellipsis( (ml.explanation?.features ? `slope:${nf(ml.explanation.features.slope,6)} | mom3:${(ml.explanation.features.mom3*100||0).toFixed(2)}% | rsi:${nf(ml.explanation.features.rsi,1)}` : (ml.explanation || ml.reason || ml.summary || ml.quote || "AI forecast active")), 280 );
 
     // News
     const news = report.news || {};
     const newsImpact = news.impact || (news.impact === 0 ? "Low" : "Low");
     const newsSentimentPct = (typeof news.sentiment === "number") ? Math.round(news.sentiment * 1000) / 10 : "N/A";
     const headline = (news.items && news.items.length) ? (news.items[0].title || news.items[0].text || news.items[0].link || "—") : (news.headline || "No major events");
+
+    // Compose ML weights summary if available
+    const mlWeights = report.ml?.adaptiveWeights || report.mlStats?.adaptiveWeights || (report.mlStats && report.mlStats.adaptiveWeights) || null;
+    const weightsLine = mlWeights ? `Adaptive weights: ind:${(mlWeights.w_ind*100).toFixed(1)}% cnn:${(mlWeights.w_cnn*100).toFixed(1)}% of:${(mlWeights.w_of*100).toFixed(1)}% news:${(mlWeights.w_news*100).toFixed(1)}%` : "";
 
     // Build UI exactly as requested (no curly braces)
     const partMain = `
@@ -382,7 +398,9 @@ SL (Neutral Invalidation): ${neutralSL}
 
 🤖 MACHINE LEARNING FORECAST (AI TP Guarantee Mode)
 Direction: ${mlDir}  
-ML Confidence: ${mlConf}%
+ML Confidence: ${mlConf}%  
+ML Accuracy: ${report.mlAcc ?? "N/A"}%  
+${weightsLine ? weightsLine + "\n" : ""}
 
 📌 ML Says:  
 “${mlQuote}”
