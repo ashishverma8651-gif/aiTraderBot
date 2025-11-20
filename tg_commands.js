@@ -1,8 +1,8 @@
-// tg_commands.js — final Telegram formatting module (integrated with ml_module_v8_6.js V12 Ultra)
+// tg_commands.js — final Telegram formatting module (integrated with ml_module_v12_precision.js V12 Precision)
 // Exports: buildAIReport, formatAIReport, sendSplitReport
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v8_6.js"; // keeps filename as requested (internal V12 logic)
+import ML from "./ml_module_v8_6.js"; // wired to your precision ML module
 import News from "./news_social.js";
 import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
@@ -326,7 +326,7 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     const defaultSLLong = isNum(price) ? Number((price - atr15 * 2).toFixed(8)) : null;
     const defaultSLShort = isNum(price) ? Number((price + atr15 * 2).toFixed(8)) : null;
 
-    // Compose final report
+// Compose final report
     const report = {
       ok: true,
       symbol,
@@ -410,7 +410,7 @@ export async function formatAIReport(report = {}) {
     const mlPerTF = ml.perTF || [];
     const mlFusion = ml.fusion || {};
     const mlDir = mlFusion.direction || "Neutral";
-    const mlConf = mlFusion.confidence ?? (mlPerTF[0]?.maxProb ?? 0);
+       const mlConf = mlFusion.confidence ?? (mlPerTF[0]?.maxProb ?? 0);
     const mlAccObj = report.mlAcc || 0;
     const mlAcc = (typeof mlAccObj === "object") ? (mlAccObj.accuracy ?? 0) : (isNum(mlAccObj) ? mlAccObj : 0);
     const aw = ml.perTF && ml.perTF[0] && ml.perTF[0].adaptiveWeights ? ml.perTF[0].adaptiveWeights : (mlPerTF[0]?.adaptiveWeights || { w_ind:0.45, w_cnn:0.25, w_of:0.2, w_news:0.1 });
