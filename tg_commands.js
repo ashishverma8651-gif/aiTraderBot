@@ -1,11 +1,11 @@
-// tg_commands.js — Telegram formatting module (integrated with ml_module_v12_precision_pro.js V12 Precision Pro)
+// tg_commands.js — Telegram formatting module (integrated with ml_module_v8_6.js V12 Precision Pro)
 // Exports: buildAIReport, formatAIReport, sendSplitReport
 //
 // This file is the full integrated version you requested. It imports the ML v12 precision pro module
 // and uses its prediction + pro-meter exports. Keep imports paths as in your repo.
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v12_precision_pro.js"; // <- integrated ML v12 precision pro
+import ML from "./ml_module_v8_6.js"; // <- integrated ML v12 precision pro
 import News from "./news_social.js";
 import { fetchMultiTF } from "./utils.js";
 import * as indicators from "./core_indicators.js";
