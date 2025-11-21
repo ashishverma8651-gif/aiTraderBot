@@ -2,7 +2,7 @@
 // Exports: buildAIReport(symbol, opts), formatAIReport(report), sendSplitReport(report, sendTelegramFunc)
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v13_pro.js";     // ✔ UPDATED to v13 Ultra-Dynamic Precision Pro
+import ML from "./ml_module_v8_6.js";     // ✔ UPDATED to v13 Ultra-Dynamic Precision Pro
 import News from "./news_social.js";      // ✔ EXACT (default export object)
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
