@@ -2,7 +2,7 @@
 
 // ------------------- Imports -------------------
 import CONFIG from "./config.js";
-import ML from "./ml_module_v13.js";      // <<<<<< ML v13 Ultra Precision (default export expected)
+import ML from "./ml_module_v8_6.js";      // <<<<<< ML v13 Ultra Precision (default export expected)
 import News from "./news_social.js";
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
