@@ -5,7 +5,7 @@ import CONFIG from "./config.js";
 
 // ----- IMPORTANT: use your ML v13 module file name here -----
 // I used "./ml_module_v13_pro.js" — replace if your file name differs.
-import ML from "./ml_module_v13_pro.js";     // ✔ EXACT (default export object for ML v13)
+import ML from "./ml_module_v8_6.js";     // ✔ EXACT (default export object for ML v13)
 import News from "./news_social.js";         // ✔ EXACT (default export object)
 
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
