@@ -506,7 +506,26 @@ ML quick summary:
 “AI forecast active”
 
 ML per-TF snapshot:
-${(mlPerTF.length ? mlPerTF.map(m => `${m.tf}: ${m.direction||m.label||"N"} | TP:${isNum(m.tpEstimate)?nf(m.tpEstimate,2):(isNum(m.tp)?nf(m.tp,2):"N/A")} | maxProb:${nf(m.maxProb ?? (m.probs && (m.probs.bull || m.probs.bear) ) || 0,0)}`).join("\n") : "No ML outputs")}
+${(
+  mlPerTF.length
+    ? mlPerTF.map(m => {
+        const tpVal = isNum(m.tpEstimate)
+          ? nf(m.tpEstimate, 2)
+          : (isNum(m.tp) ? nf(m.tp, 2) : "N/A");
+
+        const rawProb =
+          isNum(m.maxProb)
+            ? m.maxProb
+            : (m.probs && (m.probs.bull || m.probs.bear))
+              ? (m.probs.bull || m.probs.bear)
+              : 0;
+
+        const maxProb = nf(rawProb, 0);
+
+        return `${m.tf}: ${m.direction || m.label || "N"} | TP:${tpVal} | maxProb:${maxProb}`;
+      }).join("\n")
+    : "No ML outputs"
+)}
 ━━━━━━━━━━━━━━━━━━
 
 📰 NEWS IMPACT
