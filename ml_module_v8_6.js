@@ -615,7 +615,28 @@ export function fuseMLTFs(mlListInput = []) {
     if(String(dir).toLowerCase().includes("bull")) bullScore += (maxProb/100) * w;
     else if(String(dir).toLowerCase().includes("bear")) bearScore += (maxProb/100) * w;
     else neutralScore += (maxProb/100) * w;
-    tps.push({ tf: m.tf, tp: Number(m.tpEstimate ?? m.tpEstimate ?? m.tp ?? m.tpEstimate ?? m.tpEstimate ?? m.tpEstimate || m.tp || m.tpEstimate || m.tp || 0), hedge: Number(m.hedgeTP ?? m.hedge ?? m.hedgeTP ?? 0), tpConfidence: Number(m.tpConfidence ?? m.confidence ?? maxProb), maxProb });
+
+    tps.push({
+  tf: m.tf,
+  tp: Number(
+    m.tpEstimate ??
+    m.tp ??
+    0
+  ),
+  hedge: Number(
+    m.hedgeTP ??
+    m.hedge ??
+    0
+  ),
+  maxProb: Number(
+    m.tpConfidence ??
+    m.confidence ??
+    maxProb ??
+    0
+  )
+});
+
+
   }
   const finalDir = (bullScore > bearScore && bullScore > neutralScore) ? "Bullish" : (bearScore > bullScore && bearScore > neutralScore) ? "Bearish" : "Neutral";
   let wSum=0,tpSum=0,hedgeSum=0,confSum=0;
