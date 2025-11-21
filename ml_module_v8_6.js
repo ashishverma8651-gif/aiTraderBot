@@ -602,7 +602,15 @@ export function fuseMLTFs(mlListInput = []) {
   const tps = [];
   for(const m of available){
     const w = WEIGHTS[m.tf] ?? 0.2;
-    const maxProb = Number(m.tpConfidence ?? m.confidence ?? (m.probs && (m.probs.bull||m.probs.bear) ) || 0);
+
+
+    const maxProb = Number(
+  m.tpConfidence ??
+  m.confidence ??
+  ((m.probs && (m.probs.bull || m.probs.bear)) || 0)
+);
+
+
     const dir = (m.direction || m.label || "Neutral");
     if(String(dir).toLowerCase().includes("bull")) bullScore += (maxProb/100) * w;
     else if(String(dir).toLowerCase().includes("bear")) bearScore += (maxProb/100) * w;
