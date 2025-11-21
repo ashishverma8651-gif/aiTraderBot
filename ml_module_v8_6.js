@@ -723,6 +723,161 @@ export async function buildAIReport(symbol = "BTCUSDT", opts = {}) {
   }
 }
 
+// =============================================
+// ADAPTIVE TRAINING ENGINE (v15)
+// =============================================
+
+
+const STATS_PATH = path.resolve("./ml_logs/ml_stats.json");
+const PRED_LOG = path.resolve("./ml_logs/predictions.json");
+
+// Ensure persistence folder exists
+function ensureMLFolder() {
+  const dir = path.resolve("./ml_logs");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+ensureMLFolder();
+
+// Safe read JSON
+function readJSON(file, fallback = {}) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file));
+  } catch (_) {
+    return fallback;
+  }
+}
+
+// Safe write JSON
+function writeJSON(file, data) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (_) {}
+}
+
+// =============================================
+// trainAdaptive — learns from previous outcomes
+// =============================================
+function trainAdaptive() {
+  ensureMLFolder();
+
+  const stats = readJSON(STATS_PATH, {
+    total: 0,
+    win: 0,
+    loss: 0,
+    buyBias: 0.5,
+    sellBias: 0.5,
+    confidenceShift: 0,
+  });
+
+  const preds = readJSON(PRED_LOG, []);
+
+  if (!preds.length) {
+    return {
+      status: "no-data",
+      msg: "No prediction history available for adaptive training."
+    };
+  }
+
+  let recent = preds.slice(-40); // last 40 predictions only
+  let wins = recent.filter(p => p.outcome === "win").length;
+  let losses = recent.filter(p => p.outcome === "loss").length;
+
+  let newBuyBias = stats.buyBias;
+  let newSellBias = stats.sellBias;
+
+  // Adjust bias based on win/loss distribution
+  if (wins + losses > 0) {
+    let winRate = wins / (wins + losses);
+
+    // If win rate good → strengthen direction weight
+    if (winRate > 0.60) {
+      newBuyBias = Math.min(1, newBuyBias + 0.02);
+      newSellBias = Math.max(0, newSellBias - 0.02);
+    }
+
+    // If win rate bad → soften direction weight
+    if (winRate < 0.40) {
+      newBuyBias = Math.max(0, newBuyBias - 0.02);
+      newSellBias = Math.min(1, newSellBias + 0.02);
+    }
+  }
+
+  // Confidence adjustment based on streaks
+  let streak = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    streak += recent[i].outcome === "win" ? 1 : -1;
+  }
+
+  let confidenceShift = stats.confidenceShift;
+  if (streak > 5) confidenceShift += 0.03;
+  if (streak < -5) confidenceShift -= 0.03;
+
+  confidenceShift = Math.max(-0.15, Math.max(confidenceShift, -0.2));
+  confidenceShift = Math.min(0.15, Math.min(confidenceShift, 0.2));
+
+  const updatedStats = {
+    ...stats,
+    buyBias: parseFloat(newBuyBias.toFixed(4)),
+    sellBias: parseFloat(newSellBias.toFixed(4)),
+    confidenceShift: parseFloat(confidenceShift.toFixed(4))
+  };
+
+  writeJSON(STATS_PATH, updatedStats);
+
+  return {
+    status: "trained",
+    updated: updatedStats,
+    msg: "Adaptive ML training updated successfully."
+  };
+}
+
+// =============================================
+// markOutcome — required dependency
+// =============================================
+function markOutcome(id, outcome) {
+  ensureMLFolder();
+
+  let preds = readJSON(PRED_LOG, []);
+  let item = preds.find(p => p.id === id);
+  if (!item) return;
+
+  item.outcome = outcome;
+  writeJSON(PRED_LOG, preds);
+}
+
+// =============================================
+// getStats — required dependency
+// =============================================
+function getStats() {
+  ensureMLFolder();
+  return readJSON(STATS_PATH, {
+    total: 0,
+    win: 0,
+    loss: 0,
+    buyBias: 0.5,
+    sellBias: 0.5,
+    confidenceShift: 0
+  });
+}
+
+// =============================================
+// resetStats — reset adaptive engine
+// =============================================
+function resetStats() {
+  writeJSON(STATS_PATH, {
+    total: 0,
+    win: 0,
+    loss: 0,
+    buyBias: 0.5,
+    sellBias: 0.5,
+    confidenceShift: 0,
+  });
+
+  return { status: "reset", msg: "ML stats reset." };
+}
+
+
 // ----------------- default export (v15) -----------------
 const defaultExport = {
   runMLPrediction, runMicroPrediction, calculateAccuracy, recordPrediction, recordOutcome,
