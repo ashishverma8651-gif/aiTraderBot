@@ -353,7 +353,17 @@ export async function formatAIReport(report = {}) {
     const reboundTxt = pro.rebound ? (`${pro.rebound.reboundProb}%`) : "N/A";
     const exhaustionTxt = pro.exhaustion ? (`${pro.exhaustion.exhaustionPct}%`) : "N/A";
     const volCrushTxt = pro.volCrush ? (`${pro.volCrush.volCrush}%`) : "N/A";
-    const pressureTxt = pro.pressure ? (JSON.stringify(pro.pressure)) : "N/A";
+
+
+    const pressureTxt = pro.pressure ? `
+• Sell Pressure: ${pro.pressure.sellPressurePct}%
+• Buy Ratio (1m): ${pro.pressure.buyRatio1}
+• Buy Ratio (5m): ${pro.pressure.buyRatio5}
+• CVD Score: ${pro.pressure.cvdScore}
+• EMA Bear Align: ${pro.pressure.emaAlignBear}
+• OB Pressure: ${pro.pressure.obPressure}
+` : "N/A";
+
 
     const partMain = `
 🔥 ${symbol} — AI Market Intelligence
