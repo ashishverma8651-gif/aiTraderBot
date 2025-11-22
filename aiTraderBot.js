@@ -1,4 +1,4 @@
-// aiTraderBot.js — FINAL STABLE + PANEL UI + PATCHED VERSION
+// aiTraderBot.js — FULLY PATCHED + COMMANDS FIXED
 
 import fs from "fs";
 import path from "path";
@@ -11,13 +11,12 @@ import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
-// MULTI-MARKET PANEL UI
+// MULTI-MARKET PANEL UI (KEYBOARD + CALLBACK)
 import { handleCallback, kbHome } from "./merge_signals.js";
 
-
-// ======================================================
-// SINGLE INSTANCE LOCK
-// ======================================================
+/* ======================================================
+   SINGLE INSTANCE LOCK
+====================================================== */
 const LOCK_FILE = path.resolve(process.cwd(), ".aitraderbot.lock");
 
 function alreadyRunning() {
@@ -40,90 +39,95 @@ try { fs.writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
 global.__aiTrader_running = true;
 
 
-
-// ======================================================
-// START TELEGRAM BOT (Added Here ✔️)
-// ======================================================
+/* ======================================================
+   START TELEGRAM BOT
+====================================================== */
 const bot = new Telegraf(CONFIG.TELEGRAM.BOT_TOKEN);
 
-// Home Panel
+/* -------------------------
+    COMMANDS FIXED HERE
+-------------------------- */
+
+// Start Command
+bot.start(async (ctx) => {
+  await ctx.reply("👋 Welcome! Use the Menu Below:", kbHome);
+});
+
+// Home Command
+bot.command("home", async (ctx) => {
+  await ctx.reply("🏠 HOME PANEL", kbHome);
+});
+
+// Panel Command
 bot.command("panel", async (ctx) => {
   await ctx.reply("🏠 HOME PANEL", kbHome);
 });
 
-// Button callback
+// Manual Symbol Commands
+bot.command("eth", async (ctx) => {
+  const rpt = await buildAIReport("ETHUSDT");
+  const final = await formatAIReport(rpt);
+  await ctx.reply(final);
+});
+
+bot.command("nifty50", async (ctx) => {
+  const rpt = await buildAIReport("NIFTY50");
+  const final = await formatAIReport(rpt);
+  await ctx.reply(final);
+});
+
+/* -------------------------
+    CALLBACK BUTTON HANDLER
+-------------------------- */
 bot.on("callback_query", async (ctx) => {
-  const q = ctx.callbackQuery;
-  const res = await handleCallback(q);
-  await ctx.editMessageText(res.text, res.keyboard);
+  try {
+    const q = ctx.callbackQuery;
+    const res = await handleCallback(q);
+    await ctx.editMessageText(res.text, res.keyboard);
+    await ctx.answerCbQuery(); // VERY IMPORTANT: avoids button freeze
+  } catch (e) {
+    console.log("Callback Error:", e.message);
+  }
 });
 
 bot.launch();
-console.log("🤖 Telegram Bot Running");
+console.log("🤖 Telegram Bot Running...");
 
 
-
-// ======================================================
-// SIMPLE SERVER
-// ======================================================
+/* ======================================================
+   SIMPLE SERVER
+====================================================== */
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
 app.get("/", (req, res) => res.send("AI Trader Running ✔"));
 app.get("/ping", (req, res) => res.send("pong"));
-
 app.listen(PORT, () => console.log("🚀 Server live on", PORT));
 
 
-
-// ======================================================
-// HELPERS
-// ======================================================
-function nowIST() {
-  return new Date().toLocaleString("en-IN", { hour12: true, timeZone: "Asia/Kolkata" });
-}
-
-
-
-// ======================================================
-// TELEGRAM SENDER (SAFE)
-// ======================================================
+/* ======================================================
+   TELEGRAM SENDER (SAFE)
+====================================================== */
 export async function sendTelegram(text) {
   try {
-    if (!CONFIG.TELEGRAM.BOT_TOKEN || !CONFIG.TELEGRAM.CHAT_ID) {
-      console.log("⚠️ Missing Telegram credentials");
-      return false;
-    }
-
     const clean = String(text || "").trim();
-    if (!clean || clean.length < 2) {
-      console.log("⚠️ Telegram send skipped: empty message");
-      return false;
-    }
+    if (!clean) return;
 
-    const r = await axios.post(
-      `https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: CONFIG.TELEGRAM.CHAT_ID,
-        text: clean,
-        parse_mode: "HTML",
-        disable_web_page_preview: true
-      }
+    await bot.telegram.sendMessage(
+      CONFIG.TELEGRAM.CHAT_ID,
+      clean,
+      { parse_mode: "HTML", disable_web_page_preview: true }
     );
-
-    return r.data.ok;
 
   } catch (e) {
     console.log("Telegram error:", e.message);
-    return false;
   }
 }
 
 
-
-// ======================================================
-// Market Data Context
-// ======================================================
+/* ======================================================
+   MARKET DATA CONTEXT
+====================================================== */
 export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
@@ -134,65 +138,28 @@ export async function getDataContext(symbol = CONFIG.SYMBOL) {
 }
 
 
-
-// ======================================================
-// AUTO REPORT (FULLY PATCHED — 0% CRASH)
-// ======================================================
+/* ======================================================
+   AUTO REPORT (WORKING)
+====================================================== */
 let autoTimer = null;
 let autoRunning = false;
 
 async function doAutoReport() {
-  if (autoRunning) {
-    console.log(nowIST(), "⏳ Auto-report skipped (already running)");
-    return;
-  }
-
+  if (autoRunning) return;
   autoRunning = true;
-  console.log(nowIST(), "⏳ Auto-report triggered");
 
   try {
     const raw = await buildAIReport(CONFIG.SYMBOL);
+    const parts = await formatAIReport(raw);
+    const arr = Array.isArray(parts) ? parts : [parts];
 
-    if (!raw) {
-      console.log("❌ buildAIReport returned NULL");
-      await sendTelegram("⚠️ AutoReport failed: buildAIReport empty");
-      autoRunning = false;
-      return;
-    }
-
-    let parts;
-    try {
-      parts = await formatAIReport(raw);
-    } catch (err) {
-      console.log("❌ formatAIReport failed:", err.message);
-      await sendTelegram("⚠️ formatAIReport crashed:\n" + err.message);
-      autoRunning = false;
-      return;
-    }
-
-    if (typeof parts === "string") {
-      parts = [parts];
-    }
-
-    if (!Array.isArray(parts) || parts.length === 0) {
-      console.log("❌ formatAIReport returned empty");
-      await sendTelegram("⚠️ AutoReport empty output");
-      autoRunning = false;
-      return;
-    }
-
-    for (const p of parts) {
-      const msg = String(p || "");
-      if (msg.length < 2) continue;
-      await sendTelegram(msg);
+    for (const block of arr) {
+      await sendTelegram(block);
       await new Promise(r => setTimeout(r, 500));
     }
 
-    console.log(nowIST(), "📤 Auto-report sent ✔");
-
   } catch (e) {
-    console.log("❌ AutoReport main error:", e.message);
-    await sendTelegram("⚠️ AutoReport crashed:\n" + e.message);
+    sendTelegram("⚠ AutoReport Error:\n" + e.message);
   }
 
   autoRunning = false;
@@ -200,61 +167,16 @@ async function doAutoReport() {
 
 function startAuto() {
   const ms = 15 * 60 * 1000;
-
   setTimeout(doAutoReport, 3000);
   autoTimer = setInterval(doAutoReport, ms);
-
-  console.log("⏱ AutoReport scheduled every 15m");
 }
 
 startAuto();
 
 
-
-// ======================================================
-// PUBLIC URL Auto-detect
-// ======================================================
-function detectPublicURL() {
-  return (process.env.RENDER_EXTERNAL_URL ||
-          process.env.RENDER_URL ||
-          process.env.WEBSITE_URL ||
-          "").replace(/\/+$/, "");
-}
-
-const PUBLIC_URL = detectPublicURL();
-
-
-
-// ======================================================
-// KEEPALIVE (NO-SLEEP)
-// ======================================================
-console.log("🔧 KeepAlive system enabled");
-
-setInterval(async () => {
-  if (PUBLIC_URL) {
-    try {
-      await axios.get(PUBLIC_URL + "/ping", { timeout: 6000 });
-      console.log("💓 KeepAlive Public OK");
-      return;
-    } catch {
-      console.log("⚠️ Public KeepAlive failed");
-    }
-  }
-
-  try {
-    await axios.get("http://localhost:10000/ping", { timeout: 4000 });
-    console.log("💓 Localhost KeepAlive OK");
-  } catch (e) {
-    console.log("⚠️ Localhost KeepAlive failed");
-  }
-
-}, 3 * 60 * 1000);
-
-
-
-// ======================================================
-// REVERSAL WATCHER START
-// ======================================================
+/* ======================================================
+   REVERSAL WATCHER
+====================================================== */
 startReversalWatcher(
   CONFIG.SYMBOL,
   {
@@ -270,27 +192,20 @@ startReversalWatcher(
   }
 );
 
-console.log("⚡ Reversal Watcher ACTIVE");
 
-
-
-// ======================================================
-// CLEAN EXIT
-// ======================================================
+/* ======================================================
+   CLEAN EXIT
+====================================================== */
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 async function shutdown() {
-  console.log("🛑 Shutting down...");
   try {
     if (autoTimer) clearInterval(autoTimer);
-    try { await stopReversalWatcher(); } catch {}
+    await stopReversalWatcher();
     if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
   } catch {}
   process.exit(0);
 }
 
-export default {
-  getDataContext,
-  doAutoReport
-};
+export default { getDataContext, doAutoReport };
