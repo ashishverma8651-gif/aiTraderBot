@@ -10,6 +10,8 @@ import { fetchMarketData } from "./utils.js";
 import { buildAIReport, formatAIReport } from "./tg_commands.js";
 import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js";
 
+// MULTI-MARKET PANEL UI
+import { handleCallback, kbHome } from "./merge_signals.js";
 // ======================================================
 // SINGLE INSTANCE LOCK
 // ======================================================
