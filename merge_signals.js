@@ -191,25 +191,84 @@ export async function generateReport(symbol, tf = "15m") {
 export async function handleCallback(query) {
   const data = query.data;
 
-  if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
+  // 🏠 HOME PAGE
+  if (data === "back_home")
+    return { text: "🏠 HOME", keyboard: kbHome };
+
+  // MAIN MENUS
+  if (data === "menu_crypto")
+    return { text: "💠 Crypto Market", keyboard: kbCrypto };
+
+  if (data === "menu_indices")
+    return { text: "📘 Indices Market", keyboard: kbIndices };
+
+  if (data === "menu_forex")
+    return { text: "💱 Forex Market", keyboard: kbForex };
+
+  if (data === "menu_commodities")
+    return { text: "🛢 Commodities Market", keyboard: kbCommodity };
+
+
+  // BACK FROM SUBMENU
+  if (data === "back_assets")
+    return { text: "Choose Market", keyboard: kbHome };
+
+
+  // ASSET SELECTED
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol, "15m");
   }
 
+  // TIMEFRAMES MENU
+  if (data.startsWith("tfs_")) {
+    const symbol = data.replace("tfs_", "");
+    return {
+      text: `🕒 Timeframes for <b>${symbol}</b>`,
+      keyboard: kbTimeframes(symbol)
+    };
+  }
+
+  // TIMEFRAME SELECTED
+  if (data.startsWith("tf_")) {
+    const parts = data.split("_");
+    const symbol = parts[1];
+    const tf = parts[2];
+    return await generateReport(symbol, tf);
+  }
+
+  // REFRESH
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
     return await generateReport(symbol, "15m");
   }
 
-  if (data.startsWith("tf_")) {
-    const parts = data.split("_");
-    return await generateReport(parts[1], parts[2]);
+  // NEWS
+  if (data.startsWith("news_")) {
+    const symbol = data.replace("news_", "");
+    const news = await fetchNewsBundle(symbol);
+    return {
+      text: `📰 <b>News Report</b>\nImpact: ${news.impact}\nSentiment: ${news.sentiment}%`,
+      keyboard: kbActions(symbol)
+    };
   }
 
-  return { text: "❌ Unknown command", keyboard: kbHome };
-}
+  // ELLIOTT
+  if (data.startsWith("ell_")) {
+    const symbol = data.replace("ell_", "");
+    const ell = await analyzeElliott([]);
+    return {
+      text: `📊 <b>Elliott Waves</b>\nPattern: ${ell.pattern}\nConfidence: ${ell.confidence}%`,
+      keyboard: kbActions(symbol)
+    };
+  }
 
+  // FALLBACK
+  return {
+    text: "❌ Unknown command",
+    keyboard: kbHome
+  };
+}
 
 // ===============================
 // ACTION BUTTONS MENU
