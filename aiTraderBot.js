@@ -1,4 +1,4 @@
-// aiTraderBot.js — FINAL STABLE + PANEL UI + RENDER FIX + AUTOREPORT FIX
+// aiTraderBot.js — FINAL STABLE WITH FIXES
 
 import fs from "fs";
 import path from "path";
@@ -13,9 +13,9 @@ import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js
 import { handleCallback, kbHome } from "./merge_signals.js";
 
 
-// ======================================================
-// SINGLE INSTANCE LOCK
-// ======================================================
+// ===================================================================
+// 🔐 SINGLE INSTANCE LOCK
+// ===================================================================
 const LOCK_FILE = path.resolve(process.cwd(), ".aitraderbot.lock");
 
 function alreadyRunning() {
@@ -36,27 +36,83 @@ try { fs.writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
 global.__aiTrader_running = true;
 
 
-// ======================================================
-// TELEGRAM BOT — FIXED (NO POLLING CONFLICT)
-// ======================================================
+
+// ===================================================================
+// 👍 TELEGRAM BOT INIT
+// ===================================================================
 const bot = new Telegraf(CONFIG.TELEGRAM.BOT_TOKEN);
 
-// Commands
-bot.command("start", (ctx) => ctx.reply("Welcome! Use /panel to open signals panel.", kbHome));
-bot.command("panel", (ctx) => ctx.reply("🏠 HOME PANEL", kbHome));
 
-// Callback buttons
+
+// ===================================================================
+// ⭐ SAFE EDIT FIX (MAIN CRASH FIX)
+// ===================================================================
+async function safeEdit(ctx, text, keyboard) {
+  try {
+    return await ctx.editMessageText(text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: keyboard?.reply_markup || keyboard || undefined
+    });
+
+  } catch (err) {
+    const msg = String(err.message);
+    if (msg.includes("message is not modified")) {
+      console.log("⚠ SafeEdit skipped duplicate update.");
+      return;
+    }
+
+    try {
+      await ctx.reply(text, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: keyboard?.reply_markup || keyboard || undefined
+      });
+    } catch {}
+  }
+}
+
+
+
+// ===================================================================
+// TELEGRAM COMMANDS
+// ===================================================================
+bot.command("start", (ctx) =>
+  ctx.reply("Welcome! Use /panel to open signals panel.", kbHome)
+);
+
+bot.command("panel", (ctx) =>
+  ctx.reply("🏠 HOME PANEL", kbHome)
+);
+
+
+
+// ===================================================================
+// CALLBACK HANDLER (FIXED)
+// ===================================================================
 bot.on("callback_query", async (ctx) => {
-  const res = await handleCallback(ctx.callbackQuery);
-  await ctx.editMessageText(res.text, res.keyboard);
+  try {
+    const res = await handleCallback(ctx.callbackQuery);
+
+    if (!res || !res.text) {
+      return safeEdit(ctx, "❌ Unknown command", kbHome);
+    }
+
+    await safeEdit(ctx, res.text, res.keyboard);
+
+  } catch (err) {
+    console.log("Callback error:", err.message);
+    await safeEdit(ctx, "⚠ Error processing request.", kbHome);
+  }
 });
 
-// RENDER FIX — avoid double polling
+
+
+// ===================================================================
+// RENDER-SAFE BOT LAUNCH
+// ===================================================================
 bot.launch({
-  polling: {
-    interval: 300,
-    timeout: 50,
-  }
+  polling: { interval: 300, timeout: 50 }
 });
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
@@ -65,9 +121,10 @@ process.once("SIGTERM", () => bot.stop("SIGTERM"));
 console.log("🤖 Telegram Bot Running (Render-safe polling)");
 
 
-// ======================================================
+
+// ===================================================================
 // EXPRESS SERVER
-// ======================================================
+// ===================================================================
 const app = express();
 const PORT = process.env.PORT || CONFIG.PORT || 10000;
 
@@ -77,17 +134,22 @@ app.get("/ping", (req, res) => res.send("pong"));
 app.listen(PORT, () => console.log("🚀 Server live on", PORT));
 
 
-// ======================================================
+
+// ===================================================================
 // HELPERS
-// ======================================================
+// ===================================================================
 function nowIST() {
-  return new Date().toLocaleString("en-IN", { hour12: true, timeZone: "Asia/Kolkata" });
+  return new Date().toLocaleString("en-IN", {
+    hour12: true,
+    timeZone: "Asia/Kolkata"
+  });
 }
 
 
-// ======================================================
-// TELEGRAM SAFE SEND
-// ======================================================
+
+// ===================================================================
+// SEND TELEGRAM MESSAGE
+// ===================================================================
 export async function sendTelegram(text) {
   try {
     const clean = String(text || "").trim();
@@ -111,9 +173,10 @@ export async function sendTelegram(text) {
 }
 
 
-// ======================================================
-// DATA CONTEXT
-// ======================================================
+
+// ===================================================================
+// DATA CONTEXT (used by ML & MultiTF Panel)
+// ===================================================================
 export async function getDataContext(symbol = CONFIG.SYMBOL) {
   try {
     const m15 = await fetchMarketData(symbol, "15m", CONFIG.DEFAULT_LIMIT);
@@ -124,9 +187,10 @@ export async function getDataContext(symbol = CONFIG.SYMBOL) {
 }
 
 
-// ======================================================
-// AUTO 15 MINUTE REPORT (BTC/ETH)
-// ======================================================
+
+// ===================================================================
+// AUTO 15 MINUTE REPORT
+// ===================================================================
 let autoTimer = null;
 let autoRunning = false;
 
@@ -139,7 +203,7 @@ async function doAutoReport() {
   try {
     const raw = await buildAIReport(CONFIG.SYMBOL);
     if (!raw) {
-      await sendTelegram("⚠ AutoReport failed: buildAIReport empty");
+      await sendTelegram("⚠ AutoReport failed: empty report");
       autoRunning = false;
       return;
     }
@@ -174,21 +238,26 @@ function startAuto() {
 startAuto();
 
 
-// ======================================================
-// PUBLIC URL
-// ======================================================
+
+// ===================================================================
+// PUBLIC URL DETECTOR
+// ===================================================================
 function detectPublicURL() {
-  return (process.env.RENDER_EXTERNAL_URL ||
-          process.env.RENDER_URL ||
-          process.env.WEBSITE_URL ||
-          "").replace(/\/+$/, "");
+  return (
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.RENDER_URL ||
+    process.env.WEBSITE_URL ||
+    ""
+  ).replace(/\/+$/, "");
 }
+
 const PUBLIC_URL = detectPublicURL();
 
 
-// ======================================================
-// KEEPALIVE
-// ======================================================
+
+// ===================================================================
+// KEEPALIVE PING
+// ===================================================================
 console.log("🔧 KeepAlive enabled");
 
 setInterval(async () => {
@@ -201,9 +270,10 @@ setInterval(async () => {
 }, 3 * 60 * 1000);
 
 
-// ======================================================
+
+// ===================================================================
 // REVERSAL WATCHER
-// ======================================================
+// ===================================================================
 startReversalWatcher(
   CONFIG.SYMBOL,
   {
@@ -222,9 +292,10 @@ startReversalWatcher(
 console.log("⚡ Reversal Watcher ACTIVE");
 
 
-// ======================================================
+
+// ===================================================================
 // CLEAN EXIT
-// ======================================================
+// ===================================================================
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
@@ -237,7 +308,6 @@ async function shutdown() {
   } catch {}
   process.exit(0);
 }
-
 
 export default {
   getDataContext,
