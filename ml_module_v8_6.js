@@ -1361,7 +1361,7 @@ export function computeBacktestMetrics(outcomes = []) {
 }
 
 /* ---------- Aggregator / Finalizer used by Part4's reportV2 ---------- */
-export function aggregateAndScoreTPs(allCandidates = [], price = 0, feats = {}, opts = {}) {
+
   // Simple clustering and scoring:
   // - cluster by rounding
   // - score = confidence * distanceScore * tfWeight * proximityBoost * ellBoost
