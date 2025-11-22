@@ -1734,7 +1734,7 @@ export {
   registerExternalFetcher,
   enableStreamingMode,
   trimLogs,
-  writePackageREADME,
+ 
  
  
 };
