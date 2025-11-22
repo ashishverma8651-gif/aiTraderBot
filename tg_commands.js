@@ -9,7 +9,7 @@ import {
   runMicroPrediction,
   buildStableTargets,
   fuseMLTFs
-} from "./ml_module_v15.js";
+} from "./ml_module_v8_6.js";
 
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
