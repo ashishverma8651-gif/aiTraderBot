@@ -1387,30 +1387,10 @@ export function aggregateAndScoreTPs(allCandidates = [], price = 0, feats = {}, 
   } catch(e) { return []; }
 }
 
-export function finalizePrimaryHedgeFromScored(scored = [], direction = "Neutral", price = 0, feats = {}, config = {}) {
-  try {
-    const MIN_DIST_MULT = config.MIN_TP_DISTANCE_ATR_MULT || 1.2;
-    const atr = Math.max((feats && feats.atr) ? feats.atr : Math.abs(price) * 0.001, 1);
-    const minDist = (config.MIN_TP_DISTANCE || (atr * MIN_DIST_MULT));
-    const pool = scored.filter(s => Math.abs(s.tp - price) >= minDist);
-    const chosen = pool.length ? pool[0] : (scored[0] || null);
-    if (!chosen) {
-      // fallback ATR-based
-      const primary = direction === "Bullish" ? price + atr * 2.5 : direction === "Bearish" ? price - atr * 2.5 : price + atr * 2.5;
-      const hedge = direction === "Bullish" ? price - atr * 1.2 : direction === "Bearish" ? price + atr * 1.2 : price - atr * 1.2;
-      return { primary: Number(primary), hedge: Number(hedge), primarySource: "ATR_FALLBACK", hedgeSource: "ATR_HEDGE", primaryConf: 40 };
-    }
-    // choose hedge: nearest opposite side cluster or ATR
-    let opp = scored.find(s => (direction === "Bullish" ? s.tp < price : s.tp > price));
-    if (!opp) {
-      opp = { tp: Number((price + (direction === "Bullish" ? -atr * 1.2 : atr * 1.2)).toFixed(8)), source: "HEDGE_ATR", score: 30 };
-    }
-    return { primary: Number(chosen.tp), hedge: Number(opp.tp), primarySource: chosen.source || "cluster", hedgeSource: opp.source || "cluster", primaryConf: chosen.score || 40 };
-  } catch(e) {
-    const atr = Math.max((feats && feats.atr) ? feats.atr : Math.abs(price) * 0.001, 1);
-    return { primary: Number(price + atr * 2), hedge: Number(price - atr * 1.2), primarySource: "ERR_FALLBACK", hedgeSource: "ERR_HEDGE", primaryConf: 40 };
-  }
-}
+
+
+
+
 
 /* ---------- Exporters ---------- */
 export function exportPredictionsCSV(outPath = path.join(LOG_DIR, "predictions_export.csv")) {
