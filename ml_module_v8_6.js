@@ -1360,25 +1360,10 @@ export function computeBacktestMetrics(outcomes = []) {
   }
 }
 
-/* ---------- Aggregator / Finalizer used by Part4's reportV2 ---------- */
 
-  // Simple clustering and scoring:
-  // - cluster by rounding
-  // - score = confidence * distanceScore * tfWeight * proximityBoost * ellBoost
-  try {
-    if (!Array.isArray(allCandidates) || !allCandidates.length) return [];
-    const tfWeights = opts.tfWeights || { "15m":0.4, "30m":0.25, "1h":0.25 };
-    const clusters = new Map();
-    for (const c of allCandidates) {
-      const k = Math.round(c.tp); // cluster key
-      const cur = clusters.get(k) || { tp: Math.round(c.tp), members: [], scoreRaw: 0, sources: new Set(), tfCount: {} };
-      cur.members.push(c);
-      cur.sources.add(c.source || c.tf);
-      cur.tfCount[c.tf] = (cur.tfCount[c.tf] || 0) + 1;
-      clusters.set(k, cur);
-    }
-    const arr = [];
-    for (const [k, v] of clusters.entries()) {
+
+
+
       // base confidence average
       const confAvg = mean(v.members.map(m => clamp(Number(m.confidence || 40), 0, 100)));
       // proximity: farther TPs (beyond atr*mult) get lower score for short styles; use feats.atr
