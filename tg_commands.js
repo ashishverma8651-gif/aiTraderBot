@@ -2,7 +2,7 @@
 // Replace your existing tg_commands.js with this (or merge as instructed).
 
 import CONFIG from "./config.js";
-import ML from "./ml_module_v8_6.js"; // <<-- ml v15 (the file you pasted)
+import ML from "./ml_module_v15.js"; // <<-- ml v15 (the file you pasted)
 import { fetchMultiTF, fetchMarketData } from "./utils.js";
 import * as indicators from "./core_indicators.js";
 import { analyzeElliott } from "./elliott_module.js";
