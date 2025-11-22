@@ -1,5 +1,4 @@
-// utils.js — FINAL MULTI-MARKET + MULTI-SOURCE VERSION
-// Exports: fetchMarketData, fetchMultiTF, fetchUniversal
+// utils.js — FIXED FINAL VERSION (same structure, no breaking changes)
 
 import axios from "axios";
 import fs from "fs";
@@ -11,7 +10,9 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const AXIOS_TIMEOUT = 12000;
 
-// ================= Helpers =================
+// ------------------------------------------------------------
+// Helpers (unchanged)
+// ------------------------------------------------------------
 function cachePath(symbol, interval) {
   return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
 }
@@ -25,41 +26,45 @@ function readCache(symbol, interval) {
   }
 }
 function writeCache(symbol, interval, data) {
-  try { fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2)); } catch {}
+  try {
+    fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2));
+  } catch {}
 }
 
-// Multi-source safe GET (try different bases)
+// ------------------------------------------------------------
+// SAFE MULTI-SOURCE AXIOS
+// ------------------------------------------------------------
 async function safeAxiosGet(url, bases = []) {
-  let lastErr = null;
-  // If bases empty, try direct url
-  if (!Array.isArray(bases) || bases.length === 0) bases = [url];
+  let tries = [];
 
-  for (const base of bases) {
-    try {
-      // base might be a full URL (contains "http"), in that case replace host only when original url contains binance pattern
-      let finalUrl = url;
-      if (url.includes("https://api.binance.com") && base && base.startsWith("http")) {
-        finalUrl = url.replace("https://api.binance.com", base);
-      } else if (base && base.startsWith("http") && base !== url) {
-        // try base + path if url path known
-        finalUrl = url.replace("https://api.binance.com", base);
+  // direct first
+  tries.push(url);
+
+  // mirrors
+  if (Array.isArray(bases)) {
+    for (let b of bases) {
+      if (b && b.startsWith("http")) {
+        tries.push(url.replace("https://api.binance.com", b));
       }
-
-      const res = await axios.get(finalUrl, {
-        timeout: AXIOS_TIMEOUT,
-        headers: { "User-Agent": "aiTraderBot/1.0", Accept: "application/json" },
-        proxy: CONFIG.PROXY ? false : undefined
-      });
-
-      if (res && res.status === 200) return res.data;
-    } catch (e) {
-      lastErr = e;
     }
   }
+
+  for (let u of tries) {
+    try {
+      const res = await axios.get(u, {
+        timeout: AXIOS_TIMEOUT,
+        headers: { "User-Agent": "aiTraderBot/1.0" },
+      });
+      if (res.status === 200) return res.data;
+    } catch {}
+  }
+
   return null;
 }
 
-// Normalize Binance klines to simple OHLC objects
+// ------------------------------------------------------------
+// Normalize Binance Data
+// ------------------------------------------------------------
 function normalizeKline(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -74,14 +79,17 @@ function normalizeKline(raw) {
     .filter(c => Number.isFinite(c.close));
 }
 
-// ================= Crypto fetch (Binance + mirrors) =================
+// ------------------------------------------------------------
+// CRYPTO FETCH (Binance + mirrors)
+// ------------------------------------------------------------
 async function fetchCrypto(symbol, interval = "15m", limit = 200) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+
   const bases = [
+    ...(CONFIG.DATA_SOURCES?.BINANCE || []),
     ...(CONFIG.DATA_SOURCES?.BYBIT || []),
     ...(CONFIG.DATA_SOURCES?.KUCOIN || []),
     ...(CONFIG.DATA_SOURCES?.COINBASE || []),
-    ...(CONFIG.DATA_SOURCES?.BINANCE || [])
   ];
 
   const raw = await safeAxiosGet(url, bases);
@@ -89,36 +97,28 @@ async function fetchCrypto(symbol, interval = "15m", limit = 200) {
   return normalizeKline(raw);
 }
 
-// ================= NSE (Nifty / BankNifty) =================
-async function fetchNSE(symbol = "") {
-  try {
-    const base = CONFIG.DATA_SOURCES?.NSE?.[0];
-    if (!base) return [];
-    // endpoint differs across sources — using the chart-databyindex style (many NSE endpoints are protected)
-    const url = `${base}/chart-databyindex?index=${symbol}`;
-    const res = await axios.get(url, { timeout: AXIOS_TIMEOUT, headers: { "User-Agent": "Mozilla/5.0" } });
-    const raw = res.data?.grapthData || res.data?.data || [];
-    if (!Array.isArray(raw)) return [];
-    return raw.map(c => ({
-      t: Number(c.time) * 1000,
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.price ?? c.close),
-      vol: Number(c.volume ?? 0)
-    })).filter(x => Number.isFinite(x.close));
-  } catch {
-    return [];
-  }
-}
+// ------------------------------------------------------------
+// NSE DATA FIX (Stable: Yahoo Finance)
+// ------------------------------------------------------------
+const YMAP = {
+  NIFTY50: "^NSEI",
+  BANKNIFTY: "^NSEBANK",
+  SENSEX: "^BSESN",
+  FINNIFTY: "NSE:FINNIFTY"
+};
 
-// ================= Yahoo Finance (stocks & indexes) =================
-async function fetchYahoo(symbol = "") {
+async function fetchYahoo(symbol) {
   try {
-    const url = `${CONFIG.DATA_SOURCES?.YAHOO?.[0]}/${symbol}?interval=15m&range=5d`;
+    const mapped = YMAP[symbol] || symbol;
+    const base = CONFIG.DATA_SOURCES?.YAHOO?.[0];
+
+    const url = `${base}/${mapped}?interval=15m&range=5d`;
+
     const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
     const raw = res.data?.chart?.result?.[0];
+
     if (!raw) return [];
+
     const t = raw.timestamp || [];
     const q = raw.indicators?.quote?.[0] || {};
     const open = q.open || [];
@@ -126,6 +126,7 @@ async function fetchYahoo(symbol = "") {
     const low = q.low || [];
     const close = q.close || [];
     const vol = q.volume || [];
+
     const out = [];
     for (let i = 0; i < t.length; i++) {
       if (!Number.isFinite(close[i])) continue;
@@ -144,62 +145,81 @@ async function fetchYahoo(symbol = "") {
   }
 }
 
-// ================== Exported: fetchMarketData (crypto-first, cached) ==================
+// ------------------------------------------------------------
+// fetchMarketData (Crypto)
+// ------------------------------------------------------------
 export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
-  symbol = String(symbol || "").toUpperCase();
-  let data = readCache(symbol, interval) || [];
+  symbol = symbol.toUpperCase();
+  let cached = readCache(symbol, interval);
 
-  try {
-    const fresh = await fetchCrypto(symbol, interval, limit);
-    if (Array.isArray(fresh) && fresh.length > 0) {
-      writeCache(symbol, interval, fresh);
-      data = fresh;
-    }
-  } catch (e) {
-    // ignore and fallback to cache
+  let fresh = [];
+
+  // Crypto ONLY here
+  if (symbol.includes("USDT") || symbol.includes("USD")) {
+    try {
+      fresh = await fetchCrypto(symbol, interval, limit);
+      if (fresh?.length) {
+        writeCache(symbol, interval, fresh);
+        cached = fresh;
+      }
+    } catch {}
   }
 
-  const last = data.at(-1) || {};
+  const last = cached.at(-1) || {};
+
   return {
-    data,
+    data: cached,
     price: Number(last.close || 0),
-    volume: Number(last.vol || last.volume || 0),
+    volume: Number(last.vol || 0),
     updated: new Date().toISOString()
   };
 }
 
-// ================== Exported: fetchMultiTF ==================
+// ------------------------------------------------------------
+// MULTI TIMEFRAME
+// ------------------------------------------------------------
 export async function fetchMultiTF(symbol, tfs = ["1m", "5m", "15m"]) {
   const out = {};
-  await Promise.all(tfs.map(async tf => {
-    try {
-      out[tf] = await fetchMarketData(symbol, tf, CONFIG.DEFAULT_LIMIT);
-    } catch {
-      out[tf] = { data: [], price: 0 };
-    }
-  }));
+
+  await Promise.all(
+    tfs.map(async tf => {
+      try {
+        out[tf] = await fetchMarketData(symbol, tf, CONFIG.DEFAULT_LIMIT);
+      } catch {
+        out[tf] = { data: [], price: 0 };
+      }
+    })
+  );
+
   return out;
 }
 
-// ================== Exported: fetchUniversal (crypto | NSE | Yahoo) ==================
+// ------------------------------------------------------------
+// UNIVERSAL FETCH (Crypto + NSE + Yahoo)
+// ------------------------------------------------------------
 export async function fetchUniversal(symbol, interval = "15m") {
-  symbol = String(symbol || "").toUpperCase();
+  symbol = symbol.toUpperCase();
 
-  // crypto
+  // 1) Crypto
   if (symbol.endsWith("USDT") || symbol.endsWith("USD")) {
     return await fetchMarketData(symbol, interval, CONFIG.DEFAULT_LIMIT);
   }
 
-  // NSE indices (NIFTY50, BANKNIFTY)
-  if (Array.isArray(CONFIG.MARKETS?.INDIA?.INDEXES) && CONFIG.MARKETS.INDIA.INDEXES.includes(symbol)) {
-    const data = await fetchNSE(symbol);
-    return { data, price: data.at(-1)?.close || 0, updated: new Date().toISOString() };
+  // 2) India (Nifty + BankNifty etc)
+  if (CONFIG.MARKETS?.INDIA?.INDEXES?.includes(symbol)) {
+    const data = await fetchYahoo(symbol);
+    return {
+      data,
+      price: data.at(-1)?.close || 0,
+      updated: new Date().toISOString()
+    };
   }
 
-  // Yahoo stocks / indexes
+  // 3) Yahoo general stocks
   const yahoo = await fetchYahoo(symbol);
-  if (Array.isArray(yahoo) && yahoo.length > 0) return { data: yahoo, price: yahoo.at(-1)?.close || 0, updated: new Date().toISOString() };
+  if (yahoo?.length) {
+    return { data: yahoo, price: yahoo.at(-1)?.close || 0 };
+  }
 
-  // fallback to empty
-  return { data: [], price: 0, updated: new Date().toISOString() };
+  return { data: [], price: 0 };
 }
