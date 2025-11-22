@@ -81,8 +81,8 @@ export const CONFIG = {
       DEFAULT: "BTCUSDT"
     },
     INDIA: {
-      ENABLED: true,
-      INDEXES: ["NIFTY50", "BANKNIFTY"]
+  ENABLED: true,
+  INDEXES: ["NIFTY50", "BANKNIFTY", "FINNIFTY", "SENSEX"]
     },
     STOCKS: {
       ENABLED: true
