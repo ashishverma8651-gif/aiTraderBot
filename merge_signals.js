@@ -2,19 +2,23 @@
 // PREMIUM MULTI-MARKET UI + ROUTER + FORMATTER
 // -----------------------------------------------------
 
-
-
-
-import { runMLPrediction } from "./ml_module_v8_6.js";   // your ML module
+import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
+
+// -----------------------------------------------------
+// KEYBOARD WRAPPER (to always include parse_mode)
+// -----------------------------------------------------
+function withHTML(keyboard) {
+  return { ...keyboard, parse_mode: "HTML" };
+}
 
 
 
 // -------------------- MENU KEYBOARDS --------------------
 
-export const kbHome = {
+export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -27,9 +31,9 @@ export const kbHome = {
       ]
     ]
   }
-};
+});
 
-export const kbCrypto = {
+export const kbCrypto = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -44,14 +48,12 @@ export const kbCrypto = {
         { text: "DOGE", callback_data: "asset_DOGEUSDT" },
         { text: "ADA", callback_data: "asset_ADAUSDT" }
       ],
-      [
-        { text: "⬅ Back", callback_data: "back_home" }
-      ]
+      [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
-};
+});
 
-export const kbIndices = {
+export const kbIndices = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -65,9 +67,9 @@ export const kbIndices = {
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
-};
+});
 
-export const kbForex = {
+export const kbForex = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -85,9 +87,9 @@ export const kbForex = {
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
-};
+});
 
-export const kbCommodity = {
+export const kbCommodity = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -101,12 +103,13 @@ export const kbCommodity = {
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
-};
+});
+
 
 // -------------------- ACTION BUTTONS --------------------
 
 export function kbActions(symbol) {
-  return {
+  return withHTML({
     reply_markup: {
       inline_keyboard: [
         [
@@ -120,11 +123,13 @@ export function kbActions(symbol) {
         [{ text: "⬅ Back", callback_data: "back_assets" }]
       ]
     }
-  };
+  });
 }
 
+// -------------------- TIMEFRAME BUTTONS --------------------
+
 export function kbTimeframes(symbol) {
-  return {
+  return withHTML({
     reply_markup: {
       inline_keyboard: [
         [
@@ -142,8 +147,10 @@ export function kbTimeframes(symbol) {
         [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
       ]
     }
-  };
+  });
 }
+
+
 
 // -------------------- FORMATTER --------------------
 
@@ -166,7 +173,9 @@ Confidence: <b>${r.tpConf}%</b>
 `;
 }
 
-// -------------------- ASSET PROCESSOR --------------------
+
+
+// -------------------- ASSET MERGED DATA --------------------
 
 export async function generateReport(symbol, tf = "15m") {
   const ml = await runMLPrediction(symbol, tf);
@@ -177,9 +186,10 @@ export async function generateReport(symbol, tf = "15m") {
     symbol,
     price: ml.explanation?.features?.close || 0,
 
-    direction: ml.direction,
+    direction: ml.direction || "Neutral",
     biasEmoji: ml.direction === "Bullish" ? "📈"
-              : ml.direction === "Bearish" ? "📉" : "⚪",
+              : ml.direction === "Bearish" ? "📉"
+              : "⚪",
 
     maxProb: ml.maxProb || 50,
 
@@ -200,8 +210,9 @@ export async function generateReport(symbol, tf = "15m") {
   };
 }
 
+
+
 // -------------------- CALLBACK ROUTER --------------------
-// This will be used by aiTraderBot.js
 
 export async function handleCallback(query) {
   const data = query.data;
@@ -210,50 +221,54 @@ export async function handleCallback(query) {
   if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
   if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
   if (data === "menu_indices") return { text: "📘 Indices", keyboard: kbIndices };
-  if (data === "menu_forex") return { text: "💱 Forex", keyboard: kbForex };
+  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
   if (data === "menu_commodities") return { text: "🛢 Commodities", keyboard: kbCommodity };
 
   // ---------- ASSET SELECT ----------
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
-    const out = await generateReport(symbol, "15m");
-    return out;
+    return await generateReport(symbol, "15m");
   }
 
-  // ---------- TIMEFRAME SELECT ----------
+  // ---------- TIMEFRAME ----------
   if (data.startsWith("tf_")) {
-    const [_, symbol, tf] = data.split("_");
-    const out = await generateReport(symbol, tf);
-    return out;
+    const parts = data.split("_");
+    const symbol = parts[1];
+    const tf = parts[2];
+    return await generateReport(symbol, tf);
   }
 
-  // ---------- SHOW TF MENU ----------
+  // ---------- OPEN TIMEFRAME MENU ----------
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
-    return { text: `🕒 Select timeframe for ${symbol}:`, keyboard: kbTimeframes(symbol) };
+    return {
+      text: `🕒 Select timeframe for <b>${symbol}</b>:`,
+      keyboard: kbTimeframes(symbol)
+    };
   }
 
   // ---------- REFRESH ----------
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
-    const out = await generateReport(symbol, "15m");
-    return out;
+    return await generateReport(symbol, "15m");
   }
 
-  // ---------- ELLIOTT ONLY ----------
+  // ---------- ELLIOTT ----------
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
     const ell = await analyzeElliott([]);
+
     return {
       text: `📊 <b>Elliott Waves</b>\nPattern: ${ell.pattern}\nConfidence: ${ell.confidence}%`,
       keyboard: kbActions(symbol)
     };
   }
 
-  // ---------- NEWS ONLY ----------
+  // ---------- NEWS ----------
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
     const news = await fetchNewsBundle(symbol);
+
     return {
       text: `📰 <b>News Report</b>\nImpact: ${news.impact}\nSentiment: ${news.sentiment}%`,
       keyboard: kbActions(symbol)
