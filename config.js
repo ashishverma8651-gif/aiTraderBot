@@ -11,7 +11,7 @@ const ENV = process.env.NODE_ENV || "production";
 export const CONFIG = {
   MODE: ENV,
 
-  // Trading symbol
+  // Trading symbol (BTC auto-report)
   SYMBOL: process.env.SYMBOL || "BTCUSDT",
 
   // Timeframes used across all modules
@@ -26,7 +26,7 @@ export const CONFIG = {
   ),
 
   // =====================================================
-  // PRICE + CANDLE FETCHING ENDPOINTS
+  // PRICE + CANDLE FETCHING ENDPOINTS  (ORIGINAL)
   // =====================================================
   DATA_SOURCES: {
     BINANCE: [
@@ -38,7 +38,11 @@ export const CONFIG = {
     ],
     BYBIT: ["https://api.bybit.com", "https://api.bytick.com"],
     KUCOIN: ["https://api.kucoin.com"],
-    COINBASE: ["https://api.exchange.coinbase.com"]
+    COINBASE: ["https://api.exchange.coinbase.com"],
+
+    // ⭐ ADDED (no original key touched)
+    NSE: ["https://www.nseindia.com/api"],
+    YAHOO: ["https://query1.finance.yahoo.com/v8/finance/chart"]
   },
 
   // =====================================================
@@ -67,6 +71,26 @@ export const CONFIG = {
   // KEEP-ALIVE PING (Render/Hosting)
   // =====================================================
   SELF_PING_URL: process.env.SELF_PING_URL || null,
+
+  // =====================================================
+  // ⭐ ADDED: MULTI-MARKET SUPPORT (safe extensions)
+  // =====================================================
+  MARKETS: {
+    CRYPTO: {
+      ENABLED: true,
+      DEFAULT: "BTCUSDT"
+    },
+    INDIA: {
+      ENABLED: true,
+      INDEXES: ["NIFTY50", "BANKNIFTY"]
+    },
+    STOCKS: {
+      ENABLED: true
+    },
+    FOREX: {
+      ENABLED: true
+    }
+  },
 
   PATHS: {
     CACHE_DIR
