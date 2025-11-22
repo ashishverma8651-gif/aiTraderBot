@@ -366,7 +366,32 @@ ML quick summary:
 “AI forecast active”
 
 ML per-TF snapshot:
-${(r.mlPerTF && r.mlPerTF.length) ? r.mlPerTF.map(m=>`${m.tf}: ${m.direction||"N"} | TP:${isNum(m.tpEstimate)?nf(m.tpEstimate,2):(isNum(m.tp)?nf(m.tp,2):"N/A")} | maxProb:${nf(m.maxProb ?? (m.probs && (m.probs.bull || m.probs.bear) ) || 0,0)}`).join("\n") : "No ML outputs"}
+${(() => {
+  if (!r.mlPerTF || !Array.isArray(r.mlPerTF) || !r.mlPerTF.length) {
+    return "No ML outputs";
+  }
+
+  try {
+    return r.mlPerTF
+      .map(m => {
+        const tf = m.tf || "?";
+        const dir = m.direction || "Neutral";
+
+        const tp = (typeof m.tpEstimate === "number")
+          ? m.tpEstimate.toFixed(2)
+          : "N/A";
+
+        const maxProb = (typeof m.maxProb === "number")
+          ? m.maxProb
+          : (m.probs ? Math.max(m.probs.bull || 0, m.probs.bear || 0) : 0);
+
+        return `• ${tf}: ${dir} | TP:${tp} | maxProb:${maxProb}`;
+      })
+      .join("\n");
+  } catch (err) {
+    return "ML output error";
+  }
+})()}
 ━━━━━━━━━━━━━━━━━━
 `;
 
