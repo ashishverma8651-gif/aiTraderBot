@@ -550,7 +550,12 @@ export function fuseMLTFs(perTFArrayOrObj) {
     const weights = { "15m":0.45, "30m":0.3, "1h":0.25 };
     for (const p of perTF) {
       const dir = (p.direction || p.label || "").toString().toLowerCase();
-      const prob = Number(p.maxProb ?? (p.probs && Math.max(p.probs.bull||0, p.probs.bear||0)) || 50);
+
+      const prob = Number(
+    p.maxProb !== undefined
+        ? p.maxProb
+        : (p.probs ? Math.max(p.probs.bull || 0, p.probs.bear || 0) : 50)
+);
       const w = weights[p.tf] ?? 0.1;
       if (dir.includes("bull")) bull += prob * w;
       else if (dir.includes("bear")) bear += prob * w;
