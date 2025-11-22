@@ -1727,7 +1727,17 @@ export function diagnostics() {
     logDir: LOG_DIR
   };
 }
-
+// Export names are intentionally standalone; default export at file bottom already contains core functions.
+export {
+  streamingFetchMultiTF,
+  batchFetchSymbols,
+  registerExternalFetcher,
+  enableStreamingMode,
+  trimLogs,
+  writePackageREADME,
+ 
+ 
+};
 
 
 // ==============================
