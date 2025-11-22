@@ -1,7 +1,8 @@
-// merge_signals.js — FINAL PREMIUM AI PANEL (WITH FULL IMPORTS)
+// ===============================================================
+// merge_signals.js — FINAL PREMIUM AI PANEL (COMPLETE + FIXED)
 // ===============================================================
 
-// 🔥 PRICE ENGINE (YOUR UTILS)
+// 🔥 PRICE ENGINE (UTILS)
 import {
   fetchUniversal,
   fetchMarketData,
@@ -15,13 +16,26 @@ import { fetchNewsBundle } from "./news_social.js";
 
 
 // ===============================
-// REAL MARKET SYMBOL MAP (FIXED)
+// SYMBOL MAP (REAL MARKET SYMBOLS)
 // ===============================
 const symbolMap = {
   NIFTY50: "^NSEI",
   BANKNIFTY: "^NSEBANK",
   SENSEX: "^BSESN",
-  FINNIFTY: "NSE:FINNIFTY"  // Yahoo unsupported → fallback
+  FINNIFTY: "NSE:FINNIFTY",
+
+  GOLD: "GC=F",
+  SILVER: "SI=F",
+  CRUDE: "CL=F",
+  NGAS: "NG=F",
+
+  DXY: "DX-Y.NYB",
+  XAUUSD: "GC=F",
+  XAGUSD: "SI=F",
+
+  EURUSD: "EURUSD=X",
+  GBPUSD: "GBPUSD=X",
+  USDJPY: "JPY=X"
 };
 
 
@@ -98,8 +112,103 @@ export const kbIndices = withHTML({
 
 
 // ===============================
-// PRICE + AI REPORT BUILDER
+// FOREX MENU (FIXED)
 // ===============================
+export const kbForex = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "EURUSD", callback_data: "asset_EURUSD" },
+        { text: "GBPUSD", callback_data: "asset_GBPUSD" }
+      ],
+      [
+        { text: "USDJPY", callback_data: "asset_USDJPY" },
+        { text: "XAUUSD", callback_data: "asset_XAUUSD" }
+      ],
+      [
+        { text: "XAGUSD", callback_data: "asset_XAGUSD" },
+        { text: "DXY", callback_data: "asset_DXY" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
+});
+
+
+// ===============================
+// COMMODITIES MENU (FIXED)
+// ===============================
+export const kbCommodity = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "GOLD", callback_data: "asset_GOLD" },
+        { text: "SILVER", callback_data: "asset_SILVER" }
+      ],
+      [
+        { text: "CRUDE", callback_data: "asset_CRUDE" },
+        { text: "NGAS", callback_data: "asset_NGAS" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
+});
+
+
+
+// =====================================================
+// ACTION BUTTONS
+// =====================================================
+export function kbActions(symbol) {
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
+          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
+        ],
+        [
+          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
+          { text: "📰 News", callback_data: `news_${symbol}` }
+        ],
+        [{ text: "⬅ Back", callback_data: "back_assets" }]
+      ]
+    }
+  });
+}
+
+
+
+// =====================================================
+// TIMEFRAME SELECTOR
+// =====================================================
+export function kbTimeframes(symbol) {
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "5m", callback_data: `tf_${symbol}_5m` },
+          { text: "15m", callback_data: `tf_${symbol}_15m` }
+        ],
+        [
+          { text: "30m", callback_data: `tf_${symbol}_30m` },
+          { text: "1h", callback_data: `tf_${symbol}_1h` }
+        ],
+        [
+          { text: "4h", callback_data: `tf_${symbol}_4h` },
+          { text: "1D", callback_data: `tf_${symbol}_1d` }
+        ],
+        [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
+      ]
+    }
+  });
+}
+
+
+
+// =====================================================
+// PREMIUM REPORT
+// =====================================================
 export function formatPremiumReport(r) {
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
@@ -121,40 +230,28 @@ Confidence: <b>${r.tpConf}%</b>
 
 
 
-// ===============================
-// MAIN REPORT (ML + PRICE + NEWS)
-// ===============================
+// =====================================================
+// MAIN REPORT BUILDER
+// =====================================================
 export async function generateReport(symbol, tf = "15m") {
 
   const mappedSymbol = symbolMap[symbol] || symbol;
 
-  // -------------------------
-  // PRICE from utils.js
-  // -------------------------
+  // PRICE
   let priceData = await fetchUniversal(mappedSymbol, tf);
   let livePrice = priceData?.price || 0;
 
-  // -------------------------
-  // ML PREDICTION
-  // -------------------------
+  // ML
   const ml = await runMLPrediction(mappedSymbol, tf) || {};
-
   const candles = ml?.explanation?.features?.candles || [];
 
-  // -------------------------
-  // ELLIOTT WAVES
-  // -------------------------
+  // ELLIOTT
   const ell = await analyzeElliott(candles);
 
-  // -------------------------
-  // NEWS & SENTIMENT
-  // -------------------------
+  // NEWS
   const news = await fetchNewsBundle(mappedSymbol);
 
-
-  // -------------------------
-  // MERGED STRUCTURE
-  // -------------------------
+  // MERGE
   const out = {
     symbol,
     price: livePrice,
@@ -165,7 +262,6 @@ export async function generateReport(symbol, tf = "15m") {
               : "⚪",
 
     maxProb: ml.maxProb || 50,
-
     tp1: ml.tpEstimate || "—",
     tp2: ml.tp2Estimate || "—",
     tpConf: ml.tpConfidence || 55,
@@ -185,17 +281,16 @@ export async function generateReport(symbol, tf = "15m") {
 
 
 
-// ===============================
-// BUTTON ROUTER
-// ===============================
+// =====================================================
+// CALLBACK ROUTER
+// =====================================================
 export async function handleCallback(query) {
   const data = query.data;
 
-  // 🏠 HOME PAGE
+  // HOME
   if (data === "back_home")
     return { text: "🏠 HOME", keyboard: kbHome };
 
-  // MAIN MENUS
   if (data === "menu_crypto")
     return { text: "💠 Crypto Market", keyboard: kbCrypto };
 
@@ -208,19 +303,16 @@ export async function handleCallback(query) {
   if (data === "menu_commodities")
     return { text: "🛢 Commodities Market", keyboard: kbCommodity };
 
-
-  // BACK FROM SUBMENU
   if (data === "back_assets")
     return { text: "Choose Market", keyboard: kbHome };
 
-
-  // ASSET SELECTED
+  // ASSETS
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol, "15m");
   }
 
-  // TIMEFRAMES MENU
+  // TIMEFRAMES
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
     return {
@@ -229,7 +321,6 @@ export async function handleCallback(query) {
     };
   }
 
-  // TIMEFRAME SELECTED
   if (data.startsWith("tf_")) {
     const parts = data.split("_");
     const symbol = parts[1];
@@ -263,30 +354,5 @@ export async function handleCallback(query) {
     };
   }
 
-  // FALLBACK
-  return {
-    text: "❌ Unknown command",
-    keyboard: kbHome
-  };
-}
-
-// ===============================
-// ACTION BUTTONS MENU
-// ===============================
-export function kbActions(symbol) {
-  return withHTML({
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
-          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
-        ],
-        [
-          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
-          { text: "📰 News", callback_data: `news_${symbol}` }
-        ],
-        [{ text: "⬅ Back", callback_data: "back_assets" }]
-      ]
-    }
-  });
+  return { text: "❌ Unknown command", keyboard: kbHome };
 }
