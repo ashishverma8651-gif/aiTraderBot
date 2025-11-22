@@ -1,4 +1,4 @@
-// utils.js — STABLE WORKING VERSION (Bybit → Kucoin → Coinbase → Binance)
+// utils.js — MULTI-MARKET VERSION (Crypto + NSE + Yahoo + Forex)
 
 import axios from "axios";
 import fs from "fs";
@@ -10,9 +10,9 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const AXIOS_TIMEOUT = 15000;
 
-// ======================
+// ======================================================
 // Cache Helpers
-// ======================
+// ======================================================
 function cachePath(symbol, interval) {
   return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
 }
@@ -33,9 +33,9 @@ function writeCache(symbol, interval, data) {
   } catch {}
 }
 
-// ======================
+// ======================================================
 // safeAxiosGet — multi-source
-// ======================
+// ======================================================
 async function safeAxiosGet(url, bases = [], options = {}) {
   let lastErr = null;
 
@@ -63,9 +63,9 @@ async function safeAxiosGet(url, bases = [], options = {}) {
   return null;
 }
 
-// ======================
-// Normalizer
-// ======================
+// ======================================================
+// Normalizer (Crypto Klines)
+// ======================================================
 function normalizeKline(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -80,19 +80,19 @@ function normalizeKline(raw) {
     .filter(c => Number.isFinite(c.close));
 }
 
-// ======================
-// FETCH WRAPPER
-// ======================
+// ======================================================
+// CRYPTO FETCH (Original Function - UNTOUCHED)
+// ======================================================
 export async function fetchCrypto(symbol, interval, limit = 200) {
 
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 
-  // 👉 WORKING PRIORITY ORDER
+  // 👉 WORKING PRIORITY ORDER (Original)
   const bases = [
     ...CONFIG.DATA_SOURCES.BYBIT,
     ...CONFIG.DATA_SOURCES.KUCOIN,
     ...CONFIG.DATA_SOURCES.COINBASE,
-    ...CONFIG.DATA_SOURCES.BINANCE  // Binance always last
+    ...CONFIG.DATA_SOURCES.BINANCE
   ];
 
   const raw = await safeAxiosGet(url, bases);
@@ -101,9 +101,104 @@ export async function fetchCrypto(symbol, interval, limit = 200) {
   return normalizeKline(raw);
 }
 
-// ======================
-// Candle Fetcher
-// ======================
+// ======================================================
+// NSE INDIA MARKET (NIFTY, BANKNIFTY)
+// ======================================================
+async function fetchNSE(symbol, interval = "15m", limit = 200) {
+  try {
+    const url = `${CONFIG.DATA_SOURCES.NSE[0]}/chart-databyindex?index=${symbol}`;
+    const res = await axios.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json"
+      },
+      timeout: AXIOS_TIMEOUT
+    });
+
+    const raw = res.data?.grapthData || [];
+    if (!Array.isArray(raw)) return [];
+
+    return raw.map(c => ({
+      t: Number(c.time) * 1000,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.price,
+      vol: c.volume || 0
+    }));
+
+  } catch {
+    return [];
+  }
+}
+
+// ======================================================
+// YAHOO FINANCE (US Stocks + Indian Stocks + Index)
+// ======================================================
+async function fetchYahoo(symbol, interval = "15m", limit = 200) {
+  try {
+    const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${symbol}?interval=15m&range=5d`;
+    const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
+
+    const raw = res.data?.chart?.result?.[0];
+    if (!raw) return [];
+
+    const { timestamp, indicators } = raw;
+    const ohlc = indicators?.quote?.[0] || {};
+
+    return timestamp.map((t, i) => ({
+      t: t * 1000,
+      open: ohlc.open[i],
+      high: ohlc.high[i],
+      low: ohlc.low[i],
+      close: ohlc.close[i],
+      vol: ohlc.volume[i] || 0
+    })).filter(x => x.close);
+
+  } catch {
+    return [];
+  }
+}
+
+// ======================================================
+// UNIVERSAL FETCHER
+// Auto-detect market (Crypto / NSE / Yahoo)
+// ======================================================
+export async function fetchUniversal(symbol, interval = "15m") {
+  symbol = symbol.toUpperCase();
+
+  // 1) Crypto (BTCUSDT, ETHUSDT)
+  if (symbol.endsWith("USDT") || symbol.endsWith("USD")) {
+    return fetchMarketData(symbol, interval);
+  }
+
+  // 2) Indian Index (NIFTY50, BANKNIFTY)
+  if (CONFIG.MARKETS.INDIA.INDEXES.includes(symbol)) {
+    const data = await fetchNSE(symbol, interval);
+    return {
+      data,
+      price: data.at(-1)?.close || 0,
+      updated: new Date().toISOString()
+    };
+  }
+
+  // 3) Stocks (RELIANCE, AAPL, TCS etc)
+  const yahooData = await fetchYahoo(symbol, interval);
+  if (yahooData.length > 0) {
+    return {
+      data: yahooData,
+      price: yahooData.at(-1)?.close || 0,
+      updated: new Date().toISOString()
+    };
+  }
+
+  // fallback
+  return { data: [], price: 0, updated: new Date().toISOString() };
+}
+
+// ======================================================
+// Candle caching
+// ======================================================
 export async function ensureCandles(symbol, interval, limit = 200) {
   const cached = readCache(symbol, interval);
 
@@ -122,6 +217,9 @@ export async function ensureCandles(symbol, interval, limit = 200) {
   }
 }
 
+// ======================================================
+// Original market fetch (crypto-only) — kept AS-IS
+// ======================================================
 export async function fetchMarketData(symbol, interval, limit = 200) {
   const data = await ensureCandles(symbol, interval, limit);
   const last = data.at(-1) || {};
@@ -134,6 +232,9 @@ export async function fetchMarketData(symbol, interval, limit = 200) {
   };
 }
 
+// ======================================================
+// Multi-Timeframe Fetch
+// ======================================================
 export async function fetchMultiTF(symbol, tfs) {
   const out = {};
 
