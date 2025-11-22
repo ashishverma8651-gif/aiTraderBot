@@ -1729,11 +1729,7 @@ export function diagnostics() {
 }
 // Export names are intentionally standalone; default export at file bottom already contains core functions.
 export {
-  streamingFetchMultiTF,
-  batchFetchSymbols,
-  registerExternalFetcher,
-  enableStreamingMode,
-  trimLogs,
+  
  
  
  
