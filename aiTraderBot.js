@@ -1,9 +1,10 @@
-// aiTraderBot.js — FINAL STABLE + PATCHED VERSION (AutoReport FIX + No trim crash + No remove code)
+// aiTraderBot.js — FINAL STABLE + PANEL UI + PATCHED VERSION
 
 import fs from "fs";
 import path from "path";
 import express from "express";
 import axios from "axios";
+import { Telegraf, Markup } from "telegraf";
 
 import CONFIG from "./config.js";
 import { fetchMarketData } from "./utils.js";
@@ -12,6 +13,8 @@ import { startReversalWatcher, stopReversalWatcher } from "./reversal_watcher.js
 
 // MULTI-MARKET PANEL UI
 import { handleCallback, kbHome } from "./merge_signals.js";
+
+
 // ======================================================
 // SINGLE INSTANCE LOCK
 // ======================================================
@@ -37,6 +40,29 @@ try { fs.writeFileSync(LOCK_FILE, String(process.pid)); } catch {}
 global.__aiTrader_running = true;
 
 
+
+// ======================================================
+// START TELEGRAM BOT (Added Here ✔️)
+// ======================================================
+const bot = new Telegraf(CONFIG.TELEGRAM.BOT_TOKEN);
+
+// Home Panel
+bot.command("panel", async (ctx) => {
+  await ctx.reply("🏠 HOME PANEL", kbHome);
+});
+
+// Button callback
+bot.on("callback_query", async (ctx) => {
+  const q = ctx.callbackQuery;
+  const res = await handleCallback(q);
+  await ctx.editMessageText(res.text, res.keyboard);
+});
+
+bot.launch();
+console.log("🤖 Telegram Bot Running");
+
+
+
 // ======================================================
 // SIMPLE SERVER
 // ======================================================
@@ -49,12 +75,14 @@ app.get("/ping", (req, res) => res.send("pong"));
 app.listen(PORT, () => console.log("🚀 Server live on", PORT));
 
 
+
 // ======================================================
 // HELPERS
 // ======================================================
 function nowIST() {
   return new Date().toLocaleString("en-IN", { hour12: true, timeZone: "Asia/Kolkata" });
 }
+
 
 
 // ======================================================
@@ -132,7 +160,6 @@ async function doAutoReport() {
       return;
     }
 
-    // ----------- FIXED BLOCK -----------
     let parts;
     try {
       parts = await formatAIReport(raw);
@@ -143,12 +170,10 @@ async function doAutoReport() {
       return;
     }
 
-    // If output is string → wrap in array
     if (typeof parts === "string") {
       parts = [parts];
     }
 
-    // Validate
     if (!Array.isArray(parts) || parts.length === 0) {
       console.log("❌ formatAIReport returned empty");
       await sendTelegram("⚠️ AutoReport empty output");
@@ -156,14 +181,12 @@ async function doAutoReport() {
       return;
     }
 
-    // Safe send
     for (const p of parts) {
       const msg = String(p || "");
       if (msg.length < 2) continue;
       await sendTelegram(msg);
       await new Promise(r => setTimeout(r, 500));
     }
-    // ----------- END FIX -----------
 
     console.log(nowIST(), "📤 Auto-report sent ✔");
 
@@ -199,6 +222,7 @@ function detectPublicURL() {
 }
 
 const PUBLIC_URL = detectPublicURL();
+
 
 
 // ======================================================
