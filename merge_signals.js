@@ -7,7 +7,10 @@
 
 import { runMLPrediction } from "./ml_module_v8_6.js";   // your ML module
 import { analyzeElliott } from "./elliott_module.js";
-import { fetchNewsBundle } from "./utils/news.js";
+import { fetchNewsBundle } from "./news_social.js";
+
+
+
 
 // -------------------- MENU KEYBOARDS --------------------
 
