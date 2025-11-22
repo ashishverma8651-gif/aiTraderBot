@@ -566,6 +566,55 @@ export async function runMicroPrediction(symbol = "BTCUSDT", tfc = "1m") {
   } catch (e) { return { error: e?.toString?.() ?? String(e), label: "Neutral" }; }
 }
 
+// ---------------- Multimarket helpers ----------------
+// Accepts string symbol or array of symbols. Returns mapping: { "<symbol>": <prediction> }
+function normalizeSymbolsInput(symbols) {
+  if (!symbols) return [];
+  if (typeof symbols === "string") return [symbols];
+  if (Array.isArray(symbols)) return symbols.filter(s => !!s).map(s => String(s));
+  // if object with keys, interpret keys as symbols
+  if (typeof symbols === "object") return Object.keys(symbols);
+  return [];
+}
+
+/**
+ * Run predictions for multiple symbols (sequential to avoid hammering data provider).
+ * Returns { results: { symbol: mlObj }, errors: { symbol: error } }
+ */
+export async function runMultiMarketPrediction(symbols = [], tfc = "15m", opts = {}) {
+  const list = normalizeSymbolsInput(symbols);
+  const results = {};
+  const errors = {};
+  for (const s of list) {
+    try {
+      // reuse runMLPrediction which handles single symbol
+      const res = await runMLPrediction(s, tfc, opts);
+      results[s] = res;
+    } catch (err) {
+      errors[s] = err?.toString?.() ?? String(err);
+    }
+  }
+  return { results, errors };
+}
+
+/**
+ * Run micro predictions for multiple symbols
+ */
+export async function runMultiMicroPrediction(symbols = [], tfc = "1m", opts = {}) {
+  const list = normalizeSymbolsInput(symbols);
+  const results = {};
+  const errors = {};
+  for (const s of list) {
+    try {
+      const res = await runMicroPrediction(s, tfc, opts);
+      results[s] = res;
+    } catch (err) {
+      errors[s] = err?.toString?.() ?? String(err);
+    }
+  }
+  return { results, errors };
+}
+
 // ---------------- Adaptive training ----------------
 export async function trainAdaptive(batch = []) {
   try {
@@ -608,7 +657,7 @@ export function resetStats() {
 
 // ---------------- Default export ----------------
 const defaultExport = {
-  runMLPrediction, runMicroPrediction, calculateAccuracy, recordPrediction,
-  recordOutcome, markOutcome, getStats, trainAdaptive, resetStats
+  runMLPrediction, runMicroPrediction, runMultiMarketPrediction, runMultiMicroPrediction,
+  calculateAccuracy, recordPrediction, recordOutcome, markOutcome, getStats, trainAdaptive, resetStats
 };
 export default defaultExport;
