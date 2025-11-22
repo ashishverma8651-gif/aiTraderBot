@@ -1,14 +1,14 @@
-// merge_signals.js
-// PREMIUM MULTI-MARKET UI + ROUTER + FORMATTER
-// -----------------------------------------------------
+// merge_signals.js — FIXED FULL MULTI-MARKET VERSION
+//-----------------------------------------------------
 
+import { fetchUniversal } from "./utils.js";
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
 
 // -----------------------------------------------------
-// KEYBOARD WRAPPER (to always include parse_mode)
+// HTML Keyboard wrapper
 // -----------------------------------------------------
 function withHTML(keyboard) {
   return { ...keyboard, parse_mode: "HTML" };
@@ -16,8 +16,9 @@ function withHTML(keyboard) {
 
 
 
-// -------------------- MENU KEYBOARDS --------------------
-
+// -----------------------------------------------------
+// MAIN MENUS
+// -----------------------------------------------------
 export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -58,11 +59,11 @@ export const kbIndices = withHTML({
     inline_keyboard: [
       [
         { text: "NIFTY 50", callback_data: "asset_NIFTY50" },
-        { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
+        { text: "BANKNIFTY", callback_data: "asset_BANKNIFTY" }
       ],
       [
-        { text: "Sensex", callback_data: "asset_SENSEX" },
-        { text: "FinNifty", callback_data: "asset_FINNIFTY" }
+        { text: "SENSEX", callback_data: "asset_SENSEX" },
+        { text: "FINNIFTY", callback_data: "asset_FINNIFTY" }
       ],
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
@@ -106,8 +107,10 @@ export const kbCommodity = withHTML({
 });
 
 
-// -------------------- ACTION BUTTONS --------------------
 
+// -----------------------------------------------------
+// ACTION BUTTONS
+// -----------------------------------------------------
 export function kbActions(symbol) {
   return withHTML({
     reply_markup: {
@@ -126,8 +129,11 @@ export function kbActions(symbol) {
   });
 }
 
-// -------------------- TIMEFRAME BUTTONS --------------------
 
+
+// -----------------------------------------------------
+// TIMEFRAME KEYS
+// -----------------------------------------------------
 export function kbTimeframes(symbol) {
   return withHTML({
     reply_markup: {
@@ -152,8 +158,9 @@ export function kbTimeframes(symbol) {
 
 
 
-// -------------------- FORMATTER --------------------
-
+// -----------------------------------------------------
+// PREMIUM FORMATTER
+// -----------------------------------------------------
 export function formatPremiumReport(r) {
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
@@ -175,16 +182,25 @@ Confidence: <b>${r.tpConf}%</b>
 
 
 
-// -------------------- ASSET MERGED DATA --------------------
-
+// -----------------------------------------------------
+// FINAL REPORT BUILDER (FIXED WITH fetchUniversal)
+// -----------------------------------------------------
 export async function generateReport(symbol, tf = "15m") {
-  const ml = await runMLPrediction(symbol, tf);
-  const ell = await analyzeElliott(ml.explanation?.features?.candles || []);
+  // REAL MARKET DATA
+  const uni = await fetchUniversal(symbol, tf);
+
+  // ML WORKS ON REAL CANDLES
+  const ml = await runMLPrediction(symbol, tf, uni.data);
+
+  // ELLIOTT WORKS ON REAL CANDLES
+  const ell = await analyzeElliott(uni.data);
+
+  // NEWS BASED ON SYMBOL TYPE
   const news = await fetchNewsBundle(symbol);
 
-  const data = {
+  const r = {
     symbol,
-    price: ml.explanation?.features?.close || 0,
+    price: uni.price || ml.explanation?.features?.close || 0,
 
     direction: ml.direction || "Neutral",
     biasEmoji: ml.direction === "Bullish" ? "📈"
@@ -197,48 +213,47 @@ export async function generateReport(symbol, tf = "15m") {
     tp2: ml.tp2Estimate || "—",
     tpConf: ml.tpConfidence || 55,
 
-    elliottPattern: ell?.pattern || "N/A",
-    elliottConf: ell?.confidence || 50,
+    elliottPattern: ell.pattern || "N/A",
+    elliottConf: ell.confidence || 50,
 
-    newsImpact: news?.impact || "Neutral",
-    newsScore: news?.sentiment || 50
+    newsImpact: news.impact || "Neutral",
+    newsScore: news.sentiment || 50,
   };
 
   return {
-    text: formatPremiumReport(data),
+    text: formatPremiumReport(r),
     keyboard: kbActions(symbol)
   };
 }
 
 
 
-// -------------------- CALLBACK ROUTER --------------------
-
+// -----------------------------------------------------
+// CALLBACK ROUTER (FIXED)
+// -----------------------------------------------------
 export async function handleCallback(query) {
   const data = query.data;
 
-  // ---------- HOME ----------
+  // MENUS
   if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
   if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
   if (data === "menu_indices") return { text: "📘 Indices", keyboard: kbIndices };
   if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
   if (data === "menu_commodities") return { text: "🛢 Commodities", keyboard: kbCommodity };
 
-  // ---------- ASSET SELECT ----------
+  // ASSET
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol, "15m");
   }
 
-  // ---------- TIMEFRAME ----------
+  // TIMEFRAME DIRECT
   if (data.startsWith("tf_")) {
-    const parts = data.split("_");
-    const symbol = parts[1];
-    const tf = parts[2];
+    const [, symbol, tf] = data.split("_");
     return await generateReport(symbol, tf);
   }
 
-  // ---------- OPEN TIMEFRAME MENU ----------
+  // OPEN TF MENU
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
     return {
@@ -247,16 +262,16 @@ export async function handleCallback(query) {
     };
   }
 
-  // ---------- REFRESH ----------
+  // REFRESH
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
     return await generateReport(symbol, "15m");
   }
 
-  // ---------- ELLIOTT ----------
+  // ELLIOTT PAGE
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
-    const ell = await analyzeElliott([]);
+    const ell = await analyzeElliott((await fetchUniversal(symbol)).data);
 
     return {
       text: `📊 <b>Elliott Waves</b>\nPattern: ${ell.pattern}\nConfidence: ${ell.confidence}%`,
@@ -264,7 +279,7 @@ export async function handleCallback(query) {
     };
   }
 
-  // ---------- NEWS ----------
+  // NEWS PAGE
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
     const news = await fetchNewsBundle(symbol);
