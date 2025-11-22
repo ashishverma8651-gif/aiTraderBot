@@ -1737,7 +1737,7 @@ export {
   trimLogs,
   writePackageREADME,
   snapshotModuleBundle,
-  diagnostics
+ 
 };
 
 // ==============================
