@@ -209,7 +209,15 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
         let bull=0,bear=0,neutral=0;
         for (const m of mlPerTF) {
           const dir = (m.direction||"").toString().toLowerCase();
-          const prob = Number(m.maxProb ?? (m.probs && Math.max(m.probs.bull||0, m.probs.bear||0)) || 50);
+
+
+          const prob = Number(
+  m.maxProb !== undefined
+    ? m.maxProb
+    : (m.probs ? Math.max(m.probs.bull || 0, m.probs.bear || 0) : 50)
+);
+
+
           if (dir.includes("bull")) bull += prob;
           else if (dir.includes("bear")) bear += prob;
           else neutral += prob;
