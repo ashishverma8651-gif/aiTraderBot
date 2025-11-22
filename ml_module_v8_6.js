@@ -628,25 +628,10 @@ export function scoreTPCluster(cluster = {}, price = 0, feats = {}, tfWeights = 
 
 /* ---------- Aggregate candidates across TFs and produce prioritized TP list ---------- */
 
-export function aggregateAndScoreTPs(perTFCandidates = [], price = 0, feats = {}, opts = {}) {
-  // perTFCandidates: array of candidate objects (from multiple TFs)
-  // returns list of prioritized tp objects [{ tp, score, cluster, sourceBreakdown, recommended }]
-  const PREC = opts.precision || 0;
-  // cluster
-  const clusters = clusterTPCandidates(perTFCandidates, { precision: PREC });
-  const out = [];
-  for (const cl of clusters) {
-    const sc = scoreTPCluster(cl, price, feats, opts.tfWeights || {});
-    out.push({ tp: Number(cl.center), score: sc.score, meta: sc, cluster: cl });
-  }
-  // Sort by score desc, then proximity to price
-  out.sort((a,b) => (b.score - a.score) || (Math.abs(a.tp - price) - Math.abs(b.tp - price)));
-  // mark recommended top 3
-  for (let i=0;i<out.length;i++) out[i].recommended = i < (opts.top || 3);
-  return out;
-}
 
-/* ---------- Finalize primary & hedge TP with mixed strategy ---------- */
+
+
+
 
 export function finalizePrimaryHedgeFromScored(scores = [], dir = "Neutral", price = 0, feats = {}, config = {}) {
   try {
