@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — FINAL MERGED (UI + Multi-TF + Elliott fixes V3)
+// merge_signals.js — FINAL MERGED (UI + Multi-TF + Elliott fixes V4 - English)
 // ============================================================
 
 import {
@@ -9,11 +9,11 @@ import {
 } from "./utils.js";
 
 import { runMLPrediction } from "./ml_module_v8_6.js";
-import { analyzeElliott } from "./elliott_module.js"; // Assumes elliott_module is updated to v2.5+
+import { analyzeElliott } from "./elliott_module.js"; 
 import { fetchNewsBundle } from "./news_social.js";
 
 // Internal version tag for debugging
-const VERSION = "v2_7_CONFIDENCE_FIX";
+const VERSION = "v2_9_ENGLISH_UI_TF_FIXED";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -58,7 +58,7 @@ function round(v, d = 2) {
   return Math.round(v * m) / m;
 }
 
-// ================= KEYBOARDS (UI preserved) =================
+// ================= KEYBOARDS (English UI) =================
 export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -178,7 +178,7 @@ export function kbTimeframes(symbol) {
 }
 
 
-// ================= ELLIOTT UTIL (FIXED LOGIC for Filtering and Confidence) =================
+// ================= ELLIOTT UTIL (Confidence Fix V2) =================
 function extractTopPatterns(ellResult, max = 3) {
   if (!ellResult || !Array.isArray(ellResult.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
 
@@ -203,7 +203,6 @@ function extractTopPatterns(ellResult, max = 3) {
   // Second pass: Filter and dedupe by type
   for (const p of ellResult.patterns) {
     const t = String(p.type || "Pattern");
-    // Use confidence from pattern object, falling back to 50 if missing
     const conf = safeNum(p.confidence ?? p.conf ?? 50, 0); 
     const patternSentiment = p.side || "Neutral";
 
@@ -221,18 +220,16 @@ function extractTopPatterns(ellResult, max = 3) {
   // Convert to array, sort by conf desc, pick top (of the filtered list)
   const arr = Array.from(map.values()).sort((a, b) => b.conf - a.conf).slice(0, max);
 
-  // Format human-friendly
+  // 🎯 Confidence Fix: list contains pattern name and its own confidence
   const list = arr.map(a => `${a.type}(${round(a.conf, 0)}%)`);
   
-  // 🎯 NEW CONFIDENCE LOGIC: Use the confidence of the most confident pattern as the display confidence (or 50 if none found)
+  // Use the top confidence found in the *patterns* for the final display
   const topConf = arr.length ? Math.round(arr[0].conf) : 50;
 
-  // If the filtered list is empty, but we had a dominant side, use that side.
   const finalSentiment = arr.length ? dominantSide : overallSentiment;
 
   return { 
     list, 
-    // Use the top confidence found in the *patterns*, not the overall ellResult confidence.
     conf: topConf, 
     primarySentiment: finalSentiment 
   };
@@ -245,6 +242,7 @@ function formatPatternsForText(list) {
 
 // ================= FORMATTER =================
 export function formatPremiumReport(r) {
+  // The elliottPattern string contains pattern conf. elliottConf provides the overall confidence.
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
 ━━━━━━━━━━━━━━━━━━
@@ -263,43 +261,53 @@ Confidence: <b>${r.tpConf}%</b>
 `;
 }
 
-// ==================== PRICE/CANDLES RESOLVER (robust) ====================
+// ==================== PRICE/CANDLES RESOLVER (CRITICAL TF FIX) ====================
 async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
   try {
     const fetchAndCheck = async (sym, timeframe) => {
+      // 🛑 TF Fix: Always use the specified timeframe
       const result = await fetchUniversal(sym, timeframe);
       const data = result?.data ?? result?.candles ?? [];
       const price = safeNum(result?.price || data.at(-1)?.close);
-      return (price && data.length) ? { data, price } : null;
+      
+      // Must get at least 6 candles to be considered valid for analysis
+      if (price && data.length > 5) {
+          console.debug(`[${VERSION}] Successful fetch for ${sym} on ${timeframe} via universal.`);
+          return { data, price };
+      }
+      return null;
     };
 
-    // 1. Primary fetch
+    // 1. Primary fetch using the requested TF
     let primary = await fetchAndCheck(symbolRaw, tf);
     if (primary) return { ...primary, source: "universal" };
 
-    // 2. Crypto fallback (marketData)
-    if (isCryptoLike(symbolRaw)) {
-      const m = await fetchMarketData(symbolRaw, tf);
-      if (m?.price && Array.isArray(m.data)) return { data: m.data, price: safeNum(m.price), source: "marketData" };
-    }
-
-    // 3. MultiTF fallback
+    // 2. MultiTF fallback (explicitly requesting the single TF)
     const multi = await fetchMultiTF(symbolRaw, [tf]);
     if (multi?.[tf]) {
         const data = multi[tf].data || [];
         const price = safeNum(multi[tf].price || data.at(-1)?.close);
-        if (price) return { data, price, source: "multiTF" };
+        if (price && data.length > 5) {
+             console.debug(`[${VERSION}] Successful fetch for ${symbolRaw} on ${tf} via multiTF.`);
+             return { data, price, source: "multiTF" };
+        }
+    }
+    
+    // 3. Crypto fallback (marketData)
+    if (isCryptoLike(symbolRaw)) {
+      const m = await fetchMarketData(symbolRaw, tf);
+      if (m?.price && Array.isArray(m.data) && m.data.length > 5) {
+         console.debug(`[${VERSION}] Successful fetch for ${symbolRaw} on ${tf} via marketData.`);
+         return { data: m.data, price: safeNum(m.price), source: "marketData" };
+      }
     }
 
-    // 4. Retry universal with 15m
-    if (tf !== "15m") {
-      let fallback15m = await fetchAndCheck(symbolRaw, "15m");
-      if (fallback15m) return { ...fallback15m, source: "universal-15m" };
-    }
-
+    // If all fail, return error state
+    console.warn(`[${VERSION}] Failed to fetch distinct data for ${symbolRaw} on TF: ${tf}.`);
     return { data: [], price: 0, source: "none" };
+    
   } catch (err) {
-    console.debug(`[${VERSION}] resolvePriceAndCandles error:`, err?.message || err);
+    console.error(`[${VERSION}] resolvePriceAndCandles error for ${symbolRaw}/${tf}:`, err?.message || err);
     return { data: [], price: 0, source: "error" };
   }
 }
@@ -308,13 +316,13 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
 export async function generateReport(symbolLabel, tf = "15m") {
   const mappedSymbol = symbolMap[symbolLabel] || symbolLabel;
 
-  // 1. Resolve price & candles
+  // 1. Resolve price & candles (will now strictly use the requested TF)
   const { data: candles, price: livePrice, source } = await resolvePriceAndCandles(mappedSymbol, tf);
 
-  // 2. ML Prediction
+  // 2. ML Prediction (will also strictly use the requested TF)
   let ml = {};
   try {
-    ml = (await runMLPrediction(mappedSymbol, tf)) || {};
+    ml = (await runMLPrediction(mappedSymbol, tf)) || {}; // 🛑 ML runs on the requested TF
   } catch (e) {
     console.debug(`[${VERSION}] runMLPrediction failed:`, e?.message || e);
   }
@@ -330,7 +338,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
     console.debug(`[${VERSION}] analyzeElliott error:`, e?.message || e);
   }
 
-  // 4. News
+  // 4. News (TF independent)
   let news = {};
   try {
     news = (await fetchNewsBundle(mappedSymbol)) || {};
@@ -346,23 +354,21 @@ export async function generateReport(symbolLabel, tf = "15m") {
   const patternsObj = ellRes ? extractTopPatterns(ellRes, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
   const formattedPatterns = formatPatternsForText(patternsObj.list);
   
-  // 🎯 Using the specific confidence calculated by extractTopPatterns
   const ellConf = Math.round(patternsObj.conf);
-  const ellSentiment = patternsObj.primarySentiment || "Neutral"; // This is the FILTERED sentiment
+  const ellSentiment = patternsObj.primarySentiment || "Neutral"; 
 
-  // 6. Final Trend Logic: Prioritize ML if probability is high (>60), otherwise Elliott, otherwise News
+  // 6. Final Trend Logic
   let finalDirection = "Neutral";
   
   if (mlProb > 60) {
       finalDirection = mlDirection;
-  } else if (ellSentiment !== "Neutral" && ellConf >= 65) { // Only use Elliott if confidence is good
+  } else if (ellSentiment !== "Neutral" && ellConf >= 65) { 
       finalDirection = ellSentiment;
   } else if (news.sentiment > 70) {
       finalDirection = "Bullish";
   } else if (news.sentiment < 30) {
       finalDirection = "Bearish";
   } else {
-      // If nothing is strongly conclusive, default to ML's current low-confidence bias
       finalDirection = mlDirection; 
   }
   
@@ -406,7 +412,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
   };
 }
 
-// ==================== CALLBACK ROUTING ====================
+// ==================== CALLBACK ROUTING (English UI) ====================
 export async function handleCallback(query) {
   const data = query.data;
 
@@ -459,15 +465,14 @@ export async function handleCallback(query) {
     };
   }
 
-  // ELLIOTT BUTTON: show detailed Elliott patterns (use 15m candles for consistency)
+  // ELLIOTT BUTTON: show detailed Elliott patterns (use the default 15m TF)
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
     const mapped = symbolMap[symbol] || symbol;
-    // We use 15m candles for the detail view as a consistent default.
-    const { data: pd } = await resolvePriceAndCandles(mapped, "15m");
+    const tfForDetail = "15m";
+    const { data: pd } = await resolvePriceAndCandles(mapped, tfForDetail);
     let ell = {};
     try {
-      // Use 15m candles to show Elliott detail
       ell = (Array.isArray(pd) && pd.length >= 8) ? await analyzeElliott(pd.slice(-500)) : null;
     } catch (e) {
       ell = null;
@@ -475,34 +480,31 @@ export async function handleCallback(query) {
 
     if (!ell || !ell.patterns || !ell.patterns.length) {
       return {
-        text: `📊 <b>Elliott Waves</b>\nPattern: N/A\nConfidence: ${ell?.confidence ?? 50}%`,
+        text: `📊 <b>Elliott Waves (${tfForDetail})</b>\nPattern: N/A\nConfidence: ${ell?.confidence ?? 50}%`,
         keyboard: kbActions(symbol)
       };
     }
 
-    // Build friendly detailed message (no strict sentiment filter here, just show top results)
     const patternsWithSide = ell.patterns.map(p => ({
         ...p, 
-        side: p.side || (p.type.includes("Top") || p.type.includes("H&S") ? "Bearish" : "Bullish") // Guess side if missing
+        side: p.side || (p.type.includes("Top") || p.type.includes("H&S") ? "Bearish" : "Bullish") 
     }));
 
-    // Detailed list (showing everything found)
     const detailed = patternsWithSide
         .map(p => `${p.type}(${round(p.confidence || p.conf || 50, 0)}%)`)
         .slice(0, 6)
         .join(" + ");
     
-    // Overall Sentiment calculation for detail view
     const overallScore = safeNum(ell.sentiment, 0);
     const overallTrend = overallScore > 0.15 ? "Bullish" : overallScore < -0.15 ? "Bearish" : "Neutral";
         
     return {
-      text: `📊 <b>Elliott Waves (detailed, 15m)</b>\nPatterns: ${detailed}\nOverall Sentiment: ${overallTrend}\nConfidence: ${Math.round(ell.confidence)}%`,
+      text: `📊 <b>Elliott Waves (Detailed, ${tfForDetail})</b>\nPatterns: ${detailed}\nOverall Sentiment: ${overallTrend}\nConfidence: ${Math.round(ell.confidence)}%`,
       keyboard: kbActions(symbol)
     };
   }
 
-  return { text: "❌ Unknown command", keyboard: kbHome };
+  return { text: "❌ Unknown Command", keyboard: kbHome };
 }
 
-// EXPORTS (Same as original)
+// EXPORTS 
