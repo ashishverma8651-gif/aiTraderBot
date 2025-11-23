@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — v3.3 FINAL STABLE (UI + TF FIX + Elliott V3) - FIXED
+// merge_signals.js — v4.0 ULTRA FINAL (UI-SAFE + Elliott V3 + TF FIX)
 // ============================================================
 
 import {
@@ -12,7 +12,7 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-const VERSION = "v3.3_FINAL_STABLE_FIXED";
+const VERSION = "v4.0_UI_SAFE";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -36,14 +36,18 @@ const symbolMap = {
 };
 
 // ================= HELPERS =================
-function withHTML(kb) {
-  return { ...kb, parse_mode: "HTML" };
+function wrap(text, kb) {
+  return {
+    text,
+    parse_mode: "HTML",
+    reply_markup: kb?.reply_markup
+  };
 }
 
 function isCryptoLike(sym) {
   if (!sym) return false;
-  const s = String(sym).toUpperCase();
-  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC") || s.includes("ETH");
+  const s = sym.toUpperCase();
+  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
 }
 
 function safeNum(v, fb = 0) {
@@ -57,8 +61,12 @@ function round(v, d = 2) {
   return Math.round(v * m) / m;
 }
 
-// ================== HOME KEYPADS ==================
-export const kbHome = withHTML({
+function kb(k) {
+  return { ...k, parse_mode: "HTML" };
+}
+
+// ================== HOME MENUS ==================
+export const kbHome = kb({
   reply_markup: {
     inline_keyboard: [
       [
@@ -73,7 +81,7 @@ export const kbHome = withHTML({
   }
 });
 
-export const kbCrypto = withHTML({
+export const kbCrypto = kb({
   reply_markup: {
     inline_keyboard: [
       [
@@ -93,7 +101,7 @@ export const kbCrypto = withHTML({
   }
 });
 
-export const kbIndices = withHTML({
+export const kbIndices = kb({
   reply_markup: {
     inline_keyboard: [
       [
@@ -109,7 +117,7 @@ export const kbIndices = withHTML({
   }
 });
 
-export const kbForex = withHTML({
+export const kbForex = kb({
   reply_markup: {
     inline_keyboard: [
       [
@@ -129,7 +137,7 @@ export const kbForex = withHTML({
   }
 });
 
-export const kbCommodity = withHTML({
+export const kbCommodity = kb({
   reply_markup: {
     inline_keyboard: [
       [
@@ -147,7 +155,7 @@ export const kbCommodity = withHTML({
 
 // ACTION KEYPAD
 export function kbActions(symbol) {
-  return withHTML({
+  return kb({
     reply_markup: {
       inline_keyboard: [
         [
@@ -166,7 +174,7 @@ export function kbActions(symbol) {
 
 // TIMEFRAME KEYPAD
 export function kbTimeframes(symbol) {
-  return withHTML({
+  return kb({
     reply_markup: {
       inline_keyboard: [
         [
@@ -187,61 +195,38 @@ export function kbTimeframes(symbol) {
   });
 }
 
-// ==================== AUX: dedupe + top patterns ====================
-function dedupeAndPickTop(patterns = [], maxKeep = 4) {
-  if (!Array.isArray(patterns) || patterns.length === 0) return [];
-  const map = new Map(); // type -> best pattern
-  for (const p of patterns) {
-    const t = String(p.type || "Pattern");
-    const conf = safeNum(p.confidence ?? p.conf ?? 0);
-    if (!map.has(t) || conf > safeNum(map.get(t).confidence ?? map.get(t).conf ?? 0)) {
-      map.set(t, { ...p, confidence: conf });
-    }
-  }
-  // sort by confidence desc and keep top N
-  return Array.from(map.values())
-    .sort((a, b) => safeNum(b.confidence) - safeNum(a.confidence))
-    .slice(0, maxKeep);
-}
-
 // ==================== PRICE RESOLVER ====================
 async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
   try {
-    const fetchAndCheck = async (sym, timeframe) => {
+    const attempt = async (sym, timeframe) => {
       const r = await fetchUniversal(sym, timeframe);
       const data = r?.data || r?.candles || [];
-      const price = safeNum(r?.price || (Array.isArray(data) && data.length ? data.at(-1)?.close : 0));
-      return (price && data && data.length) ? { data, price } : null;
+      const price = safeNum(r?.price || data.at(-1)?.close);
+      return (price && data.length) ? { data, price } : null;
     };
 
-    // 1. Universal
-    let u = await fetchAndCheck(symbolRaw, tf);
-    if (u) return { ...u, source: "universal" };
+    let p = await attempt(symbolRaw, tf);
+    if (p) return { ...p, source: "universal" };
 
-    // 2. Crypto fallback
     if (isCryptoLike(symbolRaw)) {
       const c = await fetchMarketData(symbolRaw, tf);
-      if (c?.price && Array.isArray(c.data) && c.data.length) return { data: c.data, price: c.price, source: "marketData" };
+      if (c?.price) return { data: c.data, price: c.price, source: "marketData" };
     }
 
-    // 3. MultiTF fallback
-    const m = await fetchMultiTF(symbolRaw, [tf]);
-    if (m?.[tf]) {
-      const d = m[tf].data || [];
-      const p = safeNum(m[tf].price || (d.length ? d.at(-1)?.close : 0));
-      if (p && d.length) return { data: d, price: p, source: "multiTF" };
+    const mtf = await fetchMultiTF(symbolRaw, [tf]);
+    if (mtf?.[tf]) {
+      const d = mtf[tf].data || [];
+      const price = safeNum(mtf[tf].price || d.at(-1)?.close);
+      if (price) return { data: d, price, source: "multiTF" };
     }
 
-    // 4. Universal 15m fallback
     if (tf !== "15m") {
-      let u15 = await fetchAndCheck(symbolRaw, "15m");
-      if (u15) return { ...u15, source: "universal-15m" };
+      let fb = await attempt(symbolRaw, "15m");
+      if (fb) return { ...fb, source: "fallback-15m" };
     }
 
     return { data: [], price: 0, source: "none" };
-
-  } catch (e) {
-    console.debug(`[${VERSION}] resolvePriceAndCandles error:`, e?.message || e);
+  } catch {
     return { data: [], price: 0, source: "error" };
   }
 }
@@ -250,149 +235,98 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
 export async function generateReport(symbolLabel, tf = "15m") {
   const mapped = symbolMap[symbolLabel] || symbolLabel;
 
-  // 1. Price
-  const { data: candles, price: livePrice, source } = await resolvePriceAndCandles(mapped, tf);
+  const { data: candles, price } = await resolvePriceAndCandles(mapped, tf);
 
-  // 2. ML
   let ml = {};
-  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch (e) { console.debug(`[${VERSION}] runML failed:`, e?.message || e); }
+  try { ml = await runMLPrediction(mapped, tf); } catch {}
 
-  // 3. Elliott (multi-TF ideally but here we analyze the current tf slice)
   let ell = null;
   try {
-    if (Array.isArray(candles) && candles.length >= 8) {
-      const slice = candles.slice(-400);
-      ell = await analyzeElliott(slice);
-    }
-  } catch (e) { console.debug(`[${VERSION}] ell analyze failed:`, e?.message || e); }
+    if (candles.length >= 12) ell = await analyzeElliott(candles.slice(-400));
+  } catch {}
 
-  // 4. News
   let news = {};
-  try { news = (await fetchNewsBundle(mapped)) || {}; } catch (e) { console.debug(`[${VERSION}] news fetch failed:`, e?.message || e); }
-
-  const direction = ml.direction || "Neutral";
-  const prob = safeNum(ml.maxProb ?? ml.probability ?? ml.confidence ?? 50);
-
-  // Process Elliott patterns safely and dedupe
-  const rawPatterns = Array.isArray(ell?.patterns) ? ell.patterns : [];
-  const topPatterns = dedupeAndPickTop(rawPatterns, 4); // keep up to 4 best unique patterns
-  const ellText = topPatterns.length
-    ? topPatterns.map(p => `${String(p.type)}(${round(safeNum(p.confidence ?? p.conf ?? 0), 0)}%)`).join(" + ")
-    : "N/A";
-  const ellConf = safeNum(ell?.confidence ?? (topPatterns[0] ? topPatterns[0].confidence : 50), 50);
-
-  const out = {
-    symbol: symbolLabel,
-    price: round(safeNum(livePrice), 4),
-    direction,
-    biasEmoji: direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪",
-    tp1: ml.tp1 ?? ml.tpEstimate ?? "—",
-    tp2: ml.tp2 ?? ml.tp2Estimate ?? "—",
-    tpConf: ml.tpConfidence ?? 50,
-    maxProb: prob,
-    ellText,
-    ellConf,
-    newsImpact: news.impact || "Neutral",
-    newsScore: safeNum(news.sentiment ?? news.score ?? 50, 50),
-    _meta: {
-      version: VERSION,
-      mapped,
-      fetchSource: source,
-      candlesFound: Array.isArray(candles) ? candles.length : 0,
-      ellFound: !!ell,
-      ellPatternsFound: rawPatterns.length
-    }
-  };
+  try { news = await fetchNewsBundle(mapped); } catch {}
 
   const txt = `
-🔥 <b>${out.symbol}</b>
+🔥 <b>${symbolLabel}</b> — <i>${tf}</i>
 ━━━━━━━━━━━━━━
-📍 <b>Price:</b> ${out.price}
-📊 <b>Trend:</b> ${out.biasEmoji} ${out.direction}
-📉 <b>Elliott:</b> ${out.ellText} (${out.ellConf}%)
-📰 <b>News:</b> ${out.newsImpact} (${out.newsScore}%)
-🎯 <b>TP:</b> ${out.tp1} | Hedge: ${out.tp2}
-🤖 <b>ML Prob:</b> ${out.maxProb}%
+📍 <b>Price:</b> ${round(price, 4)}
+📊 <b>Trend:</b> ${ml.direction || "Neutral"}
+📉 <b>Elliott:</b> ${
+    ell?.patterns
+      ?.map(p => `${p.type}(${round(p.confidence, 0)}%)`)
+      ?.join(" + ") || "N/A"
+  }
+📰 <b>News:</b> ${news.impact || "Neutral"} (${news.sentiment || 50}%)
+🎯 <b>TP:</b> ${ml.tp1 || "—"} | Hedge: ${ml.tp2 || "—"}
+🤖 <b>ML Prob:</b> ${ml.maxProb || 50}%
 ━━━━━━━━━━━━━━
-<small>Src:${out._meta.fetchSource} | candles:${out._meta.candlesFound} | ell:${out._meta.ellPatternsFound}</small>
 `;
 
-  return { text: txt, keyboard: kbActions(symbolLabel) };
+  return wrap(txt, kbActions(symbolLabel));
 }
 
 // ================= CALLBACK HANDLER ==================
 export async function handleCallback(query) {
   const data = query.data;
 
-  // Menus
-  if (data === "back_home") return { text: "🏠 Home", keyboard: kbHome };
-  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
-  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
-  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
-  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-  if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
+  if (data === "back_home") return wrap("🏠 Home", kbHome);
+  if (data === "menu_crypto") return wrap("💠 Crypto", kbCrypto);
+  if (data === "menu_indices") return wrap("📘 Indices", kbIndices);
+  if (data === "menu_forex") return wrap("💱 Forex", kbForex);
+  if (data === "menu_commodities") return wrap("🛢 Commodities", kbCommodity);
+  if (data === "back_assets") return wrap("Choose Market", kbHome);
 
-  // Asset clicked
   if (data.startsWith("asset_")) {
-    const symbol = data.replace("asset_", "");
-    return await generateReport(symbol);
+    const sym = data.replace("asset_", "");
+    return await generateReport(sym);
   }
 
-  // Timeframes menu
   if (data.startsWith("tfs_")) {
-    const symbol = data.replace("tfs_", "");
-    return { text: `🕒 Timeframes: <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
+    const sym = data.replace("tfs_", "");
+    return wrap(`🕒 Timeframes: <b>${sym}</b>`, kbTimeframes(sym));
   }
 
-  // Timeframe selection: tf_<SYMBOL>_<TF>
   if (data.startsWith("tf_")) {
-    const clean = data.replace("tf_", "");
-    const parts = clean.split("_");
-    const tf = parts.pop();
-    const symbol = parts.join("_");
+    const [_, symbol, tf] = data.split("_");
     return await generateReport(symbol, tf);
   }
 
-  // Refresh
   if (data.startsWith("refresh_")) {
-    const symbol = data.replace("refresh_", "");
-    return await generateReport(symbol);
+    const sym = data.replace("refresh_", "");
+    return await generateReport(sym);
   }
 
-  // News
   if (data.startsWith("news_")) {
-    const symbol = data.replace("news_", "");
-    const mapped = symbolMap[symbol] || symbol;
+    const sym = data.replace("news_", "");
+    const mapped = symbolMap[sym] || sym;
     const n = await fetchNewsBundle(mapped);
-    return {
-      text: `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
-      keyboard: kbActions(symbol)
-    };
+    return wrap(
+      `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+      kbActions(sym)
+    );
   }
 
-  // Elliott detailed
   if (data.startsWith("ell_")) {
-    const symbol = data.replace("ell_", "");
-    const mapped = symbolMap[symbol] || symbol;
-    const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
+    const sym = data.replace("ell_", "");
+    const mapped = symbolMap[sym] || sym;
+    const { data: cd } = await resolvePriceAndCandles(mapped, "15m");
 
     let ell = null;
-    try { if (Array.isArray(cdl) && cdl.length >= 8) ell = await analyzeElliott(cdl.slice(-500)); } catch (e) { console.debug(`[${VERSION}] ell detail err:`, e?.message || e); }
+    try { ell = await analyzeElliott(cd.slice(-500)); } catch {}
 
-    if (!ell || !Array.isArray(ell.patterns) || !ell.patterns.length) {
-      return { text: `📊 Elliott: N/A`, keyboard: kbActions(symbol) };
-    }
+    const det = ell?.patterns
+      ?.map(p => `${p.type} (${round(p.confidence, 0)}%)`)
+      ?.slice(0, 6)
+      ?.join(" + ") || "N/A";
 
-    const top = dedupeAndPickTop(ell.patterns, 6);
-    const det = top.map(p => `${String(p.type)} (${round(safeNum(p.confidence ?? p.conf ?? 0), 0)}%)`).join(" + ");
-
-    return {
-      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(safeNum(ell.confidence ?? top[0]?.confidence ?? 50, 50), 0)}%`,
-      keyboard: kbActions(symbol)
-    };
+    return wrap(
+      `📊 <b>Elliott (15m)</b>\n${det}\nConfidence: ${round(ell?.confidence || 50, 0)}%`,
+      kbActions(sym)
+    );
   }
 
-  return { text: "❌ Unknown", keyboard: kbHome };
+  return wrap("❌ Unknown", kbHome);
 }
 
-// EXPORTS
