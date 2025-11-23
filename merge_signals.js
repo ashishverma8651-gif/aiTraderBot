@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — v4.0 ULTRA FINAL (UI-SAFE + Elliott V3 + TF FIX)
+// merge_signals.js — v3.4 FINAL FIXED (UI + TF FIX + Elliott V3)
 // ============================================================
 
 import {
@@ -12,7 +12,7 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-const VERSION = "v4.0_UI_SAFE";
+const VERSION = "v3.4_FINAL";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -36,17 +36,13 @@ const symbolMap = {
 };
 
 // ================= HELPERS =================
-function wrap(text, kb) {
-  return {
-    text,
-    parse_mode: "HTML",
-    reply_markup: kb?.reply_markup
-  };
+function withHTML(kb) {
+  return { ...kb, parse_mode: "HTML" };
 }
 
 function isCryptoLike(sym) {
   if (!sym) return false;
-  const s = sym.toUpperCase();
+  const s = String(sym).toUpperCase();
   return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
 }
 
@@ -61,12 +57,8 @@ function round(v, d = 2) {
   return Math.round(v * m) / m;
 }
 
-function kb(k) {
-  return { ...k, parse_mode: "HTML" };
-}
-
-// ================== HOME MENUS ==================
-export const kbHome = kb({
+// ================= HOME KEYPADS ==================
+export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -81,7 +73,7 @@ export const kbHome = kb({
   }
 });
 
-export const kbCrypto = kb({
+export const kbCrypto = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -101,7 +93,7 @@ export const kbCrypto = kb({
   }
 });
 
-export const kbIndices = kb({
+export const kbIndices = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -117,7 +109,7 @@ export const kbIndices = kb({
   }
 });
 
-export const kbForex = kb({
+export const kbForex = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -137,7 +129,7 @@ export const kbForex = kb({
   }
 });
 
-export const kbCommodity = kb({
+export const kbCommodity = withHTML({
   reply_markup: {
     inline_keyboard: [
       [
@@ -155,7 +147,7 @@ export const kbCommodity = kb({
 
 // ACTION KEYPAD
 export function kbActions(symbol) {
-  return kb({
+  return withHTML({
     reply_markup: {
       inline_keyboard: [
         [
@@ -166,7 +158,7 @@ export function kbActions(symbol) {
           { text: "📊 Elliott", callback_data: `ell_${symbol}` },
           { text: "📰 News", callback_data: `news_${symbol}` }
         ],
-        [{ text: "⬅ Back", callback_data: "back_assets" }]
+        [{ text: "⬅ Back", callback_data: "back_home" }]
       ]
     }
   });
@@ -174,7 +166,7 @@ export function kbActions(symbol) {
 
 // TIMEFRAME KEYPAD
 export function kbTimeframes(symbol) {
-  return kb({
+  return withHTML({
     reply_markup: {
       inline_keyboard: [
         [
@@ -195,34 +187,35 @@ export function kbTimeframes(symbol) {
   });
 }
 
-// ==================== PRICE RESOLVER ====================
+// ================== PRICE RESOLVER ==================
 async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
   try {
-    const attempt = async (sym, timeframe) => {
+    const fetchAndCheck = async (sym, timeframe) => {
       const r = await fetchUniversal(sym, timeframe);
       const data = r?.data || r?.candles || [];
       const price = safeNum(r?.price || data.at(-1)?.close);
       return (price && data.length) ? { data, price } : null;
     };
 
-    let p = await attempt(symbolRaw, tf);
-    if (p) return { ...p, source: "universal" };
+    let u = await fetchAndCheck(symbolRaw, tf);
+    if (u) return { ...u, source: "universal" };
 
     if (isCryptoLike(symbolRaw)) {
       const c = await fetchMarketData(symbolRaw, tf);
-      if (c?.price) return { data: c.data, price: c.price, source: "marketData" };
+      if (c?.price && c?.data)
+        return { data: c.data, price: c.price, source: "marketData" };
     }
 
-    const mtf = await fetchMultiTF(symbolRaw, [tf]);
-    if (mtf?.[tf]) {
-      const d = mtf[tf].data || [];
-      const price = safeNum(mtf[tf].price || d.at(-1)?.close);
-      if (price) return { data: d, price, source: "multiTF" };
+    const m = await fetchMultiTF(symbolRaw, [tf]);
+    if (m?.[tf]) {
+      const d = m[tf].data || [];
+      const p = safeNum(m[tf].price || d.at(-1)?.close);
+      if (p) return { data: d, price: p, source: "multiTF" };
     }
 
     if (tf !== "15m") {
-      let fb = await attempt(symbolRaw, "15m");
-      if (fb) return { ...fb, source: "fallback-15m" };
+      let u15 = await fetchAndCheck(symbolRaw, "15m");
+      if (u15) return { ...u15, source: "universal-15m" };
     }
 
     return { data: [], price: 0, source: "none" };
@@ -235,98 +228,130 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
 export async function generateReport(symbolLabel, tf = "15m") {
   const mapped = symbolMap[symbolLabel] || symbolLabel;
 
-  const { data: candles, price } = await resolvePriceAndCandles(mapped, tf);
+  const { data: candles, price: livePrice } = await resolvePriceAndCandles(mapped, tf);
 
   let ml = {};
-  try { ml = await runMLPrediction(mapped, tf); } catch {}
+  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch {}
 
   let ell = null;
   try {
-    if (candles.length >= 12) ell = await analyzeElliott(candles.slice(-400));
+    if (candles.length >= 8)
+      ell = await analyzeElliott(candles.slice(-400));
   } catch {}
 
   let news = {};
-  try { news = await fetchNewsBundle(mapped); } catch {}
+  try { news = (await fetchNewsBundle(mapped)) || {}; } catch {}
 
-  const txt = `
-🔥 <b>${symbolLabel}</b> — <i>${tf}</i>
+  const direction = ml.direction || "Neutral";
+  const prob = safeNum(ml.maxProb || 50);
+
+  const out = {
+    symbol: symbolLabel,
+    price: round(livePrice, 4),
+    direction,
+    biasEmoji: direction === "Bullish" ? "📈" :
+               direction === "Bearish" ? "📉" : "⚪",
+    tp1: ml.tp1 ?? "—",
+    tp2: ml.tp2 ?? "—",
+    maxProb: prob,
+    ellText: ell?.patterns?.map(p => `${p.type}(${round(p.confidence, 0)}%)`).join(" + ") || "N/A",
+    ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
+    newsImpact: news.impact || "Neutral",
+    newsScore: news.sentiment || 50
+  };
+
+  const text = `
+🔥 <b>${out.symbol}</b>
 ━━━━━━━━━━━━━━
-📍 <b>Price:</b> ${round(price, 4)}
-📊 <b>Trend:</b> ${ml.direction || "Neutral"}
-📉 <b>Elliott:</b> ${
-    ell?.patterns
-      ?.map(p => `${p.type}(${round(p.confidence, 0)}%)`)
-      ?.join(" + ") || "N/A"
-  }
-📰 <b>News:</b> ${news.impact || "Neutral"} (${news.sentiment || 50}%)
-🎯 <b>TP:</b> ${ml.tp1 || "—"} | Hedge: ${ml.tp2 || "—"}
-🤖 <b>ML Prob:</b> ${ml.maxProb || 50}%
+📍 <b>Price:</b> ${out.price}
+📊 <b>Trend:</b> ${out.biasEmoji} ${out.direction}
+📉 <b>Elliott:</b> ${out.ellText} (${out.ellConf}%)
+📰 <b>News:</b> ${out.newsImpact} (${out.newsScore}%)
+🎯 <b>TP:</b> ${out.tp1} | Hedge: ${out.tp2}
+🤖 <b>ML Prob:</b> ${out.maxProb}%
 ━━━━━━━━━━━━━━
 `;
 
-  return wrap(txt, kbActions(symbolLabel));
+  return { text, keyboard: kbActions(symbolLabel) };
 }
 
 // ================= CALLBACK HANDLER ==================
 export async function handleCallback(query) {
   const data = query.data;
 
-  if (data === "back_home") return wrap("🏠 Home", kbHome);
-  if (data === "menu_crypto") return wrap("💠 Crypto", kbCrypto);
-  if (data === "menu_indices") return wrap("📘 Indices", kbIndices);
-  if (data === "menu_forex") return wrap("💱 Forex", kbForex);
-  if (data === "menu_commodities") return wrap("🛢 Commodities", kbCommodity);
-  if (data === "back_assets") return wrap("Choose Market", kbHome);
+  // Menus
+  if (data === "back_home") return { text: "🏠 Home", keyboard: kbHome };
+  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
+  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
+  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
+  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
 
+  // Asset
   if (data.startsWith("asset_")) {
-    const sym = data.replace("asset_", "");
-    return await generateReport(sym);
+    const symbol = data.replace("asset_", "");
+    const r = await generateReport(symbol);
+    return { text: r.text, keyboard: r.keyboard };
   }
 
+  // Timeframe menu
   if (data.startsWith("tfs_")) {
-    const sym = data.replace("tfs_", "");
-    return wrap(`🕒 Timeframes: <b>${sym}</b>`, kbTimeframes(sym));
+    const symbol = data.replace("tfs_", "");
+    return { text: `🕒 Timeframes: <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
   }
 
+  // Timeframe selected
   if (data.startsWith("tf_")) {
-    const [_, symbol, tf] = data.split("_");
-    return await generateReport(symbol, tf);
+    const clean = data.replace("tf_", "");
+    const [symbol, tf] = clean.split("_");
+    const r = await generateReport(symbol, tf);
+    return { text: r.text, keyboard: r.keyboard };
   }
 
+  // Refresh
   if (data.startsWith("refresh_")) {
-    const sym = data.replace("refresh_", "");
-    return await generateReport(sym);
+    const symbol = data.replace("refresh_", "");
+    const r = await generateReport(symbol);
+    return { text: r.text, keyboard: r.keyboard };
   }
 
+  // News
   if (data.startsWith("news_")) {
-    const sym = data.replace("news_", "");
-    const mapped = symbolMap[sym] || sym;
+    const symbol = data.replace("news_", "");
+    const mapped = symbolMap[symbol] || symbol;
+
     const n = await fetchNewsBundle(mapped);
-    return wrap(
-      `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
-      kbActions(sym)
-    );
+    return {
+      text: `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+      keyboard: kbActions(symbol)
+    };
   }
 
+  // Elliott detailed
   if (data.startsWith("ell_")) {
-    const sym = data.replace("ell_", "");
-    const mapped = symbolMap[sym] || sym;
-    const { data: cd } = await resolvePriceAndCandles(mapped, "15m");
+    const symbol = data.replace("ell_", "");
+    const mapped = symbolMap[symbol] || symbol;
 
+    const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
     let ell = null;
-    try { ell = await analyzeElliott(cd.slice(-500)); } catch {}
 
-    const det = ell?.patterns
-      ?.map(p => `${p.type} (${round(p.confidence, 0)}%)`)
-      ?.slice(0, 6)
-      ?.join(" + ") || "N/A";
+    try { ell = await analyzeElliott(cdl.slice(-500)); } catch {}
 
-    return wrap(
-      `📊 <b>Elliott (15m)</b>\n${det}\nConfidence: ${round(ell?.confidence || 50, 0)}%`,
-      kbActions(sym)
-    );
+    if (!ell || !ell.patterns?.length) {
+      return { text: "📊 Elliott: N/A", keyboard: kbActions(symbol) };
+    }
+
+    const det = ell.patterns
+      .map(p => `${p.type} (${round(p.confidence, 0)}%)`)
+      .slice(0, 6)
+      .join(" + ");
+
+    return {
+      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence, 0)}%`,
+      keyboard: kbActions(symbol)
+    };
   }
 
-  return wrap("❌ Unknown", kbHome);
+  return { text: "❌ Unknown", keyboard: kbHome };
 }
 
+// EXPORTS
