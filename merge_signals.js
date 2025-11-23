@@ -1,4 +1,4 @@
-// merge_signals.js — FINAL PREMIUM AI PANEL (FIXED + FALLBACKS)
+// merge_signals.js — FINAL PREMIUM AI PANEL (MULTI-TF FIXED)
 // ============================================================
 
 import {
@@ -33,8 +33,8 @@ const symbolMap = {
 };
 
 // ================= HELPERS =================
-function withHTML(keyboard) {
-  return { ...keyboard, parse_mode: "HTML" };
+function withHTML(kb) {
+  return { ...kb, parse_mode: "HTML" };
 }
 
 function isCryptoSymbol(s) {
@@ -196,48 +196,28 @@ Confidence: <b>${r.tpConf}%</b>
 `;
 }
 
-// ==================== PRICE / DATA FETCH WRAPPER WITH FALLBACKS ====================
+// ==================== MULTI-TF SAFE FETCH ====================
 async function resolvePriceAndCandles(symbol, tf = "15m") {
-  // symbol is already mapped before call
   try {
-    console.debug(`[merge_signals] resolvePriceAndCandles — primary fetchUniversal('${symbol}', '${tf}')`);
     const primary = await fetchUniversal(symbol, tf);
-    if (primary && ((primary.price && primary.price !== 0) || (primary.data && primary.data.length))) {
-      console.debug(`[merge_signals] primary success for ${symbol} price=${primary.price}`);
-      return { data: primary.data || primary.candles || [], price: safeNum(primary.price || (primary.data?.at(-1)?.close)), source: "universal" };
-    }
+    if (primary && (primary.price || primary.data?.length))
+      return { data: primary.data || [], price: safeNum(primary.price || primary.data.at(-1)?.close), source: "universal" };
 
-    // Fallback 1: if it's crypto-like try fetchMarketData
     if (isCryptoSymbol(symbol)) {
-      console.debug(`[merge_signals] fallback crypto fetchMarketData('${symbol}', '${tf}')`);
       const m = await fetchMarketData(symbol, tf);
-      if (m && m.price && m.price !== 0) return { data: m.data || [], price: safeNum(m.price), source: "marketData" };
+      if (m?.price) return { data: m.data || [], price: safeNum(m.price), source: "marketData" };
     }
 
-    // Fallback 2: try fetchMultiTF and pick requested tf
-    try {
-      console.debug(`[merge_signals] fallback fetchMultiTF('${symbol}')`);
-      const multi = await fetchMultiTF(symbol, [tf]);
-      if (multi && multi[tf] && multi[tf].price && multi[tf].price !== 0) {
-        return { data: multi[tf].data || [], price: safeNum(multi[tf].price), source: "multiTF" };
-      }
-    } catch (e) {
-      /* ignore */
-    }
+    const multi = await fetchMultiTF(symbol, [tf]);
+    if (multi?.[tf]?.data?.length)
+      return {
+        data: multi[tf].data,
+        price: safeNum(multi[tf].price || multi[tf].data.at(-1)?.close),
+        source: "multiTF"
+      };
 
-    // Fallback 3: if symbol looks like Yahoo ticker (contains '=' or ends with X or starts with ^) try fetchUniversal again with tf='15m'
-    if (!symbol.includes("USDT") && (symbol.includes("=") || symbol.endsWith("=X") || symbol.startsWith("^"))) {
-      console.debug(`[merge_signals] re-trying universal with fallback tf='15m' for ${symbol}`);
-      const p2 = await fetchUniversal(symbol, "15m");
-      if (p2 && (p2.price || (p2.data && p2.data.length))) return { data: p2.data || [], price: safeNum(p2.price || p2.data?.at(-1)?.close), source: "universal-2" };
-    }
-
-    // Nothing found — return empty
-    console.debug(`[merge_signals] all fetch attempts failed for ${symbol}`);
     return { data: [], price: 0, source: "none" };
-
-  } catch (err) {
-    console.debug(`[merge_signals] resolvePriceAndCandles error for ${symbol}:`, err?.message || err);
+  } catch (e) {
     return { data: [], price: 0, source: "error" };
   }
 }
@@ -246,19 +226,11 @@ async function resolvePriceAndCandles(symbol, tf = "15m") {
 export async function generateReport(symbol, tf = "15m") {
   const mappedSymbol = symbolMap[symbol] || symbol;
 
-  // fetch price & candles with robust fallback strategy
-  const { data: candles, price: livePrice, source } = await resolvePriceAndCandles(mappedSymbol, tf);
+  const { data: candles, price: livePrice } = await resolvePriceAndCandles(mappedSymbol, tf);
 
-  // ML prediction (use mappedSymbol for ML as well)
   let ml = {};
-  try {
-    ml = (await runMLPrediction(mappedSymbol, tf)) || {};
-  } catch (e) {
-    console.debug(`[merge_signals] runMLPrediction error for ${mappedSymbol}:`, e?.message || e);
-    ml = {};
-  }
+  try { ml = await runMLPrediction(mappedSymbol, tf) || {}; } catch { ml = {}; }
 
-  // Determine direction & emojis / TP fields (safe)
   const direction = ml.direction || "Neutral";
   const biasEmoji = direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪";
 
@@ -266,49 +238,27 @@ export async function generateReport(symbol, tf = "15m") {
   const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
   const tpConf = ml.tpConfidence ?? 55;
 
-  // Elliott analysis (safe)
   let ell = {};
-  try {
-    ell = await analyzeElliott(Array.isArray(candles) ? candles : []);
-  } catch (e) {
-    console.debug(`[merge_signals] analyzeElliott error for ${mappedSymbol}:`, e?.message || e);
-    ell = {};
-  }
+  try { ell = await analyzeElliott(candles || []); } catch { ell = {}; }
   const ep = extractElliottPattern(ell);
 
-  // News
   let news = {};
-  try {
-    news = (await fetchNewsBundle(mappedSymbol)) || {};
-  } catch (e) {
-    console.debug(`[merge_signals] fetchNewsBundle error for ${mappedSymbol}:`, e?.message || e);
-    news = {};
-  }
+  try { news = await fetchNewsBundle(mappedSymbol) || {}; } catch { news = {}; }
 
-  // Build output
   const out = {
     symbol,
     price: livePrice,
     direction,
     biasEmoji,
-
     tp1,
     tp2,
     tpConf,
-
     maxProb: ml.maxProb || 50,
-
     elliottPattern: ep.name,
     elliottConf: ep.conf,
-
     newsImpact: news.impact || "Neutral",
-    newsScore: news.sentiment || 50,
-
-    _meta: { mappedSymbol, source, candlesFound: Array.isArray(candles) ? candles.length : 0 }
+    newsScore: news.sentiment || 50
   };
-
-  // Note: _meta is internal — not shown in message but useful in logs; remove if you prefer.
-  console.debug("[merge_signals] Report meta:", out._meta);
 
   return {
     text: formatPremiumReport(out),
@@ -320,7 +270,6 @@ export async function generateReport(symbol, tf = "15m") {
 export async function handleCallback(query) {
   const data = query.data;
 
-  // HOME
   if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
   if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
   if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
@@ -328,46 +277,42 @@ export async function handleCallback(query) {
   if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
   if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
 
-  // ASSET
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol);
   }
 
-  // TIMEFRAMES LIST
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
     return { text: `🕒 Timeframes for <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
   }
 
-  // TF SELECT
+  // ===== FIXED MULTI-TF HANDLER =====
   if (data.startsWith("tf_")) {
-    const [, symbol, tf] = data.split("_");
+    const clean = data.replace("tf_", "");  // BTCUSDT_5m
+    const [symbol, tf] = clean.split("_");
     return await generateReport(symbol, tf);
   }
 
-  // REFRESH
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
     return await generateReport(symbol);
   }
 
-  // NEWS
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
-    const mappedSymbol = symbolMap[symbol] || symbol;
-    const news = await fetchNewsBundle(mappedSymbol);
+    const mapped = symbolMap[symbol] || symbol;
+    const n = await fetchNewsBundle(mapped);
     return {
-      text: `📰 <b>News Report</b>\nImpact: ${news.impact}\nSentiment: ${news.sentiment}%`,
+      text: `📰 <b>News Report</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
       keyboard: kbActions(symbol)
     };
   }
 
-  // ELLIOTT button
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
-    const mappedSymbol = symbolMap[symbol] || symbol;
-    const pd = await resolvePriceAndCandles(mappedSymbol, "15m");
+    const mapped = symbolMap[symbol] || symbol;
+    const pd = await resolvePriceAndCandles(mapped, "15m");
     const ell = await analyzeElliott(pd.data || []);
     const ep = extractElliottPattern(ell);
     return {
