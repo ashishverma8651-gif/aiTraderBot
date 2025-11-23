@@ -88,7 +88,7 @@ function fuseMLTFs(mlList = []) {
       tp: Number(m.tpEstimate ?? m.tp ?? m.tpEstimate ?? 0),
       hedge: Number(m.hedgeTP ?? m.hedge ?? 0),
       tpConfidence: Number(m.tpConfidence ?? m.tpConfidence ?? (m.tpConfidence ?? 0)),
-      maxProb: maxProb
+      maxProb: maxProb // Use maxProb as the ML confidence source
     });
   }
 
@@ -113,12 +113,19 @@ function fuseMLTFs(mlList = []) {
 
     // If TP missing or zero, skip contribution
     if (isNum(t.tp) && t.tp > 0) { tpSum += t.tp * includeWeight; wSum += includeWeight; }
-    if (isNum(t.hedge) && t.hedge > 0) { hedgeSum += t.hedge * includeWeight; confSum += (t.tpConfidence || t.maxProb) * includeWeight; }
+    
+    // FIX 1: Fused Confidence Calculation - Only use maxProb (true ML confidence) for fusion.
+    if (isNum(t.hedge) && t.hedge > 0) { hedgeSum += t.hedge * includeWeight; }
+    confSum += t.maxProb * includeWeight; // Correctly fuse maxProb (61.90% etc.)
   }
+  
+  // FIX 1: ConfSum wSum calculation - Use the total weight accumulated for averaging maxProb
+  const totalWeightForConf = available.reduce((sum, m) => sum + (WEIGHTS[m.tf] ?? 0.2), 0);
 
   const primaryTP = (wSum > 0) ? (tpSum / wSum) : (tps[0] ? tps[0].tp : null);
-  const hedgeTP = (confSum > 0) ? (hedgeSum / wSum) : (tps[0] ? tps[0].hedge : null);
-  const avgConfidence = (wSum > 0) ? (confSum / wSum) : (available.reduce((a,b)=>a + (b.maxProb||0),0) / available.length || 0);
+  const hedgeTP = (wSum > 0) ? (hedgeSum / wSum) : (tps[0] ? tps[0].hedge : null);
+  const avgConfidence = (totalWeightForConf > 0) ? (confSum / totalWeightForConf) : (available.reduce((a,b)=>a + (b.maxProb||0),0) / available.length || 0);
+  
   return {
     direction: finalDir,
     primaryTP: isNum(primaryTP) ? Number(primaryTP) : null,
@@ -139,6 +146,7 @@ function buildStableTargets(clusterTargets = [], mlFusion = null, price = 0, fea
   const dir = mlFusion?.direction || "Neutral";
   const atr = Math.max(feats?.atr || 0, Math.abs(price) * 0.0005);
   let primary = null, hedge = null;
+  const mlFusionConf = mlFusion?.confidence ?? 40; // Default ML Conf 40%
 
   if (sorted.length) {
     // prefer candidates that match the direction (tp > price for bullish)
@@ -148,6 +156,12 @@ function buildStableTargets(clusterTargets = [], mlFusion = null, price = 0, fea
     else if (dir === "Bearish") primary = (bears.length ? bears[0] : sorted[0]);
     else primary = sorted[0];
 
+    // FIX 2: TP Confidence 100% check - If cluster confidence is unreasonably high (e.g., 100%),
+    // cap it to ML Fusion confidence for stability.
+    if (primary && primary.confidence >= 95 && mlFusionConf < 90) {
+      primary.confidence = Math.round(Math.max(mlFusionConf, 70)); // Cap to max of fused ML or 70%
+    }
+    
     // hedge: choose best opposite-side candidate or use ML hedge or ATR hedge
     if (dir === "Bullish") {
       hedge = (bears.length ? bears[0] : (mlFusion?.hedgeTP ? { tp: mlFusion.hedgeTP, source: "ML" } : { tp: price - atr * 1.2, source: "HEDGE_ATR" }));
@@ -161,8 +175,8 @@ function buildStableTargets(clusterTargets = [], mlFusion = null, price = 0, fea
   } else {
     // no cluster targets -> fallback to ML primary or ATR targets
     if (mlFusion && isNum(mlFusion.primaryTP) && mlFusion.primaryTP > 0) {
-      primary = { tp: mlFusion.primaryTP, source: "ML", confidence: mlFusion.confidence };
-      hedge = isNum(mlFusion.hedgeTP) && mlFusion.hedgeTP > 0 ? { tp: mlFusion.hedgeTP, source: "ML", confidence: mlFusion.confidence } : { tp: (dir === "Bullish" ? price - atr * 1.2 : price + atr * 1.2), source: "HEDGE_ATR", confidence: 30 };
+      primary = { tp: mlFusion.primaryTP, source: "ML", confidence: mlFusionConf };
+      hedge = isNum(mlFusion.hedgeTP) && mlFusion.hedgeTP > 0 ? { tp: mlFusion.hedgeTP, source: "ML", confidence: mlFusionConf } : { tp: (dir === "Bullish" ? price - atr * 1.2 : price + atr * 1.2), source: "HEDGE_ATR", confidence: 30 };
     } else {
       // ATR-based
       primary = { tp: (dir === "Bullish" ? price + atr * 2.5 : dir === "Bearish" ? price - atr * 2.5 : price + atr * 2.5), source: "ATR", confidence: 30 };
@@ -175,7 +189,7 @@ function buildStableTargets(clusterTargets = [], mlFusion = null, price = 0, fea
   const hedgeTP = Number(hedge.tp);
   const primarySource = primary.source || "Cluster";
   const hedgeSource = hedge.source || "Cluster";
-  const primaryConf = Math.round(primary.confidence ?? mlFusion?.confidence ?? 40);
+  const primaryConf = Math.round(primary.confidence ?? mlFusionConf);
 
   return { primaryTP, hedgeTP, primarySource, hedgeSource, primaryConf, direction: dir };
 }
@@ -413,7 +427,7 @@ export async function formatAIReport(report = {}) {
     const mlConf = mlFusion.confidence ?? (mlPerTF[0]?.maxProb ?? 0);
     const mlAccObj = report.mlAcc || 0;
     const mlAcc = (typeof mlAccObj === "object") ? (mlAccObj.accuracy ?? 0) : (isNum(mlAccObj) ? mlAccObj : 0);
-    const aw = ml.perTF && ml.perTF[0] && ml.perTF[0].adaptiveWeights ? ml.perTF[0].adaptiveWeights : (mlPerTF[0]?.adaptiveWeights || { w_ind:0.45, w_cnn:0.25, w_of:0.2, w_news:0.1 });
+    const aw = ml.perTF && ml.perTF[0] && ml.perTF[0].explanation && ml.perTF[0].explanation.adaptiveWeights ? ml.perTF[0].explanation.adaptiveWeights : (mlPerTF[0]?.adaptiveWeights || { w_ind:0.45, w_cnn:0.25, w_of:0.2, w_news:0.1 });
     const awTxt = `ind:${Math.round((aw.w_ind||0)*100)}% cnn:${Math.round((aw.w_cnn||0)*100)}% of:${Math.round((aw.w_of||0)*100)}% news:${Math.round((aw.w_news||0)*100)}%`;
 
     const news = report.news || {};
