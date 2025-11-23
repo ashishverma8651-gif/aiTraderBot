@@ -1,8 +1,8 @@
 // ================================
-// utils.js — FINAL FULL FIXED VERSION (LIVE MARKET) - Logs Removed
+// utils.js — FINAL FULL FIXED VERSION (LIVE MARKET) - Logs Removed & Error Handling Fixed
 // =================================
-// This version removes excessive console logging to prevent memory issues
-// during high API call volumes.
+// IMPORTANT: Reverted safeGet to not throw errors on failure, allowing 
+// it to return null silently as originally intended.
 // ================================
 
 import axios from "axios";
@@ -77,19 +77,19 @@ const SYMBOL_EQUIV = {
 };
 
 // --------------------------------
-// SAFE GET + MIRRORS
+// SAFE GET + MIRRORS (FIXED)
 // --------------------------------
 async function safeGet(url, mirrors = [], timeout = AXIOS_TIMEOUT) {
   for (let a = 0; a < RETRY_ATTEMPTS; a++) {
     try {
       const r = await axios.get(url, { timeout });
       if (r?.data) return r.data;
-    } catch (e) {
-      // Suppress retry logs unless fatal
+    } catch {
+      // Reverted to original logic: if error, try again or move to mirror, do not throw.
       if (a < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS);
-      else throw new Error(`Failed to fetch ${url} after retries: ${e.message}`);
     }
   }
+  
   for (const mirror of mirrors) {
     if (!mirror) continue;
     let final = url;
@@ -97,17 +97,18 @@ async function safeGet(url, mirrors = [], timeout = AXIOS_TIMEOUT) {
       const u = new URL(url);
       final = mirror.replace(/\/+$/, "") + u.pathname + u.search;
     } catch {}
+    
     for (let a = 0; a < RETRY_ATTEMPTS; a++) {
       try {
         const r = await axios.get(final, { timeout });
         if (r?.data) return r.data;
-      } catch (e) {
+      } catch {
         if (a < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS);
-        else throw new Error(`Failed to fetch ${final} via mirror: ${e.message}`);
       }
     }
   }
-  return null;
+  
+  return null; // All attempts failed, return null silently.
 }
 
 // --------------------------------
