@@ -711,4 +711,3 @@ export async function analyzeElliott(candles = [], opts = {}) {
   }
 }
 
-export { analyzeElliott };
