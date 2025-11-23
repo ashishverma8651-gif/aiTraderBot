@@ -1,5 +1,5 @@
 // ===============================================================
-// merge_signals.js — FINAL PREMIUM AI PANEL (STABLE + FIXED)
+// merge_signals.js — FINAL PREMIUM AI PANEL (FIXED, CLEAN, STABLE)
 // ===============================================================
 
 // 🔥 PRICE ENGINE
@@ -15,9 +15,9 @@ import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
 
-// ===============================
-// SYMBOL MAP
-// ===============================
+// ==============================================================
+// SYMBOL MAP (FULL)
+// ==============================================================
 const symbolMap = {
   NIFTY50: "^NSEI",
   BANKNIFTY: "^NSEBANK",
@@ -39,17 +39,17 @@ const symbolMap = {
 };
 
 
-// ===============================
-// SAFE HTML WRAPPER
-// ===============================
+// ==============================================================
+// Wrapper
+// ==============================================================
 function withHTML(keyboard) {
   return { ...keyboard, parse_mode: "HTML" };
 }
 
 
-// ===============================
+// ==============================================================
 // HOME MENU
-// ===============================
+// ==============================================================
 export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -66,9 +66,9 @@ export const kbHome = withHTML({
 });
 
 
-// ===============================
+// ==============================================================
 // CRYPTO MENU
-// ===============================
+// ==============================================================
 export const kbCrypto = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -90,9 +90,9 @@ export const kbCrypto = withHTML({
 });
 
 
-// ===============================
+// ==============================================================
 // INDICES MENU
-// ===============================
+// ==============================================================
 export const kbIndices = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -110,9 +110,9 @@ export const kbIndices = withHTML({
 });
 
 
-// ===============================
+// ==============================================================
 // FOREX MENU
-// ===============================
+// ==============================================================
 export const kbForex = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -134,9 +134,9 @@ export const kbForex = withHTML({
 });
 
 
-// ===============================
+// ==============================================================
 // COMMODITIES MENU
-// ===============================
+// ==============================================================
 export const kbCommodity = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -154,10 +154,9 @@ export const kbCommodity = withHTML({
 });
 
 
-
-// =====================================================
-// ACTION BUTTONS
-// =====================================================
+// ==============================================================
+// ACTIONS (REFRESH / TFS / NEWS / ELLIOTT)
+// ==============================================================
 export function kbActions(symbol) {
   return withHTML({
     reply_markup: {
@@ -177,26 +176,19 @@ export function kbActions(symbol) {
 }
 
 
-
-// =====================================================
+// ==============================================================
 // TIMEFRAME SELECTOR
-// =====================================================
+// ==============================================================
 export function kbTimeframes(symbol) {
   return withHTML({
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: "5m", callback_data: `tf_${symbol}_5m` },
-          { text: "15m", callback_data: `tf_${symbol}_15m` }
-        ],
-        [
-          { text: "30m", callback_data: `tf_${symbol}_30m` },
-          { text: "1h", callback_data: `tf_${symbol}_1h` }
-        ],
-        [
-          { text: "4h", callback_data: `tf_${symbol}_4h` },
-          { text: "1D", callback_data: `tf_${symbol}_1d` }
-        ],
+        [{ text: "5m", callback_data: `tf_${symbol}_5m` },
+         { text: "15m", callback_data: `tf_${symbol}_15m` }],
+        [{ text: "30m", callback_data: `tf_${symbol}_30m` },
+         { text: "1h", callback_data: `tf_${symbol}_1h` }],
+        [{ text: "4h", callback_data: `tf_${symbol}_4h` },
+         { text: "1D", callback_data: `tf_${symbol}_1d` }],
         [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
       ]
     }
@@ -204,29 +196,24 @@ export function kbTimeframes(symbol) {
 }
 
 
-
-// =====================================================
-// ELLIOTT PATTERN SELECTOR (NEW)
-// =====================================================
+// ==============================================================
+// Elliott Pattern Extractor
+// ==============================================================
 function extractElliottPattern(ell) {
   if (!ell || !ell.patterns || !ell.patterns.length)
     return { name: "N/A", conf: ell?.confidence || 50 };
 
-  const best = ell.patterns.reduce((a, b) =>
-    (a.confidence || 0) > (b.confidence || 0) ? a : b
-  );
-
+  const p = ell.patterns[0];
   return {
-    name: best.type || "Pattern",
-    conf: best.confidence || ell?.confidence || 50
+    name: p.type || "Structure",
+    conf: p.confidence || ell.confidence || 50
   };
 }
 
 
-
-// =====================================================
-// PREMIUM REPORT FORMATTER
-// =====================================================
+// ==============================================================
+// FORMATTER
+// ==============================================================
 export function formatPremiumReport(r) {
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
@@ -247,48 +234,48 @@ Confidence: <b>${r.tpConf}%</b>
 }
 
 
-
-// =====================================================
-// MAIN AI REPORT BUILDER
-// =====================================================
+// ==============================================================
+// MAIN REPORT (FULL FIXED)
+// ==============================================================
 export async function generateReport(symbol, tf = "15m") {
-
   const mappedSymbol = symbolMap[symbol] || symbol;
 
-  // PRICE SOURCE
+  // REAL DATA FOR TIMEFRAME
   const priceData = await fetchUniversal(mappedSymbol, tf);
-  let livePrice = priceData?.price || 0;
+  const candles = priceData?.data || priceData?.candles || [];
 
-  // ML ENGINE
+  const livePrice = priceData?.price || 0;
+
+  // ML
   const ml = await runMLPrediction(mappedSymbol, tf) || {};
 
-  // SAFE CANDLE SOURCE
-  let candles =
-    ml?.explanation?.features?.candles ||
-    priceData?.data ||
-    priceData?.candles ||
-    [];
+  const direction = ml.direction || "Neutral";
+  const biasEmoji =
+    direction === "Bullish" ? "📈" :
+    direction === "Bearish" ? "📉" : "⚪";
 
-  // ELLIOTT MODULE
+  const tp1 = ml.tpEstimate ?? ml.tp1 ?? "—";
+  const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
+  const tpConf = ml.tpConfidence ?? 55;
+
+  // Elliott
   const ell = await analyzeElliott(candles);
   const ep = extractElliottPattern(ell);
 
-  // NEWS MODULE
+  // NEWS
   const news = await fetchNewsBundle(mappedSymbol) || {};
 
   const out = {
     symbol,
     price: livePrice,
+    direction,
+    biasEmoji,
 
-    direction: ml.direction || "Neutral",
-    biasEmoji:
-      ml.direction === "Bullish" ? "📈" :
-      ml.direction === "Bearish" ? "📉" : "⚪",
+    tp1,
+    tp2,
+    tpConf,
 
     maxProb: ml.maxProb || 50,
-    tp1: ml.tpEstimate || "—",
-    tp2: ml.tp2Estimate || "—",
-    tpConf: ml.tpConfidence || 55,
 
     elliottPattern: ep.name,
     elliottConf: ep.conf,
@@ -304,39 +291,25 @@ export async function generateReport(symbol, tf = "15m") {
 }
 
 
-
-// =====================================================
-// CALLBACK ROUTER (STABLE VERSION)
-// =====================================================
+// ==============================================================
+// CALLBACK ROUTER (FINAL FIXED)
+// ==============================================================
 export async function handleCallback(query) {
   const data = query.data;
 
-  // MAIN NAVIGATION
-  if (data === "back_home")
-    return { text: "🏠 HOME", keyboard: kbHome };
+  // HOME NAVIGATION
+  if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
+  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
+  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
+  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
+  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
+  if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
 
-  if (data === "menu_crypto")
-    return { text: "💠 Crypto Market", keyboard: kbCrypto };
-
-  if (data === "menu_indices")
-    return { text: "📘 Indices Market", keyboard: kbIndices };
-
-  if (data === "menu_forex")
-    return { text: "💱 Forex Market", keyboard: kbForex };
-
-  if (data === "menu_commodities")
-    return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-
-  if (data === "back_assets")
-    return { text: "Choose Market", keyboard: kbHome };
-
-
-  // SELECT ASSET
+  // ASSET SELECTED
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol);
   }
-
 
   // TIMEFRAME MENU
   if (data.startsWith("tfs_")) {
@@ -347,47 +320,39 @@ export async function handleCallback(query) {
     };
   }
 
-
-  // SPECIFIC TIMEFRAME
+  // SPECIFIC TF
   if (data.startsWith("tf_")) {
     const [, symbol, tf] = data.split("_");
     return await generateReport(symbol, tf);
   }
 
-
-  // REFRESH BUTTON
+  // REFRESH
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
     return await generateReport(symbol);
   }
 
-
-  // NEWS REPORT
+  // NEWS
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
     const mappedSymbol = symbolMap[symbol] || symbol;
-
     const news = await fetchNewsBundle(mappedSymbol);
 
     return {
-      text: `📰 <b>NEWS REPORT</b>
+      text: `📰 <b>News Report</b>
 Impact: ${news.impact}
 Sentiment: ${news.sentiment}%`,
       keyboard: kbActions(symbol)
     };
   }
 
-
-  // ELLIOTT REPORT
+  // ELLIOTT
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
     const mappedSymbol = symbolMap[symbol] || symbol;
 
     const priceData = await fetchUniversal(mappedSymbol, "15m");
-    const candles =
-      priceData?.data ||
-      priceData?.candles ||
-      [];
+    const candles = priceData?.data || priceData?.candles || [];
 
     const ell = await analyzeElliott(candles);
     const ep = extractElliottPattern(ell);
@@ -399,7 +364,6 @@ Confidence: ${ep.conf}%`,
       keyboard: kbActions(symbol)
     };
   }
-
 
   return { text: "❌ Unknown command", keyboard: kbHome };
 }
