@@ -173,4 +173,3 @@ export async function analyzeElliott(candles, options = { lookback: 5 }) {
     };
 }
 
-export { analyzeElliott };
