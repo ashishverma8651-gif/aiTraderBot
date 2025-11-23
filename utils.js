@@ -19,7 +19,7 @@ const RETRY_DELAY_MS = 400;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // --------------------------------
-// CACHE HELPERS
+// CACHE HELPERS (Currently unused in fetch functions, but kept for future use)
 // --------------------------------
 function cachePath(symbol, interval) {
   return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
@@ -131,9 +131,13 @@ function normalizeKline(raw) {
 // --------------------------------
 async function fetchCrypto(symbol, interval = "15m", limit = 200) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  console.log(`[UTILS-DEBUG] Fetching Crypto: ${symbol} @ ${interval}. URL: ${url}`); // 🔥 DEBUG LOG
   const mirrors = CONFIG.DATA_SOURCES?.BINANCE || [];
   const raw = await safeGet(url, mirrors);
-  if (!raw) return [];
+  if (!raw) {
+    console.warn(`[UTILS-DEBUG] WARNING: No data returned for ${symbol} @ ${interval} (Binance)`); // 🔥 DEBUG LOG
+    return [];
+  }
   return normalizeKline(raw);
 }
 
@@ -145,10 +149,15 @@ async function fetchYahoo(symbol, interval = "15m") {
     const tf = TF_MAP[interval] || TF_MAP["15m"];
     const base = CONFIG.DATA_SOURCES?.YAHOO?.[0] || "https://query1.finance.yahoo.com/v8/finance/chart";
     const url = `${base}/${encodeURIComponent(symbol)}?interval=${tf.interval}&range=${tf.range}`;
+    
+    console.log(`[UTILS-DEBUG] Fetching Yahoo: ${symbol} @ ${interval} (${tf.interval}). URL: ${url}`); // 🔥 DEBUG LOG
 
     const res = await safeGet(url);
     const r = res?.chart?.result?.[0];
-    if (!r) return [];
+    if (!r) {
+      console.warn(`[UTILS-DEBUG] WARNING: No result found in Yahoo data for ${symbol} @ ${interval}`); // 🔥 DEBUG LOG
+      return [];
+    }
 
     const ts = r.timestamp || [];
     const q = r.indicators?.quote?.[0] || {};
@@ -167,9 +176,12 @@ async function fetchYahoo(symbol, interval = "15m") {
         vol: q.volume?.[i] || 0
       });
     }
+    
+    console.log(`[UTILS-DEBUG] Yahoo Data Count for ${symbol} @ ${interval}: ${out.length}`); // 🔥 DEBUG LOG
     return out;
 
-  } catch {
+  } catch (error) {
+    console.error(`[UTILS-DEBUG] fetchYahoo Error for ${symbol} @ ${interval}:`, error.message); // 🔥 DEBUG LOG
     return [];
   }
 }
@@ -180,7 +192,7 @@ async function fetchYahoo(symbol, interval = "15m") {
 async function fetchNSE(symbol, interval = "15m") {
   const mapped = SYMBOL_EQUIV[symbol];
   if (mapped?.startsWith("^")) {
-    const d = await fetchYahoo(mapped, interval);
+    const d = await fetchYahoo(mapped, interval); // Passes interval to fetchYahoo
     if (d.length) return d;
   }
   return [];
@@ -191,14 +203,15 @@ async function fetchNSE(symbol, interval = "15m") {
 // --------------------------------
 export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
   try {
-    const data = await fetchCrypto(symbol, interval, limit);
+    const data = await fetchCrypto(symbol, interval, limit); // Passes interval to fetchCrypto
     const last = data.at(-1) || {};
     return {
       data,
       price: +last.close || 0,
       updated: new Date().toISOString()
     };
-  } catch {
+  } catch (error) {
+    console.error(`[UTILS-DEBUG] fetchMarketData error:`, error.message);
     return { data: [], price: 0 };
   }
 }
@@ -238,7 +251,8 @@ export async function fetchUniversal(symbol, interval = "15m") {
 
     return { data: [], price: 0 };
 
-  } catch {
+  } catch (error) {
+    console.error(`[UTILS-DEBUG] fetchUniversal main error:`, error.message);
     return { data: [], price: 0 };
   }
 }
@@ -249,7 +263,8 @@ export async function fetchUniversal(symbol, interval = "15m") {
 export async function fetchMultiTF(symbol, tfs = ["5m", "15m", "1h"]) {
   const out = {};
   await Promise.all(tfs.map(async tf => {
-    out[tf] = await fetchUniversal(symbol, tf);
+    out[tf] = await fetchUniversal(symbol, tf); // Passes TF correctly
   }));
   return out;
 }
+
