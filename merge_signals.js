@@ -1,3 +1,6 @@
+// merge_signals_fixed.js — merged & fixed (based on your provided code)
+// Version: v3.4_FINAL (fixed ML TP mapping for multimarket)
+
 // ============================================================
 // merge_signals.js — v3.4 FINAL (UI OK + TF OK + Single Elliott Pattern)
 // ============================================================
@@ -48,7 +51,7 @@ function isCryptoLike(sym) {
 
 function safeNum(v, fb = 0) {
   const n = Number(v);
- 	return Number.isFinite(n) ? n : fb;
+  return Number.isFinite(n) ? n : fb;
 }
 
 function round(v, d = 2) {
@@ -231,25 +234,51 @@ export async function generateReport(symbolLabel, tf = "15m") {
   const { data: candles, price: livePrice } = await resolvePriceAndCandles(mapped, tf);
 
   let ml = {};
-  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch {}
+  try {
+    // call ML with mapped symbol (multimarket aware)
+    ml = (await runMLPrediction(mapped, tf)) || {};
+  } catch (err) {
+    // keep ml empty on error (we'll show fallbacks)
+    ml = {};
+  }
 
   let ell = null;
   try {
     if (candles.length >= 8)
       ell = await analyzeElliott(candles.slice(-400));
-  } catch {}
+  } catch (e) {
+    ell = null;
+  }
 
   let news = {};
-  try { news = (await fetchNewsBundle(mapped)) || {}; } catch {}
+  try { news = (await fetchNewsBundle(mapped)) || {}; } catch (e) { news = {}; }
+
+  // ======== FIX: map ML TP field names robustly ========
+  // ml may use tpEstimate/tp2Estimate (new) or tp1/tp2 (old). Use either, else "—"
+  const tpPrimaryRaw = (ml && (ml.tpEstimate ?? ml.tp1 ?? ml.tp)) ?? null;
+  const tpHedgeRaw = (ml && (ml.tp2Estimate ?? ml.tp2 ?? ml.tpSecondary ?? ml.tp_hedge)) ?? null;
+
+  // Make sure we return sensible strings
+  const formatTP = (v) => {
+    if (!v && v !== 0) return "—";
+    if (typeof v === "number") return String(round(v, 4));
+    return String(v);
+  };
+
+  const tp1_val = formatTP(tpPrimaryRaw);
+  const tp2_val = formatTP(tpHedgeRaw);
 
   const direction = ml.direction || "Neutral";
-  const prob = safeNum(ml.maxProb || 50);
+  const prob = safeNum(ml.maxProb ?? ml.prob ?? 50);
 
   // =============== FIX: SINGLE BEST PATTERN ONLY ===============
   const ellText = (() => {
-    if (!ell?.patterns?.length) return "N/A";
-    const best = ell.patterns.sort((a, b) => b.confidence - a.confidence)[0];
-    return `${best.type} (${round(best.confidence, 0)}%)`;
+    if (!ell) return "N/A";
+    // older analyzeElliott returns { patterns: [], confidence: num } or ({ targets, patterns })
+    const patterns = ell.patterns || (ell.results && ell.results.patterns) || [];
+    if (!patterns.length) return "N/A";
+    const best = patterns.sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
+    return `${best.type || best.name || "Pattern"} (${round(best.confidence || 0, 0)}%)`;
   })();
 
   const out = {
@@ -258,13 +287,13 @@ export async function generateReport(symbolLabel, tf = "15m") {
     direction,
     biasEmoji: direction === "Bullish" ? "📈" :
                direction === "Bearish" ? "📉" : "⚪",
-    tp1: ml.tp1 ?? "—",
-    tp2: ml.tp2 ?? "—",
+    tp1: tp1_val,
+    tp2: tp2_val,
     maxProb: prob,
     ellText,
     ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
     newsImpact: news.impact || "Neutral",
-    newsScore: news.sentiment || 50
+    newsScore: (typeof news.sentiment === "number") ? round(news.sentiment, 1) : (news.sentiment || 50)
   };
 
   const text = `
@@ -341,20 +370,20 @@ export async function handleCallback(query) {
     const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
     let ell = null;
 
-    try { ell = await analyzeElliott(cdl.slice(-500)); } catch {}
+    try { ell = await analyzeElliott(cdl.slice(-500)); } catch (e) { ell = null; }
 
     if (!ell || !ell.patterns?.length) {
       return { text: "📊 Elliott: N/A", keyboard: kbActions(symbol) };
     }
 
     const det = ell.patterns
-      .sort((a, b) => b.confidence - a.confidence)
+      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
       .slice(0, 5)
-      .map(p => `${p.type} (${round(p.confidence, 0)}%)`)
+      .map(p => `${p.type || p.name} (${round(p.confidence || 0, 0)}%)`)
       .join("\n");
 
     return {
-      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence, 0)}%`,
+      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence || 0, 0)}%`,
       keyboard: kbActions(symbol)
     };
   }
