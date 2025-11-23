@@ -13,7 +13,7 @@ import { analyzeElliott } from "./elliott_module.js"; // Assumes elliott_module 
 import { fetchNewsBundle } from "./news_social.js";
 
 // Internal version tag for debugging
-const VERSION = "v2_6";
+const VERSION = "v2_6_FIXED";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -59,7 +59,6 @@ function round(v, d = 2) {
 }
 
 // ================= KEYBOARDS (UI preserved) =================
-// Note: kbHome, kbCrypto, kbIndices, kbForex, kbCommodity remain unchanged
 export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
@@ -147,7 +146,6 @@ export const kbCommodity = withHTML({
   }
 });
 
-// **kbActions is correct as per user's UI**
 export function kbActions(symbol) {
   return withHTML({
     reply_markup: {
@@ -179,25 +177,39 @@ export function kbTimeframes(symbol) {
   });
 }
 
+
 // ================= ELLIOTT UTIL (FIXED LOGIC for Filtering) =================
 function extractTopPatterns(ellResult, max = 3) {
   if (!ellResult || !Array.isArray(ellResult.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
 
-  // Determine the overall primary sentiment based on Elliott's scoring
-  // Sentiment > 0.15 for Bullish, < -0.15 for Bearish (Hysteresis used to define clear bias)
-  const overallSentiment = ellResult.sentiment > 0.15 ? "Bullish" : ellResult.sentiment < -0.15 ? "Bearish" : "Neutral";
-  const map = new Map();
+  // Define clear sentiment based on a threshold (Bullish > 0.15, Bearish < -0.15)
+  const score = safeNum(ellResult.sentiment, 0);
+  const overallSentiment = score > 0.15 ? "Bullish" : score < -0.15 ? "Bearish" : "Neutral";
   
-  // Filter and dedupe by type, prioritizing patterns matching the overall sentiment
+  const map = new Map();
+  let bullCount = 0;
+  let bearCount = 0;
+  
+  // First pass: Count Bullish/Bearish patterns to find the dominant side *before* filtering by type
+  for (const p of ellResult.patterns) {
+    const patternSentiment = p.side || "Neutral"; 
+    if (patternSentiment === "Bullish") bullCount++;
+    if (patternSentiment === "Bearish") bearCount++;
+  }
+
+  // Determine the dominant pattern side for filtering
+  // If the counts are equal, default to the overall sentiment score.
+  const dominantSide = bullCount > bearCount ? "Bullish" : bearCount > bullCount ? "Bearish" : overallSentiment;
+  
+  // Second pass: Filter and dedupe by type
   for (const p of ellResult.patterns) {
     const t = String(p.type || "Pattern");
-    // Ensure we correctly handle both 'confidence' and 'conf' fields from elliott_module
     const conf = safeNum(p.confidence ?? p.conf ?? ellResult.confidence ?? 50, 0); 
-    const patternSentiment = p.side || "Neutral"; // Get 'side' from elliott_module_v2_5
+    const patternSentiment = p.side || "Neutral";
 
-    // 🛑 CRITICAL FILTER: If Elliott has a clear direction, skip opposing patterns
-    if (overallSentiment !== "Neutral" && patternSentiment !== overallSentiment) {
-        // Skip patterns that contradict the calculated dominant Elliott direction
+    // 🛑 CRITICAL FILTER: Only keep patterns that align with the DOMINANT side.
+    // If the dominantSide is Neutral, we still keep everything (though theoretically the count logic should prevent this).
+    if (dominantSide !== "Neutral" && patternSentiment !== dominantSide) {
         continue; 
     }
     
@@ -214,10 +226,13 @@ function extractTopPatterns(ellResult, max = 3) {
   const list = arr.map(a => `${a.type}(${round(a.conf, 0)}%)`);
   const topConf = arr.length ? Math.round(arr[0].conf) : Math.round(ellResult.confidence ?? 50);
 
+  // If the filtered list is empty, but we had a dominant side, use that side.
+  const finalSentiment = arr.length ? dominantSide : overallSentiment;
+
   return { 
     list, 
     conf: topConf, 
-    primarySentiment: overallSentiment 
+    primarySentiment: finalSentiment 
   };
 }
 
@@ -228,7 +243,6 @@ function formatPatternsForText(list) {
 
 // ================= FORMATTER =================
 export function formatPremiumReport(r) {
-  // r.elliottPattern expected as formatted string, r.elliottConf number
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
 ━━━━━━━━━━━━━━━━━━
@@ -283,14 +297,13 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
 
     return { data: [], price: 0, source: "none" };
   } catch (err) {
-    console.debug("[merge_signals] resolvePriceAndCandles error:", err?.message || err);
+    console.debug(`[${VERSION}] resolvePriceAndCandles error:`, err?.message || err);
     return { data: [], price: 0, source: "error" };
   }
 }
 
 // ==================== MAIN REPORT ====================
 export async function generateReport(symbolLabel, tf = "15m") {
-  // symbolLabel is like "NIFTY50" or "BTCUSDT"
   const mappedSymbol = symbolMap[symbolLabel] || symbolLabel;
 
   // 1. Resolve price & candles
@@ -301,7 +314,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
   try {
     ml = (await runMLPrediction(mappedSymbol, tf)) || {};
   } catch (e) {
-    console.debug("[merge_signals] runMLPrediction failed:", e?.message || e);
+    console.debug(`[${VERSION}] runMLPrediction failed:`, e?.message || e);
   }
 
   // 3. Elliott Analysis
@@ -312,7 +325,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
       ellRes = await analyzeElliott(slice, { left: 3, right: 3 }); 
     }
   } catch (e) {
-    console.debug("[merge_signals] analyzeElliott error:", e?.message || e);
+    console.debug(`[${VERSION}] analyzeElliott error:`, e?.message || e);
   }
 
   // 4. News
@@ -320,7 +333,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
   try {
     news = (await fetchNewsBundle(mappedSymbol)) || {};
   } catch (e) {
-    console.debug("[merge_signals] fetchNewsBundle error:", e?.message || e);
+    console.debug(`[${VERSION}] fetchNewsBundle error:`, e?.message || e);
   }
 
   // 5. Aggregate and Format Results
@@ -331,21 +344,22 @@ export async function generateReport(symbolLabel, tf = "15m") {
   const patternsObj = ellRes ? extractTopPatterns(ellRes, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
   const formattedPatterns = formatPatternsForText(patternsObj.list);
   const ellConf = Math.round(patternsObj.conf || ellRes?.confidence || 50);
-  const ellSentiment = patternsObj.primarySentiment || "Neutral";
+  const ellSentiment = patternsObj.primarySentiment || "Neutral"; // This is the FILTERED sentiment
 
-  // 6. Final Trend Logic: Prioritize ML if probability is high, otherwise Elliott, otherwise News
+  // 6. Final Trend Logic: Prioritize ML if probability is high (>60), otherwise Elliott, otherwise News
   let finalDirection = "Neutral";
+  
   if (mlProb > 60) {
       finalDirection = mlDirection;
-  } else if (ellSentiment !== "Neutral") {
-      // Use Elliott's filtered sentiment
+  } else if (ellSentiment !== "Neutral" && ellConf >= 65) { // Only use Elliott if confidence is good
       finalDirection = ellSentiment;
   } else if (news.sentiment > 70) {
       finalDirection = "Bullish";
   } else if (news.sentiment < 30) {
       finalDirection = "Bearish";
   } else {
-      finalDirection = mlDirection; // Fallback to ML's lower confidence bias
+      // If nothing is strongly conclusive, default to ML's current low-confidence bias
+      finalDirection = mlDirection; 
   }
   
   const biasEmoji = finalDirection === "Bullish" ? "📈" : finalDirection === "Bearish" ? "📉" : "⚪";
@@ -380,7 +394,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
     }
   };
 
-  console.debug("[merge_signals] report meta:", out._meta);
+  console.debug(`[${VERSION}] report meta:`, out._meta);
 
   return {
     text: formatPremiumReport(out),
@@ -449,6 +463,7 @@ export async function handleCallback(query) {
     const { data: pd } = await resolvePriceAndCandles(mapped, "15m");
     let ell = {};
     try {
+      // Use 15m candles to show Elliott detail
       ell = (Array.isArray(pd) && pd.length >= 8) ? await analyzeElliott(pd.slice(-500)) : null;
     } catch (e) {
       ell = null;
@@ -461,16 +476,24 @@ export async function handleCallback(query) {
       };
     }
 
-    // Build friendly detailed message (dedup + top 6 for detail)
-    // For detail, we don't apply the strict sentiment filter, we show everything found
-    const dedup = extractTopPatterns({ ...ell, patterns: ell.patterns.map(p => ({...p, side: p.side || "Neutral"})) }, 6);
-    const detailed = ell.patterns
+    // Build friendly detailed message (no strict sentiment filter here, just show top results)
+    const patternsWithSide = ell.patterns.map(p => ({
+        ...p, 
+        side: p.side || (p.type.includes("Top") || p.type.includes("H&S") ? "Bearish" : "Bullish") // Guess side if missing
+    }));
+
+    // Detailed list (showing everything found)
+    const detailed = patternsWithSide
         .map(p => `${p.type}(${round(p.confidence || p.conf || 50, 0)}%)`)
         .slice(0, 6)
         .join(" + ");
+    
+    // Overall Sentiment calculation for detail view
+    const overallScore = safeNum(ell.sentiment, 0);
+    const overallTrend = overallScore > 0.15 ? "Bullish" : overallScore < -0.15 ? "Bearish" : "Neutral";
         
     return {
-      text: `📊 <b>Elliott Waves (detailed, 15m)</b>\nPatterns: ${detailed}\nOverall Sentiment: ${ell.sentiment > 0.15 ? "Bullish" : ell.sentiment < -0.15 ? "Bearish" : "Neutral"}\nConfidence: ${Math.round(ell.confidence)}%`,
+      text: `📊 <b>Elliott Waves (detailed, 15m)</b>\nPatterns: ${detailed}\nOverall Sentiment: ${overallTrend}\nConfidence: ${Math.round(ell.confidence)}%`,
       keyboard: kbActions(symbol)
     };
   }
@@ -478,3 +501,4 @@ export async function handleCallback(query) {
   return { text: "❌ Unknown command", keyboard: kbHome };
 }
 
+// EXPORTS (Same as original)
