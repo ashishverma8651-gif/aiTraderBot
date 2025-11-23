@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — FINAL MERGED (UI + Multi-TF + Elliott fixes V3)
+// merge_signals.js — FINAL STABLE V3.1 (UI + Multi-TF + Elliott fixes)
 // ============================================================
 
 import {
@@ -9,11 +9,10 @@ import {
 } from "./utils.js";
 
 import { runMLPrediction } from "./ml_module_v8_6.js";
-import { analyzeElliott } from "./elliott_module.js"; // Assumes elliott_module is updated to v2.5+
+import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-// Internal version tag for debugging
-const VERSION = "v2_7_CONFIDENCE_FIX_PARSING_FIXED";
+const VERSION = "v3.1_FINAL_STABLE";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -54,11 +53,10 @@ function safeNum(v, fallback = 0) {
 
 function round(v, d = 4) {
     if (!Number.isFinite(v)) return v;
-    const m = Math.pow(10, d);
-    return Math.round(v * m) / m;
+    return Math.round(v * 10 ** d) / 10 ** d;
 }
 
-// ================= KEYBOARDS (UI preserved) =================
+// ================= KEYBOARDS =================
 export const kbHome = withHTML({
     reply_markup: {
         inline_keyboard: [
@@ -168,83 +166,60 @@ export function kbTimeframes(symbol) {
     return withHTML({
         reply_markup: {
             inline_keyboard: [
-                [{ text: "5m", callback_data: `tf_${symbol}_5m` }, { text: "15m", callback_data: `tf_${symbol}_15m` }],
-                [{ text: "30m", callback_data: `tf_${symbol}_30m` }, { text: "1h", callback_data: `tf_${symbol}_1h` }],
-                [{ text: "4h", callback_data: `tf_${symbol}_4h` }, { text: "1D", callback_data: `tf_${symbol}_1d` }],
+                [
+                    { text: "5m", callback_data: `tf_${symbol}_5m` },
+                    { text: "15m", callback_data: `tf_${symbol}_15m` }
+                ],
+                [
+                    { text: "30m", callback_data: `tf_${symbol}_30m` },
+                    { text: "1h", callback_data: `tf_${symbol}_1h` }
+                ],
+                [
+                    { text: "4h", callback_data: `tf_${symbol}_4h` },
+                    { text: "1D", callback_data: `tf_${symbol}_1d` }
+                ],
                 [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
             ]
         }
     });
 }
 
-// ================= ELLIOTT UTIL (FIXED LOGIC for Filtering and Confidence) =================
-function extractTopPatterns(ellResult, max = 3) {
-    if (!ellResult || !Array.isArray(ellResult.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
+// ================= ELLIOTT FIX =================
+function extractTopPatterns(ell, max = 3) {
+    if (!ell || !Array.isArray(ell.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
 
-    // Define clear sentiment based on a threshold (Bullish > 0.15, Bearish < -0.15)
-    const score = safeNum(ellResult.sentiment, 0);
-    const overallSentiment = score > 0.15 ? "Bullish" : score < -0.15 ? "Bearish" : "Neutral";
+    const score = safeNum(ell.sentiment, 0);
+    const overallSent = score > 0.15 ? "Bullish" : score < -0.15 ? "Bearish" : "Neutral";
+
+    let bulls = 0, bears = 0;
+    for (const p of ell.patterns) {
+        if (p.side === "Bullish") bulls++;
+        if (p.side === "Bearish") bears++;
+    }
+
+    const dom = bulls > bears ? "Bullish" : bears > bulls ? "Bearish" : overallSent;
 
     const map = new Map();
-    let bullCount = 0;
-    let bearCount = 0;
+    for (const p of ell.patterns) {
+        if (dom !== "Neutral" && p.side !== dom) continue;
 
-    // First pass: Count Bullish/Bearish patterns to find the dominant side
-    for (const p of ellResult.patterns) {
-        const patternSentiment = p.side || "Neutral";
-        if (patternSentiment === "Bullish") bullCount++;
-        if (patternSentiment === "Bearish") bearCount++;
+        const t = p.type;
+        const c = safeNum(p.confidence ?? p.conf ?? 50);
+        if (!map.has(t) || c > map.get(t).conf) {
+            map.set(t, { type: t, conf: c });
+        }
     }
 
-    // Determine the dominant pattern side for filtering
-    const dominantSide = bullCount > bearCount ? "Bullish" : bearCount > bullCount ? "Bearish" : overallSentiment;
-
-    // Second pass: Filter and dedupe by type
-    for (const p of ellResult.patterns) {
-        const t = String(p.type || "Pattern");
-        // Use confidence from pattern object, falling back to 50 if missing
-        const conf = safeNum(p.confidence ?? p.conf ?? 50, 0);
-        const patternSentiment = p.side || "Neutral";
-
-        // 🛑 CRITICAL FILTER: Only keep patterns that align with the DOMINANT side.
-        if (dominantSide !== "Neutral" && patternSentiment !== dominantSide) {
-            continue;
-        }
-
-        // Dedupe: keep highest-confidence pattern of the same type
-        if (!map.has(t) || conf > map.get(t).conf) {
-            map.set(t, { type: t, conf, source: p, sentiment: patternSentiment });
-        }
-
-    }
-
-    // Convert to array, sort by conf desc, pick top (of the filtered list)
-    const arr = Array.from(map.values()).sort((a, b) => b.conf - a.conf).slice(0, max);
-
-    // Format human-friendly
-    const list = arr.map(a => `${a.type}(${round(a.conf, 0)}%)`);
-
-    // 🎯 NEW CONFIDENCE LOGIC: Use the confidence of the most confident pattern as the display confidence (or 50 if none found)
-    const topConf = arr.length ? Math.round(arr[0].conf) : 50;
-
-    // If the filtered list is empty, but we had a dominant side, use that side.
-    const finalSentiment = arr.length ? dominantSide : overallSentiment;
-
+    const arr = [...map.values()].sort((a, b) => b.conf - a.conf).slice(0, max);
     return {
-        list,
-        // Use the top confidence found in the patterns, not the overall ellResult confidence.
-        conf: topConf,
-        primarySentiment: finalSentiment
+        list: arr.map(a => `${a.type}(${Math.round(a.conf)}%)`),
+        conf: arr[0]?.conf ?? 50,
+        primarySentiment: arr.length ? dom : overallSent
     };
 }
 
-function formatPatternsForText(list) {
-    if (!list || !list.length) return "N/A";
-    return list.join(" + ");
-}
-
 // ================= FORMATTER =================
-export function formatPremiumReport(r) {
+function formatPremiumReport(r) {
     return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL (${r._meta.tfUsed})
 ━━━━━━━━━━━━━━━━━━
@@ -260,151 +235,105 @@ Confidence: <b>${r.tpConf}%</b>
 
 🤖 <b>ML Probability:</b> ${r.maxProb}%
 ━━━━━━━━━━━━━━━━━━
-<small>Data Source: ${r._meta.fetchSource} | Ver: ${r._meta.version}</small>
+<small>Source: ${r._meta.fetchSource} | Candles: ${r._meta.candlesFound} | Ver: ${VERSION}</small>
 `;
 }
 
-// ==================== PRICE/CANDLES RESOLVER (robust) ====================
-async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
+// ================= PRICE RESOLVER =================
+async function resolvePriceAndCandles(symbol, tf) {
     try {
-        const fetchAndCheck = async (sym, timeframe) => {
-            // Assumes fetchUniversal is imported from utils.js
-            const result = await fetchUniversal(sym, timeframe);
-            const data = result?.data ?? result?.candles ?? [];
-            const price = safeNum(result?.price || data.at(-1)?.close);
-            return (price && data.length) ? { data, price } : null;
+        const tryFetch = async (sym, timeframe) => {
+            const r = await fetchUniversal(sym, timeframe);
+            const data = r?.data ?? r?.candles ?? [];
+            const price = safeNum(r?.price || data.at(-1)?.close);
+            if (price && data.length) return { data, price };
+            return null;
         };
 
-        // 1. Primary fetch  
-        let primary = await fetchAndCheck(symbolRaw, tf);
-        if (primary) return { ...primary, source: "universal" };
+        let p = await tryFetch(symbol, tf);
+        if (p) return { ...p, source: "universal" };
 
-        // 2. Crypto fallback (marketData)  
-        if (isCryptoLike(symbolRaw)) {
-            // Assumes fetchMarketData is imported from utils.js
-            const m = await fetchMarketData(symbolRaw, tf);
-            if (m?.price && Array.isArray(m.data)) return { data: m.data, price: safeNum(m.price), source: "marketData" };
+        if (isCryptoLike(symbol)) {
+            const m = await fetchMarketData(symbol, tf);
+            if (m?.price && Array.isArray(m.data))
+                return { data: m.data, price: safeNum(m.price), source: "marketData" };
         }
 
-        // 3. MultiTF fallback  
-        // Assumes fetchMultiTF is imported from utils.js
-        const multi = await fetchMultiTF(symbolRaw, [tf]);
+        const multi = await fetchMultiTF(symbol, [tf]);
         if (multi?.[tf]) {
-            const data = multi[tf].data || [];
-            const price = safeNum(multi[tf].price || data.at(-1)?.close);
-            if (price) return { data, price, source: "multiTF" };
+            const d = multi[tf].data || [];
+            const pr = safeNum(multi[tf].price || d.at(-1)?.close);
+            if (pr) return { data: d, price: pr, source: "multiTF" };
         }
 
-        // 4. Retry universal with 15m  
         if (tf !== "15m") {
-            let fallback15m = await fetchAndCheck(symbolRaw, "15m");
-            if (fallback15m) return { ...fallback15m, source: "universal-15m" };
+            let p2 = await tryFetch(symbol, "15m");
+            if (p2) return { ...p2, source: "universal-15m" };
         }
 
         return { data: [], price: 0, source: "none" };
 
-    } catch (err) {
-        console.debug(`[${VERSION}] resolvePriceAndCandles error:`, err?.message || err);
+    } catch (e) {
         return { data: [], price: 0, source: "error" };
     }
 }
 
-// ==================== MAIN REPORT ====================
+// ================= MAIN REPORT =================
 export async function generateReport(symbolLabel, tf = "15m") {
-    const mappedSymbol = symbolMap[symbolLabel] || symbolLabel;
+    const mapped = symbolMap[symbolLabel] || symbolLabel;
 
-    // 1. Resolve price & candles
-    const { data: candles, price: livePrice, source } = await resolvePriceAndCandles(mappedSymbol, tf);
+    const { data: candles, price, source } = await resolvePriceAndCandles(mapped, tf);
 
-    // 2. ML Prediction (Assumes runMLPrediction is imported)
     let ml = {};
-    try {
-        ml = (await runMLPrediction(mappedSymbol, tf)) || {};
-    } catch (e) {
-        console.debug(`[${VERSION}] runMLPrediction failed:`, e?.message || e);
-    }
+    try { ml = await runMLPrediction(mapped, tf) || {}; } catch {}
 
-    // 3. Elliott Analysis (Assumes analyzeElliott is imported)
-    let ellRes = null;
+    let ell = null;
     try {
-        if (Array.isArray(candles) && candles.length >= 8) {
-            // Slice the last 400 candles for efficient Elliott analysis
-            const slice = candles.slice(-400); 
-            ellRes = await analyzeElliott(slice, { left: 3, right: 3 });
-        }
-    } catch (e) {
-        console.debug(`[${VERSION}] analyzeElliott error:`, e?.message || e);
-    }
+        if (candles.length >= 8)
+            ell = await analyzeElliott(candles.slice(-400), { left: 3, right: 3 });
+    } catch {}
 
-    // 4. News (Assumes fetchNewsBundle is imported)
     let news = {};
-    try {
-        news = (await fetchNewsBundle(mappedSymbol)) || {};
-    } catch (e) {
-        console.debug(`[${VERSION}] fetchNewsBundle error:`, e?.message || e);
-    }
+    try { news = await fetchNewsBundle(mapped) || {}; } catch {}
 
-    // 5. Aggregate and Format Results
-    const mlDirection = ml.direction || "Neutral";
-    const mlProb = safeNum(ml.maxProb || ml.probability || ml.confidence || 50);
+    const patt = ell ? extractTopPatterns(ell, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
+    const ellConf = Math.round(patt.conf);
+    const ellSent = patt.primarySentiment;
 
-    // Use the FIXED pattern extraction logic
-    const patternsObj = ellRes ? extractTopPatterns(ellRes, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
-    const formattedPatterns = formatPatternsForText(patternsObj.list);
+    const mlProb = safeNum(ml.maxProb || ml.confidence || 50);
+    const mlDir = ml.direction || "Neutral";
 
-    // 🎯 Using the specific confidence calculated by extractTopPatterns
-    const ellConf = Math.round(patternsObj.conf);
-    const ellSentiment = patternsObj.primarySentiment || "Neutral"; // This is the FILTERED sentiment
+    let finalDir = "Neutral";
+    if (mlProb > 60) finalDir = mlDir;
+    else if (ellSent !== "Neutral" && ellConf >= 60) finalDir = ellSent;
+    else if (news.sentiment > 70) finalDir = "Bullish";
+    else if (news.sentiment < 30) finalDir = "Bearish";
+    else finalDir = mlDir;
 
-    // 6. Final Trend Logic: Prioritize ML if probability is high (>60), otherwise Elliott, otherwise News
-    let finalDirection = "Neutral";
+    const biasEmoji = finalDir === "Bullish" ? "📈" : finalDir === "Bearish" ? "📉" : "⚪";
 
-    if (mlProb > 60) {
-        finalDirection = mlDirection;
-    } else if (ellSentiment !== "Neutral" && ellConf >= 65) { // Only use Elliott if confidence is good
-        finalDirection = ellSentiment;
-    } else if (news.sentiment > 70) {
-        finalDirection = "Bullish";
-    } else if (news.sentiment < 30) {
-        finalDirection = "Bearish";
-    } else {
-        // If nothing is strongly conclusive, default to ML's current low-confidence bias
-        finalDirection = mlDirection;
-    }
-
-    const biasEmoji = finalDirection === "Bullish" ? "📈" : finalDirection === "Bearish" ? "📉" : "⚪";
-
-    // Targets based on ML
-    const tp1 = ml.tpEstimate ?? ml.tp1 ?? "—";
-    const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
-    const tpConf = ml.tpConfidence ?? 55;
-
-    // Build output object
     const out = {
         symbol: symbolLabel,
-        price: round(livePrice, 4),
-        direction: finalDirection,
+        price: round(price, 4),
+        direction: finalDir,
         biasEmoji,
-        tp1,
-        tp2,
-        tpConf,
+        tp1: ml.tp1 ?? ml.tpEstimate ?? "—",
+        tp2: ml.tp2 ?? ml.tp2Estimate ?? "—",
+        tpConf: ml.tpConfidence ?? 55,
         maxProb: round(mlProb, 2),
-        elliottPattern: formattedPatterns || "N/A",
+        elliottPattern: patt.list.join(" + ") || "N/A",
         elliottConf: ellConf,
         newsImpact: news.impact || "Neutral",
         newsScore: safeNum(news.sentiment, 50),
         _meta: {
             version: VERSION,
-            mappedSymbol,
+            mappedSymbol: mapped,
             fetchSource: source,
-            candlesFound: Array.isArray(candles) ? candles.length : 0,
-            ellOk: !!ellRes,
-            ellSentiment: ellSentiment,
+            candlesFound: candles.length,
+            ellSentiment: ellSent,
             tfUsed: tf
         }
     };
-
-    console.debug(`[${VERSION}] report meta:`, out._meta);
 
     return {
         text: formatPremiumReport(out),
@@ -412,104 +341,78 @@ export async function generateReport(symbolLabel, tf = "15m") {
     };
 }
 
-// ==================== CALLBACK ROUTING ====================
-export async function handleCallback(query) {
-    const data = query.data;
+// ================= CALLBACK HANDLER (FINAL FIXED) =================
+export async function handleCallback(q) {
+    const d = q.data;
 
-    // HOME
-    if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
-    if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
-    if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
-    if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
-    if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-    if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
+    if (d === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
+    if (d === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
+    if (d === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
+    if (d === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
+    if (d === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
+    if (d === "back_assets") return { text: "Choose Market", keyboard: kbHome };
 
-    // SELECTED ASSET
-    if (data.startsWith("asset_")) {
-        const symbol = data.replace("asset_", "");
-        return await generateReport(symbol);
+    if (d.startsWith("asset_")) {
+        const s = d.replace("asset_", "");
+        return await generateReport(s);
     }
 
-    // TIMEFRAMES MENU
-    if (data.startsWith("tfs_")) {
-        const symbol = data.replace("tfs_", "");
-        return {
-            text: `🕒 Timeframes for <b>${symbol}</b>`,
-            keyboard: kbTimeframes(symbol)
-        };
+    if (d.startsWith("tfs_")) {
+        const s = d.replace("tfs_", "");
+        return { text: `🕒 Timeframes for <b>${s}</b>`, keyboard: kbTimeframes(s) };
     }
 
-    // SPECIFIC TF - callback format: tf_<SYMBOL>_<TF> e.g. tf_BTCUSDT_5m or tf_NIFTY50_1h
-    if (data.startsWith("tf_")) {
-        const clean = data.substring(3); // remove "tf_"
-
-        // 💥 CRITICAL FIX: Split by '_' to correctly separate symbol and timeframe.
-        const parts = clean.split('_'); 
-        const tf = parts.pop(); // last part is timeframe (e.g., '5m', '1h')
-        const symbol = parts.join('_'); // remaining parts form the symbol (e.g., 'BTCUSDT')
-
+    // FINAL FIX
+    if (d.startsWith("tf_")) {
+        // format: tf_SYMBOL_TF
+        // ex: tf_BTCUSDT_15m
+        const parts = d.split("_");
+        const symbol = parts[1];
+        const tf = parts[2];
         return await generateReport(symbol, tf);
     }
 
-    // REFRESH
-    if (data.startsWith("refresh_")) {
-        const symbol = data.replace("refresh_", "");
-        return await generateReport(symbol);
+    if (d.startsWith("refresh_")) {
+        const s = d.replace("refresh_", "");
+        return await generateReport(s);
     }
 
-    // NEWS
-    if (data.startsWith("news_")) {
-        const symbol = data.replace("news_", "");
-        const mapped = symbolMap[symbol] || symbol;
-        const news = await fetchNewsBundle(mapped);
+    if (d.startsWith("news_")) {
+        const s = d.replace("news_", "");
+        const mapped = symbolMap[s] || s;
+        const n = await fetchNewsBundle(mapped);
         return {
-            text: `📰 <b>News Report</b>\nImpact: ${news.impact}\nSentiment: ${news.sentiment}%`,
-            keyboard: kbActions(symbol)
+            text: `📰 <b>News Report</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+            keyboard: kbActions(s)
         };
     }
 
-    // ELLIOTT BUTTON: show detailed Elliott patterns (use 15m candles for consistency)
-    if (data.startsWith("ell_")) {
-        const symbol = data.replace("ell_", "");
-        const mapped = symbolMap[symbol] || symbol;
-        // We use 15m candles for the detail view as a consistent default.
-        const { data: pd } = await resolvePriceAndCandles(mapped, "15m");
-        let ell = {};
-        try {
-            // Use 15m candles to show Elliott detail, slicing the last 500 for context
-            ell = (Array.isArray(pd) && pd.length >= 8) ? await analyzeElliott(pd.slice(-500)) : null;
-        } catch (e) {
-            ell = null;
-        }
+    if (d.startsWith("ell_")) {
+        const s = d.replace("ell_", "");
+        const mapped = symbolMap[s] || s;
 
-        if (!ell || !ell.patterns || !ell.patterns.length) {
+        const { data } = await resolvePriceAndCandles(mapped, "15m");
+        let ell = null;
+        try { ell = await analyzeElliott(data.slice(-500)); } catch {}
+
+        if (!ell?.patterns?.length)
             return {
                 text: `📊 <b>Elliott Waves</b>\nPattern: N/A\nConfidence: ${ell?.confidence ?? 50}%`,
-                keyboard: kbActions(symbol)
+                keyboard: kbActions(s)
             };
-        }
 
-        // Build friendly detailed message (no strict sentiment filter here, just show top results)
-        const patternsWithSide = ell.patterns.map(p => ({
-            ...p,
-            side: p.side || (p.type.includes("Top") || p.type.includes("H&S") ? "Bearish" : "Bullish") // Guess side if missing
-        }));
-
-        // Detailed list (showing everything found)
-        const detailed = patternsWithSide
-            .map(p => `${p.type}(${round(p.confidence || p.conf || 50, 0)}%) [${p.side}]`) // Added side for clarity
+        const det = ell.patterns
+            .map(p => `${p.type}(${round(p.conf || p.confidence || 50, 0)}%)`)
             .slice(0, 6)
             .join("\n- ");
 
-        // Overall Sentiment calculation for detail view
-        const overallScore = safeNum(ell.sentiment, 0);
-        const overallTrend = overallScore > 0.15 ? "Bullish" : overallScore < -0.15 ? "Bearish" : "Neutral";
+        const sc = safeNum(ell.sentiment, 0);
+        const tr = sc > 0.15 ? "Bullish" : sc < -0.15 ? "Bearish" : "Neutral";
 
         return {
-            text: `📊 <b>Elliott Waves (detailed, 15m)</b>\nOverall Sentiment: ${overallTrend}\nConfidence: ${Math.round(ell.confidence)}%\n\nDetected Patterns (Top 6):\n- ${detailed}`,
-            keyboard: kbActions(symbol)
+            text: `📊 <b>Elliott Waves (15m)</b>\nSentiment: ${tr}\nConfidence: ${Math.round(ell.confidence)}%\n\nPatterns:\n- ${det}`,
+            keyboard: kbActions(s)
         };
-
     }
 
     return { text: "❌ Unknown command", keyboard: kbHome };
