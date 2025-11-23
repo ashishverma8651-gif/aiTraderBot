@@ -1,5 +1,5 @@
 // ===============================================================
-// merge_signals.js — FINAL PREMIUM AI PANEL (FIXED + VERIFIED)
+// merge_signals.js — FINAL PREMIUM AI PANEL (STABLE + FIXED)
 // ===============================================================
 
 // 🔥 PRICE ENGINE
@@ -40,7 +40,7 @@ const symbolMap = {
 
 
 // ===============================
-// WRAPPER (SAFE HTML)
+// SAFE HTML WRAPPER
 // ===============================
 function withHTML(keyboard) {
   return { ...keyboard, parse_mode: "HTML" };
@@ -154,6 +154,7 @@ export const kbCommodity = withHTML({
 });
 
 
+
 // =====================================================
 // ACTION BUTTONS
 // =====================================================
@@ -174,6 +175,7 @@ export function kbActions(symbol) {
     }
   });
 }
+
 
 
 // =====================================================
@@ -204,7 +206,26 @@ export function kbTimeframes(symbol) {
 
 
 // =====================================================
-// PREMIUM REPORT
+// ELLIOTT PATTERN SELECTOR (NEW)
+// =====================================================
+function extractElliottPattern(ell) {
+  if (!ell || !ell.patterns || !ell.patterns.length)
+    return { name: "N/A", conf: ell?.confidence || 50 };
+
+  const best = ell.patterns.reduce((a, b) =>
+    (a.confidence || 0) > (b.confidence || 0) ? a : b
+  );
+
+  return {
+    name: best.type || "Pattern",
+    conf: best.confidence || ell?.confidence || 50
+  };
+}
+
+
+
+// =====================================================
+// PREMIUM REPORT FORMATTER
 // =====================================================
 export function formatPremiumReport(r) {
   return `
@@ -234,18 +255,25 @@ export async function generateReport(symbol, tf = "15m") {
 
   const mappedSymbol = symbolMap[symbol] || symbol;
 
-  // PRICE
+  // PRICE SOURCE
   const priceData = await fetchUniversal(mappedSymbol, tf);
   let livePrice = priceData?.price || 0;
 
-  // ML
+  // ML ENGINE
   const ml = await runMLPrediction(mappedSymbol, tf) || {};
-  const candles = ml?.explanation?.features?.candles || [];
 
-  // Elliott (SAFE)
-  const ell = await analyzeElliott(candles || []);
+  // SAFE CANDLE SOURCE
+  let candles =
+    ml?.explanation?.features?.candles ||
+    priceData?.data ||
+    priceData?.candles ||
+    [];
 
-  // NEWS (with mappedSymbol fix)
+  // ELLIOTT MODULE
+  const ell = await analyzeElliott(candles);
+  const ep = extractElliottPattern(ell);
+
+  // NEWS MODULE
   const news = await fetchNewsBundle(mappedSymbol) || {};
 
   const out = {
@@ -262,8 +290,8 @@ export async function generateReport(symbol, tf = "15m") {
     tp2: ml.tp2Estimate || "—",
     tpConf: ml.tpConfidence || 55,
 
-    elliottPattern: ell?.pattern || "N/A",
-    elliottConf: ell?.confidence || 50,
+    elliottPattern: ep.name,
+    elliottConf: ep.conf,
 
     newsImpact: news.impact || "Neutral",
     newsScore: news.sentiment || 50
@@ -278,12 +306,12 @@ export async function generateReport(symbol, tf = "15m") {
 
 
 // =====================================================
-// CALLBACK ROUTER (FIXED)
+// CALLBACK ROUTER (STABLE VERSION)
 // =====================================================
 export async function handleCallback(query) {
   const data = query.data;
 
-  // HOME NAV
+  // MAIN NAVIGATION
   if (data === "back_home")
     return { text: "🏠 HOME", keyboard: kbHome };
 
@@ -302,11 +330,13 @@ export async function handleCallback(query) {
   if (data === "back_assets")
     return { text: "Choose Market", keyboard: kbHome };
 
-  // SELECTED ASSET
+
+  // SELECT ASSET
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
     return await generateReport(symbol);
   }
+
 
   // TIMEFRAME MENU
   if (data.startsWith("tfs_")) {
@@ -317,50 +347,59 @@ export async function handleCallback(query) {
     };
   }
 
-  // SPECIFIC TF
+
+  // SPECIFIC TIMEFRAME
   if (data.startsWith("tf_")) {
     const [, symbol, tf] = data.split("_");
     return await generateReport(symbol, tf);
   }
 
-  // REFRESH
+
+  // REFRESH BUTTON
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
     return await generateReport(symbol);
   }
 
-  // NEWS
+
+  // NEWS REPORT
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
     const mappedSymbol = symbolMap[symbol] || symbol;
+
     const news = await fetchNewsBundle(mappedSymbol);
 
     return {
-      text: `📰 <b>News Report</b>
+      text: `📰 <b>NEWS REPORT</b>
 Impact: ${news.impact}
 Sentiment: ${news.sentiment}%`,
       keyboard: kbActions(symbol)
     };
   }
 
-  // ELLIOTT
+
+  // ELLIOTT REPORT
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
     const mappedSymbol = symbolMap[symbol] || symbol;
 
-    // get candles from main fetch
     const priceData = await fetchUniversal(mappedSymbol, "15m");
-    const candles = priceData?.data || [];
+    const candles =
+      priceData?.data ||
+      priceData?.candles ||
+      [];
 
     const ell = await analyzeElliott(candles);
+    const ep = extractElliottPattern(ell);
 
     return {
       text: `📊 <b>Elliott Waves</b>
-Pattern: ${ell.pattern}
-Confidence: ${ell.confidence}%`,
+Pattern: ${ep.name}
+Confidence: ${ep.conf}%`,
       keyboard: kbActions(symbol)
     };
   }
+
 
   return { text: "❌ Unknown command", keyboard: kbHome };
 }
