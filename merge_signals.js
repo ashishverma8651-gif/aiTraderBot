@@ -1,481 +1,361 @@
 // ============================================================
-// merge_signals.js — FINAL STABLE V3.1 (UI + Multi-TF + Elliott fixes)
+// merge_signals.js — v3.3 FINAL STABLE (UI + TF FIX + Elliott V3)
 // ============================================================
 
 import {
-    fetchUniversal,
-    fetchMultiTF,
-    fetchMarketData
+  fetchUniversal,
+  fetchMultiTF,
+  fetchMarketData
 } from "./utils.js";
 
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-const VERSION = "v3.1_FINAL_STABLE";
+const VERSION = "v3.3_FINAL_STABLE";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
-    NIFTY50: "^NSEI",
-    BANKNIFTY: "^NSEBANK",
-    SENSEX: "^BSESN",
-    FINNIFTY: "NSE:FINNIFTY",
+  NIFTY50: "^NSEI",
+  BANKNIFTY: "^NSEBANK",
+  SENSEX: "^BSESN",
+  FINNIFTY: "NSE:FINNIFTY",
 
-    GOLD: "GC=F",
-    SILVER: "SI=F",
-    CRUDE: "CL=F",
-    NGAS: "NG=F",
+  GOLD: "GC=F",
+  SILVER: "SI=F",
+  CRUDE: "CL=F",
+  NGAS: "NG=F",
 
-    DXY: "DX-Y.NYB",
-    XAUUSD: "GC=F",
-    XAGUSD: "SI=F",
+  DXY: "DX-Y.NYB",
+  XAUUSD: "GC=F",
+  XAGUSD: "SI=F",
 
-    EURUSD: "EURUSD=X",
-    GBPUSD: "GBPUSD=X",
-    USDJPY: "JPY=X"
+  EURUSD: "EURUSD=X",
+  GBPUSD: "GBPUSD=X",
+  USDJPY: "JPY=X"
 };
 
 // ================= HELPERS =================
 function withHTML(kb) {
-    return { ...kb, parse_mode: "HTML" };
+  return { ...kb, parse_mode: "HTML" };
 }
 
 function isCryptoLike(sym) {
-    if (!sym) return false;
-    const s = String(sym).toUpperCase();
-    return s.endsWith("USDT") || s.endsWith("USD") || s.endsWith("BTC") || s.endsWith("ETH");
+  if (!sym) return false;
+  const s = String(sym).toUpperCase();
+  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
 }
 
-function safeNum(v, fallback = 0) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : fallback;
+function safeNum(v, fb = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fb;
 }
 
-function round(v, d = 4) {
-    if (!Number.isFinite(v)) return v;
-    return Math.round(v * 10 ** d) / 10 ** d;
+function round(v, d = 2) {
+  if (!Number.isFinite(v)) return v;
+  const m = Math.pow(10, d);
+  return Math.round(v * m) / m;
 }
 
-// ================= KEYBOARDS =================
+// ================== HOME KEYPADS ==================
 export const kbHome = withHTML({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: "💠 Crypto", callback_data: "menu_crypto" },
-                { text: "📘 Indices", callback_data: "menu_indices" }
-            ],
-            [
-                { text: "💱 Forex", callback_data: "menu_forex" },
-                { text: "🛢 Commodities", callback_data: "menu_commodities" }
-            ]
-        ]
-    }
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "💠 Crypto", callback_data: "menu_crypto" },
+        { text: "📘 Indices", callback_data: "menu_indices" }
+      ],
+      [
+        { text: "💱 Forex", callback_data: "menu_forex" },
+        { text: "🛢 Commodities", callback_data: "menu_commodities" }
+      ]
+    ]
+  }
 });
 
 export const kbCrypto = withHTML({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: "BTC", callback_data: "asset_BTCUSDT" },
-                { text: "ETH", callback_data: "asset_ETHUSDT" }
-            ],
-            [
-                { text: "SOL", callback_data: "asset_SOLUSDT" },
-                { text: "XRP", callback_data: "asset_XRPUSDT" }
-            ],
-            [
-                { text: "DOGE", callback_data: "asset_DOGEUSDT" },
-                { text: "ADA", callback_data: "asset_ADAUSDT" }
-            ],
-            [{ text: "⬅ Back", callback_data: "back_home" }]
-        ]
-    }
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "BTC", callback_data: "asset_BTCUSDT" },
+        { text: "ETH", callback_data: "asset_ETHUSDT" }
+      ],
+      [
+        { text: "SOL", callback_data: "asset_SOLUSDT" },
+        { text: "XRP", callback_data: "asset_XRPUSDT" }
+      ],
+      [
+        { text: "DOGE", callback_data: "asset_DOGEUSDT" },
+        { text: "ADA", callback_data: "asset_ADAUSDT" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
 });
 
 export const kbIndices = withHTML({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: "NIFTY50", callback_data: "asset_NIFTY50" },
-                { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
-            ],
-            [
-                { text: "Sensex", callback_data: "asset_SENSEX" },
-                { text: "FinNifty", callback_data: "asset_FINNIFTY" }
-            ],
-            [{ text: "⬅ Back", callback_data: "back_home" }]
-        ]
-    }
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "NIFTY50", callback_data: "asset_NIFTY50" },
+        { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
+      ],
+      [
+        { text: "Sensex", callback_data: "asset_SENSEX" },
+        { text: "FinNifty", callback_data: "asset_FINNIFTY" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
 });
 
 export const kbForex = withHTML({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: "EURUSD", callback_data: "asset_EURUSD" },
-                { text: "GBPUSD", callback_data: "asset_GBPUSD" }
-            ],
-            [
-                { text: "USDJPY", callback_data: "asset_USDJPY" },
-                { text: "XAUUSD", callback_data: "asset_XAUUSD" }
-            ],
-            [
-                { text: "XAGUSD", callback_data: "asset_XAGUSD" },
-                { text: "DXY", callback_data: "asset_DXY" }
-            ],
-            [{ text: "⬅ Back", callback_data: "back_home" }]
-        ]
-    }
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "EURUSD", callback_data: "asset_EURUSD" },
+        { text: "GBPUSD", callback_data: "asset_GBPUSD" }
+      ],
+      [
+        { text: "USDJPY", callback_data: "asset_USDJPY" },
+        { text: "XAUUSD", callback_data: "asset_XAUUSD" }
+      ],
+      [
+        { text: "XAGUSD", callback_data: "asset_XAGUSD" },
+        { text: "DXY", callback_data: "asset_DXY" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
 });
 
 export const kbCommodity = withHTML({
-    reply_markup: {
-        inline_keyboard: [
-            [
-                { text: "GOLD", callback_data: "asset_GOLD" },
-                { text: "SILVER", callback_data: "asset_SILVER" }
-            ],
-            [
-                { text: "CRUDE", callback_data: "asset_CRUDE" },
-                { text: "NGAS", callback_data: "asset_NGAS" }
-            ],
-            [{ text: "⬅ Back", callback_data: "back_home" }]
-        ]
-    }
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "GOLD", callback_data: "asset_GOLD" },
+        { text: "SILVER", callback_data: "asset_SILVER" }
+      ],
+      [
+        { text: "CRUDE", callback_data: "asset_CRUDE" },
+        { text: "NGAS", callback_data: "asset_NGAS" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
 });
 
+// ACTION KEYPAD
 export function kbActions(symbol) {
-    return withHTML({
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
-                    { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
-                ],
-                [
-                    { text: "📊 Elliott", callback_data: `ell_${symbol}` },
-                    { text: "📰 News", callback_data: `news_${symbol}` }
-                ],
-                [{ text: "⬅ Back", callback_data: "back_assets" }]
-            ]
-        }
-    });
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
+          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
+        ],
+        [
+          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
+          { text: "📰 News", callback_data: `news_${symbol}` }
+        ],
+        [{ text: "⬅ Back", callback_data: "back_assets" }]
+      ]
+    }
+  });
 }
 
+// TIMEFRAME KEYPAD
 export function kbTimeframes(symbol) {
-    return withHTML({
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: "5m", callback_data: `tf_${symbol}_5m` },
-                    { text: "15m", callback_data: `tf_${symbol}_15m` }
-                ],
-                [
-                    { text: "30m", callback_data: `tf_${symbol}_30m` },
-                    { text: "1h", callback_data: `tf_${symbol}_1h` }
-                ],
-                [
-                    { text: "4h", callback_data: `tf_${symbol}_4h` },
-                    { text: "1D", callback_data: `tf_${symbol}_1d` }
-                ],
-                [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
-            ]
-        }
-    });
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "5m", callback_data: `tf_${symbol}_5m` },
+          { text: "15m", callback_data: `tf_${symbol}_15m` }
+        ],
+        [
+          { text: "30m", callback_data: `tf_${symbol}_30m` },
+          { text: "1h", callback_data: `tf_${symbol}_1h` }
+        ],
+        [
+          { text: "4h", callback_data: `tf_${symbol}_4h` },
+          { text: "1D", callback_data: `tf_${symbol}_1d` }
+        ],
+        [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
+      ]
+    }
+  });
 }
 
-// ================= ELLIOTT FIX =================
-function extractTopPatterns(ell, max = 3) {
-    if (!ell || !Array.isArray(ell.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
-
-    const score = safeNum(ell.sentiment, 0);
-    const overallSent = score > 0.15 ? "Bullish" : score < -0.15 ? "Bearish" : "Neutral";
-
-    let bulls = 0, bears = 0;
-    for (const p of ell.patterns) {
-        if (p.side === "Bullish") bulls++;
-        if (p.side === "Bearish") bears++;
-    }
-
-    const dom = bulls > bears ? "Bullish" : bears > bulls ? "Bearish" : overallSent;
-
-    const map = new Map();
-    for (const p of ell.patterns) {
-        if (dom !== "Neutral" && p.side !== dom) continue;
-
-        const t = p.type;
-        const c = safeNum(p.confidence ?? p.conf ?? 50);
-        if (!map.has(t) || c > map.get(t).conf) {
-            map.set(t, { type: t, conf: c });
-        }
-    }
-
-    const arr = [...map.values()].sort((a, b) => b.conf - a.conf).slice(0, max);
-    return {
-        list: arr.map(a => `${a.type}(${Math.round(a.conf)}%)`),
-        conf: arr[0]?.conf ?? 50,
-        primarySentiment: arr.length ? dom : overallSent
+// ==================== PRICE RESOLVER ====================
+async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
+  try {
+    const fetchAndCheck = async (sym, timeframe) => {
+      const r = await fetchUniversal(sym, timeframe);
+      const data = r?.data || r?.candles || [];
+      const price = safeNum(r?.price || data.at(-1)?.close);
+      return (price && data.length) ? { data, price } : null;
     };
-}
 
-// ================= FORMATTER =================
-function formatPremiumReport(r) {
-    const formattedPrice = Number.isFinite(r.price) ? r.price.toFixed(4) : "N/A";
-    const formattedTP1 = Number.isFinite(r.tp1) ? r.tp1.toFixed(4) : r.tp1;
-    const formattedTP2 = Number.isFinite(r.tp2) ? r.tp2.toFixed(4) : r.tp2;
-    
-    return `
-🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL (${r._meta.tfUsed})
-━━━━━━━━━━━━━━━━━━
-📍 <b>Price:</b> ${formattedPrice}
-🧭 <b>Trend:</b> ${r.biasEmoji} ${r.direction}
-📰 <b>News:</b> ${r.newsImpact} (${r.newsScore}%)
-⚡ <b>Elliott:</b> ${r.elliottPattern} (${r.elliottConf}%)
+    // 1. Universal
+    let u = await fetchAndCheck(symbolRaw, tf);
+    if (u) return { ...u, source: "universal" };
 
-🎯 <b>TARGETS</b>
-Primary TP: <b>${formattedTP1}</b>
-Hedge TP: <b>${formattedTP2}</b>
-Confidence: <b>${r.tpConf}%</b>
-
-🤖 <b>ML Probability:</b> ${r.maxProb}%
-━━━━━━━━━━━━━━━━━━
-<small>Source: ${r._meta.fetchSource} | Candles: ${r._meta.candlesFound} | Ver: ${VERSION}</small>
-`;
-}
-
-// ================= PRICE RESOLVER =================
-async function resolvePriceAndCandles(symbol, tf) {
-    try {
-        const tryFetch = async (sym, timeframe) => {
-            // Note: fetchUniversal must be defined in utils.js
-            const r = await fetchUniversal(sym, timeframe);
-            const data = r?.data ?? r?.candles ?? [];
-            const price = safeNum(r?.price || data.at(-1)?.close);
-            if (price && data.length) return { data, price };
-            return null;
-        };
-
-        let p = await tryFetch(symbol, tf);
-        if (p) return { ...p, source: "universal" };
-
-        if (isCryptoLike(symbol)) {
-            // Note: fetchMarketData must be defined in utils.js
-            const m = await fetchMarketData(symbol, tf);
-            if (m?.price && Array.isArray(m.data))
-                return { data: m.data, price: safeNum(m.price), source: "marketData" };
-        }
-
-        // Note: fetchMultiTF must be defined in utils.js
-        const multi = await fetchMultiTF(symbol, [tf]);
-        if (multi?.[tf]) {
-            const d = multi[tf].data || [];
-            const pr = safeNum(multi[tf].price || d.at(-1)?.close);
-            if (pr) return { data: d, price: pr, source: "multiTF" };
-        }
-
-        // Fallback to 15m only if the initial requested TF was not 15m and all previous steps failed
-        if (tf !== "15m") { 
-            let p2 = await tryFetch(symbol, "15m");
-            if (p2) return { ...p2, source: "universal-15m" };
-        }
-
-        // If all attempts fail, return a known "failure" state
-        return { data: [], price: 0, source: "none" };
-
-    } catch (e) {
-        console.error(`Error in resolvePriceAndCandles for ${symbol}/${tf}:`, e);
-        return { data: [], price: 0, source: "error" };
+    // 2. Crypto fallback
+    if (isCryptoLike(symbolRaw)) {
+      const c = await fetchMarketData(symbolRaw, tf);
+      if (c?.price && c?.data) return { data: c.data, price: c.price, source: "marketData" };
     }
+
+    // 3. MultiTF fallback
+    const m = await fetchMultiTF(symbolRaw, [tf]);
+    if (m?.[tf]) {
+      const d = m[tf].data || [];
+      const p = safeNum(m[tf].price || d.at(-1)?.close);
+      if (p) return { data: d, price: p, source: "multiTF" };
+    }
+
+    // 4. Universal 15m fallback
+    if (tf !== "15m") {
+      let u15 = await fetchAndCheck(symbolRaw, "15m");
+      if (u15) return { ...u15, source: "universal-15m" };
+    }
+
+    return { data: [], price: 0, source: "none" };
+
+  } catch (e) {
+    return { data: [], price: 0, source: "error" };
+  }
 }
 
-// ================= MAIN REPORT =================
+// ================== MAIN REPORT ==================
 export async function generateReport(symbolLabel, tf = "15m") {
-    const mapped = symbolMap[symbolLabel] || symbolLabel;
+  const mapped = symbolMap[symbolLabel] || symbolLabel;
 
-    // --- 1. Fetch Price & Candles ---
-    const { data: candles, price, source } = await resolvePriceAndCandles(mapped, tf);
-    
-    // Check if critical data (price or candles) is missing
-    if (price === 0 || candles.length < 5) {
-        // Return a special report indicating data failure
-        return {
-            text: `⚠️ <b>${symbolLabel}</b> — DATA UNAVAILABLE\n\nCould not fetch current price or enough candle data for analysis (Source: ${source}). Please try <b>🔄 Refresh</b>.`,
-            keyboard: kbActions(symbolLabel)
-        };
-    }
+  // 1. Price
+  const { data: candles, price: livePrice, source } = await resolvePriceAndCandles(mapped, tf);
 
-    // --- 2. Run Analyses (Wrapped in try/catch for soft failure) ---
-    let ml = {};
-    try { ml = await runMLPrediction(mapped, tf) || {}; } catch (e) { console.error("ML Prediction failed:", e); }
+  // 2. ML
+  let ml = {};
+  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch {}
+
+  // 3. Elliott
+  let ell = null;
+  try {
+    if (candles.length >= 8) ell = await analyzeElliott(candles.slice(-400));
+  } catch {}
+
+  // 4. News
+  let news = {};
+  try { news = (await fetchNewsBundle(mapped)) || {}; } catch {}
+
+  const direction = ml.direction || "Neutral";
+  const prob = safeNum(ml.maxProb || 50);
+
+  const out = {
+    symbol: symbolLabel,
+    price: round(livePrice, 4),
+    direction,
+    biasEmoji: direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪",
+    tp1: ml.tp1 ?? "—",
+    tp2: ml.tp2 ?? "—",
+    tpConf: ml.tpConfidence ?? 50,
+    maxProb: prob,
+    ellText: ell?.patterns?.map(p => `${p.type}(${round(p.confidence, 0)}%)`).join(" + ") || "N/A",
+    ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
+    newsImpact: news.impact || "Neutral",
+    newsScore: news.sentiment || 50
+  };
+
+  const txt = `
+🔥 <b>${out.symbol}</b>
+━━━━━━━━━━━━━━
+📍 <b>Price:</b> ${out.price}
+📊 <b>Trend:</b> ${out.biasEmoji} ${out.direction}
+📉 <b>Elliott:</b> ${out.ellText} (${out.ellConf}%)
+📰 <b>News:</b> ${out.newsImpact} (${out.newsScore}%)
+🎯 <b>TP:</b> ${out.tp1} | Hedge: ${out.tp2}
+🤖 <b>ML Prob:</b> ${out.maxProb}%
+━━━━━━━━━━━━━━
+`;
+
+  return { text: txt, keyboard: kbActions(symbolLabel) };
+}
+
+// ================= CALLBACK HANDLER ==================
+export async function handleCallback(query) {
+  const data = query.data;
+
+  // Menus
+  if (data === "back_home") return { text: "🏠 Home", keyboard: kbHome };
+  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
+  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
+  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
+  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
+  if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
+
+  // Asset clicked
+  if (data.startsWith("asset_")) {
+    const symbol = data.replace("asset_", "");
+    return await generateReport(symbol);
+  }
+
+  // Timeframe menu
+  if (data.startsWith("tfs_")) {
+    const symbol = data.replace("tfs_", "");
+    return { text: `🕒 Timeframes: <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
+  }
+
+  // FIXED: Timeframe selection
+  if (data.startsWith("tf_")) {
+    const clean = data.replace("tf_", "");
+    const [symbol, tf] = clean.split("_");
+    return await generateReport(symbol, tf);
+  }
+
+  // Refresh
+  if (data.startsWith("refresh_")) {
+    const symbol = data.replace("refresh_", "");
+    return await generateReport(symbol);
+  }
+
+  // News
+  if (data.startsWith("news_")) {
+    const symbol = data.replace("news_", "");
+    const mapped = symbolMap[symbol] || symbol;
+    const n = await fetchNewsBundle(mapped);
+    return {
+      text: `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+      keyboard: kbActions(symbol)
+    };
+  }
+
+  // Elliott detailed
+  if (data.startsWith("ell_")) {
+    const symbol = data.replace("ell_", "");
+    const mapped = symbolMap[symbol] || symbol;
+    const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
 
     let ell = null;
-    try {
-        if (candles.length >= 8)
-            ell = await analyzeElliott(candles.slice(-400), { left: 3, right: 3 });
-    } catch (e) { console.error("Elliott Analysis failed:", e); }
+    try { ell = await analyzeElliott(cdl.slice(-500)); } catch {}
 
-    let news = {};
-    try { news = await fetchNewsBundle(mapped) || {}; } catch (e) { console.error("News Fetch failed:", e); }
+    if (!ell || !ell.patterns?.length) {
+      return { text: `📊 Elliott: N/A`, keyboard: kbActions(symbol) };
+    }
 
-
-    // --- 3. Consolidate Results ---
-    const patt = ell ? extractTopPatterns(ell, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
-    const ellConf = Math.round(patt.conf);
-    const ellSent = patt.primarySentiment;
-
-    const mlProb = safeNum(ml.maxProb || ml.confidence || 50);
-    const mlDir = ml.direction || "Neutral";
-
-    let finalDir = "Neutral";
-    if (mlProb > 60) finalDir = mlDir;
-    else if (ellSent !== "Neutral" && ellConf >= 60) finalDir = ellSent;
-    else if (safeNum(news.sentiment, 50) > 70) finalDir = "Bullish";
-    else if (safeNum(news.sentiment, 50) < 30) finalDir = "Bearish";
-    else finalDir = mlDir; // Fallback to ML direction if other signals are weak
-
-    const biasEmoji = finalDir === "Bullish" ? "📈" : finalDir === "Bearish" ? "📉" : "⚪";
-
-    const out = {
-        symbol: symbolLabel,
-        price: round(price, 4),
-        direction: finalDir,
-        biasEmoji,
-        tp1: ml.tp1 ?? ml.tpEstimate ?? "—",
-        tp2: ml.tp2 ?? ml.tp2Estimate ?? "—",
-        tpConf: ml.tpConfidence ?? 55,
-        maxProb: round(mlProb, 2),
-        elliottPattern: patt.list.join(" + ") || "N/A",
-        elliottConf: ellConf,
-        newsImpact: news.impact || "Neutral",
-        newsScore: safeNum(news.sentiment, 50),
-        _meta: {
-            version: VERSION,
-            mappedSymbol: mapped,
-            fetchSource: source,
-            candlesFound: candles.length,
-            ellSentiment: ellSent,
-            tfUsed: tf
-        }
-    };
+    const det = ell.patterns
+      .map(p => `${p.type} (${round(p.confidence, 0)}%)`)
+      .slice(0, 6)
+      .join(" + ");
 
     return {
-        text: formatPremiumReport(out),
-        keyboard: kbActions(symbolLabel)
+      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence, 0)}%`,
+      keyboard: kbActions(symbol)
     };
+  }
+
+  return { text: "❌ Unknown", keyboard: kbHome };
 }
 
-// ================= CALLBACK HANDLER (FINAL FIXED) =================
-export async function handleCallback(q) {
-    const d = q.data;
-
-    if (d === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
-    if (d === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
-    if (d === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
-    if (d === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
-    if (d === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-    if (d === "back_assets") return { text: "Choose Market", keyboard: kbHome };
-
-    // *** FIX: Added robust error handling for report generation ***
-    if (d.startsWith("asset_")) {
-        const s = d.replace("asset_", "");
-        try {
-            return await generateReport(s);
-        } catch (e) {
-            console.error(`❌ CRITICAL ERROR: Failed to generate report for ${s} at the top level.`, e);
-            // Return a safe error message with the original symbol's keyboard
-            return {
-                text: `❌ <b>CRITICAL ERROR for ${s}</b>\n\nReport generation failed due to a system error or missing dependencies. Please check console logs.`,
-                keyboard: kbActions(s)
-            };
-        }
-    }
-
-    if (d.startsWith("tfs_")) {
-        const s = d.replace("tfs_", "");
-        return { text: `🕒 Timeframes for <b>${s}</b>`, keyboard: kbTimeframes(s) };
-    }
-
-    // FINAL FIX
-    if (d.startsWith("tf_")) {
-        // format: tf_SYMBOL_TF
-        // ex: tf_BTCUSDT_15m
-        const parts = d.split("_");
-        const symbol = parts[1];
-        const tf = parts[2];
-        try {
-             return await generateReport(symbol, tf);
-        } catch (e) {
-            console.error(`❌ CRITICAL ERROR: Failed to generate report for ${symbol}/${tf}.`, e);
-            return {
-                text: `❌ <b>CRITICAL ERROR for ${symbol} (${tf})</b>\n\nReport generation failed due to a system error.`,
-                keyboard: kbActions(symbol)
-            };
-        }
-    }
-
-    if (d.startsWith("refresh_")) {
-        const s = d.replace("refresh_", "");
-        try {
-            return await generateReport(s);
-        } catch (e) {
-            console.error(`❌ CRITICAL ERROR: Failed to refresh report for ${s}.`, e);
-            return {
-                text: `❌ <b>CRITICAL ERROR during Refresh for ${s}</b>\n\nReport generation failed due to a system error.`,
-                keyboard: kbActions(s)
-            };
-        }
-    }
-
-    if (d.startsWith("news_")) {
-        const s = d.replace("news_", "");
-        const mapped = symbolMap[s] || s;
-        let n = {};
-        try {
-             n = await fetchNewsBundle(mapped);
-        } catch (e) {
-            console.error(`News fetch failed for ${s}:`, e);
-            return { text: `❌ News Fetch Failed for ${s}.`, keyboard: kbActions(s) };
-        }
-        
-        return {
-            text: `📰 <b>News Report</b>\nImpact: ${n.impact || 'N/A'}\nSentiment: ${safeNum(n.sentiment, 50)}%`,
-            keyboard: kbActions(s)
-        };
-    }
-
-    if (d.startsWith("ell_")) {
-        const s = d.replace("ell_", "");
-        const mapped = symbolMap[s] || s;
-
-        const { data } = await resolvePriceAndCandles(mapped, "15m");
-        let ell = null;
-        try { 
-            if (data.length >= 8) {
-               ell = await analyzeElliott(data.slice(-500)); 
-            }
-        } catch (e) {
-            console.error(`Elliott analysis failed for ${s}:`, e);
-        }
-
-        if (!ell?.patterns?.length)
-            return {
-                text: `📊 <b>Elliott Waves (15m)</b>\nSentiment: N/A\nConfidence: ${ell?.confidence ? Math.round(ell.confidence) : 50}%\n\nPatterns: No major pattern found or insufficient data.`,
-                keyboard: kbActions(s)
-            };
-
-        const det = ell.patterns
-            .map(p => `${p.type}(${round(p.conf || p.confidence || 50, 0)}%)`)
-            .slice(0, 6)
-            .join("\n- ");
-
-        const sc = safeNum(ell.sentiment, 0);
-        const tr = sc > 0.15 ? "Bullish" : sc < -0.15 ? "Bearish" : "Neutral";
-
-        return {
-            text: `📊 <b>Elliott Waves (15m)</b>\nSentiment: ${tr}\nConfidence: ${Math.round(ell.confidence)}%\n\nPatterns:\n- ${det}`,
-            keyboard: kbActions(s)
-        };
-    }
-
-    return { text: "❌ Unknown command", keyboard: kbHome };
-}
+// EXPORTS
+export { generateReport, kbHome, kbCrypto, kbIndices, kbForex, kbCommodity };
