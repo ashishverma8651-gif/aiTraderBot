@@ -631,4 +631,3 @@ export async function analyzeElliott(candles = [], opts = {}) {
 export default { analyzeElliott };
 
 // EXPORTS (Same as original)
-export { analyzeElliott };
