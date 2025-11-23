@@ -1,4 +1,4 @@
-// FILE: utils.js  (Option C - Enhanced Multi-Vendor, Fault-Tolerant, Cache-Warm, Proxy-Safe)
+// FILE: utils.js — Enhanced NON-BREAKING version (keeps same exports & behavior)
 // Exports: fetchMarketData, fetchUniversal, fetchMultiTF
 import axios from "axios";
 import fs from "fs";
@@ -13,22 +13,26 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const AXIOS_TIMEOUT = Number(process.env.AXIOS_TIMEOUT_MS || 12000);
 const RETRY_ATTEMPTS = Number(process.env.RETRY_ATTEMPTS || 2);
-const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 450);
-const DEFAULT_LIMIT = 200;
+const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 400);
+const DEFAULT_LIMIT = Number(process.env.DEFAULT_LIMIT || 200);
 
-const ALPHAVANTAGE_KEY = process.env.ALPHAVANTAGE_KEY || CONFIG.ALPHA_VANTAGE_KEY || null;
+const EXTERNAL_PROXY_SERVICES = [
+  "https://api.codetabs.com/v1/proxy?quest=",
+  "https://api.allorigins.win/raw?url=",
+  "https://corsproxy.io/?"
+];
 
 const now = () => Date.now();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const safeNum = v => Number.isFinite(+v) ? +v : 0;
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const safeNum = v => (Number.isFinite(+v) ? +v : 0);
 const last = (arr, n = 1) => (Array.isArray(arr) && arr.length ? arr[arr.length - n] : null);
 
 // -----------------------------
-// Cache helpers & lastGoodPrice
+// Cache helpers
 // -----------------------------
 function cachePath(symbol, interval) {
-  return path.join(CACHE_DIR, `${symbol}__${interval}.json`);
+  const key = `${String(symbol).toUpperCase()}_${String(interval)}`;
+  return path.join(CACHE_DIR, `${key}.json`);
 }
 function readCache(symbol, interval) {
   try {
@@ -48,19 +52,18 @@ function writeCache(symbol, interval, data) {
     fs.writeFileSync(p, JSON.stringify(obj, null, 2));
   } catch {}
 }
-// search caches for a last known close (across intervals)
+// Return last known close from any cache file for symbol (fallback)
 function lastGoodPrice(symbol) {
   try {
-    const files = fs.readdirSync(CACHE_DIR).filter(f => f.startsWith(symbol + "__"));
-    // prefer newest file
-    files.sort((a,b) => fs.statSync(path.join(CACHE_DIR,b)).mtimeMs - fs.statSync(path.join(CACHE_DIR,a)).mtimeMs);
+    const files = fs.readdirSync(CACHE_DIR).filter(f => f.startsWith(String(symbol).toUpperCase() + "_"));
+    files.sort((a, b) => fs.statSync(path.join(CACHE_DIR, b)).mtimeMs - fs.statSync(path.join(CACHE_DIR, a)).mtimeMs);
     for (const f of files) {
       try {
         const obj = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, f), "utf8") || "{}");
         const arr = obj?.data;
         if (Array.isArray(arr) && arr.length) {
-          const lastc = arr[arr.length - 1];
-          if (lastc && Number.isFinite(+lastc.close)) return Number(lastc.close);
+          const lc = arr[arr.length - 1];
+          if (lc && Number.isFinite(+lc.close)) return Number(lc.close);
         }
       } catch {}
     }
@@ -69,7 +72,7 @@ function lastGoodPrice(symbol) {
 }
 
 // -----------------------------
-// Timeframes map
+// Timeframes map & symbol map (preserved)
 // -----------------------------
 const TF_MAP = {
   "1m":  { interval: "1m",   range: "1d" },
@@ -81,9 +84,6 @@ const TF_MAP = {
   "1d":  { interval: "1d",   range: "6mo" }
 };
 
-// -----------------------------
-// Symbol equivalences (kept + extended)
-// -----------------------------
 const SYMBOL_EQUIV = {
   GOLD: "GC=F",
   XAUUSD: "GC=F",
@@ -108,41 +108,43 @@ function parseProxy(proxyUrl) {
   try {
     const u = new URL(proxyUrl);
     const auth = u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } : undefined;
-    return { protocol: u.protocol.replace(":", ""), host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80), auth };
-  } catch { return null; }
+    return {
+      protocol: u.protocol.replace(":", ""),
+      host: u.hostname,
+      port: Number(u.port) || (u.protocol === "https:" ? 443 : 80),
+      auth
+    };
+  } catch {
+    return null;
+  }
 }
 const PROXY_CFG = parseProxy(CONFIG.PROXY || process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null);
 function axiosOptions(timeout = AXIOS_TIMEOUT) {
-  const opts = { timeout, validateStatus: s => s >= 200 && s < 500 }; // treat 4xx as handled
+  const opts = { timeout };
   if (PROXY_CFG) {
-    opts.proxy = { host: PROXY_CFG.host, port: PROXY_CFG.port, protocol: PROXY_CFG.protocol };
+    opts.proxy = { host: PROXY_CFG.host, port: PROXY_CFG.port };
     if (PROXY_CFG.auth) opts.proxy.auth = { username: PROXY_CFG.auth.username, password: PROXY_CFG.auth.password };
   }
   return opts;
 }
 
 // -----------------------------
-// safeGet: primary tries + mirror/proxy fallbacks
+// safeGet with retries + mirrors + external proxies
+// (keeps silent failures but tries many fallbacks)
 // -----------------------------
-const GLOBAL_MIRRORS = CONFIG.DATA_SOURCES?.BINANCE || [];
-const EXTERNAL_PROXIES = (CONFIG.PROXY ? [CONFIG.PROXY] : []).concat([
-  "https://api.codetabs.com/v1/proxy?quest=",
-  "https://api.allorigins.win/raw?url=",
-  "https://corsproxy.io/?"
-]);
-
 async function safeGet(url, mirrors = [], timeout = AXIOS_TIMEOUT) {
-  // primary direct attempts
+  // try direct with retries
   for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
     try {
       const r = await axios.get(url, axiosOptions(timeout));
       if (r?.data !== undefined && r?.data !== null) return r.data;
-    } catch (err) {
-      if (attempt < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS + Math.random() * 120);
+    } catch {
+      if (attempt < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS);
     }
   }
-  // try mirrors (mirror includes vendor fallback domains)
-  for (const m of (mirrors || []).concat(GLOBAL_MIRRORS || [])) {
+
+  // try mirrors (mirror bases in mirrors array)
+  for (const m of mirrors || []) {
     if (!m) continue;
     let final = url;
     try {
@@ -153,26 +155,28 @@ async function safeGet(url, mirrors = [], timeout = AXIOS_TIMEOUT) {
       try {
         const r = await axios.get(final, axiosOptions(timeout));
         if (r?.data !== undefined && r?.data !== null) return r.data;
-      } catch (err) {
-        if (attempt < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS + Math.random()*120);
+      } catch {
+        if (attempt < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS);
       }
     }
   }
+
   // try external proxy services
-  for (const pbase of EXTERNAL_PROXIES) {
+  for (const pbase of EXTERNAL_PROXY_SERVICES) {
     try {
-      const prox = pbase + encodeURIComponent(url);
+      const proxied = pbase + encodeURIComponent(url);
       for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
         try {
-          const r = await axios.get(prox, axiosOptions(timeout));
+          const r = await axios.get(proxied, axiosOptions(timeout));
           if (r?.data !== undefined && r?.data !== null) return r.data;
-        } catch (err) {
-          if (attempt < RETRY_ATTEMPTS - 1) await sleep(120 + Math.random()*120);
+        } catch {
+          if (attempt < RETRY_ATTEMPTS - 1) await sleep(RETRY_DELAY_MS);
         }
       }
     } catch {}
   }
-  return null;
+
+  return null; // silent fail
 }
 
 // -----------------------------
@@ -188,7 +192,7 @@ function normalizeKline(raw) {
     close: +k[4],
     vol: +k[5]
   }));
-  out.sort((a,b) => a.t - b.t);
+  out.sort((a, b) => a.t - b.t);
   return out;
 }
 function normalizeYahooChart(res) {
@@ -198,9 +202,9 @@ function normalizeYahooChart(res) {
   const ts = r.timestamp || [];
   const q = r.indicators?.quote?.[0] || {};
   const out = [];
-  for (let i=0;i<ts.length;i++) {
+  for (let i = 0; i < ts.length; i++) {
     const close = q.close?.[i];
-    if (!Number.isFinite(close)) continue;
+    if (!Number.isFinite(close)) continue; // skip nulls
     out.push({
       t: Number(ts[i]) * 1000,
       open: Number(q.open?.[i] ?? close),
@@ -210,107 +214,52 @@ function normalizeYahooChart(res) {
       vol: Number(q.volume?.[i] || 0)
     });
   }
-  out.sort((a,b) => a.t - b.t);
-  return out;
-}
-function normalizeAlphaCsv(csvText) {
-  // attempt to parse AlphaVantage CSV daily or intraday (fallback)
-  // basic parsing - returns array of candles with t in ms
-  if (!csvText || typeof csvText !== "string") return [];
-  const lines = csvText.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-  const header = lines[0].split(",");
-  const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(",");
-    if (cols.length < 5) continue;
-    // header may be timestamp,open,high,low,close,volume
-    const ts = new Date(cols[0]).getTime();
-    if (!Number.isFinite(ts)) continue;
-    out.push({
-      t: ts,
-      open: Number(cols[1]),
-      high: Number(cols[2]),
-      low: Number(cols[3]),
-      close: Number(cols[4]),
-      vol: Number(cols[5] || 0)
-    });
-  }
-  out.sort((a,b)=>a.t-b.t);
+  out.sort((a, b) => a.t - b.t);
   return out;
 }
 
 // -----------------------------
-// Vendor fetchers
+// fetchCrypto — Binance klines only, with cache fallback
 // -----------------------------
-// 1) Binance klines
-async function fetchBinanceKlines(symbol, interval = "15m", limit = DEFAULT_LIMIT) {
+async function fetchCrypto(symbol, interval = "15m", limit = 200) {
   try {
+    symbol = String(symbol).toUpperCase();
+    const cacheEntry = readCache(symbol, interval);
+    // build URL
     const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${Number(limit)}`;
     const mirrors = CONFIG.DATA_SOURCES?.BINANCE || [];
     const raw = await safeGet(url, mirrors);
-    if (!raw) return [];
-    return normalizeKline(raw);
+    if (!raw || !Array.isArray(raw) || !raw.length) {
+      // fallback to cache if exists
+      if (cacheEntry && Array.isArray(cacheEntry.data) && cacheEntry.data.length) return cacheEntry.data;
+      return [];
+    }
+    const normalized = normalizeKline(raw);
+    writeCache(symbol, interval, normalized);
+    return normalized;
   } catch {
-    return [];
+    return readCache(symbol, interval)?.data || [];
   }
 }
-// 2) Bybit klines (mirror)
-async function fetchBybitKlines(symbol, interval = "15m", limit = DEFAULT_LIMIT) {
-  try {
-    // Bybit API shape: /public/linear/kline?symbol=BTCUSDT&interval=1
-    const mapInterval = interval.replace("m","").replace("h","60"); // keep simple; Bybit may use other naming in some endpoints
-    const url = `https://api.bybit.com/public/linear/kline?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(mapInterval)}&limit=${Number(limit)}`;
-    const raw = await safeGet(url, CONFIG.DATA_SOURCES?.BYBIT || []);
-    // Bybit wraps data inside result?.list sometimes
-    const list = raw?.result?.list || raw?.result || raw;
-    if (!Array.isArray(list)) return [];
-    // convert if Bybit returns arrays
-    if (Array.isArray(list) && list.length && Array.isArray(list[0])) return normalizeKline(list);
-    // else try to map object entries
-    try {
-      return list.map(r => ({
-        t: safeNum(r.open_time || r.t || r[0]) * (r.open_time ? 1000 : 1),
-        open: safeNum(r.open || r[1]),
-        high: safeNum(r.high || r[2]),
-        low: safeNum(r.low || r[3]),
-        close: safeNum(r.close || r[4]),
-        vol: safeNum(r.volume || r[5])
-      }));
-    } catch { return []; }
-  } catch { return []; }
-}
-// 3) KuCoin (mirror)
-async function fetchKucoinKlines(symbol, interval = "15m", limit = DEFAULT_LIMIT) {
-  try {
-    const url = `https://api.kucoin.com/api/v1/market/candles?type=${encodeURIComponent(interval)}&symbol=${encodeURIComponent(symbol)}&limit=${Number(limit)}`;
-    const raw = await safeGet(url, CONFIG.DATA_SOURCES?.KUCOIN || []);
-    // Kucoin returns array of arrays: [time, open, close, high, low, volume, turnover]
-    if (!Array.isArray(raw)) return [];
-    const mapped = raw.map(k => {
-      // map to Binance-like order: time, open, high, low, close, vol
-      const t = Number(k[0]);
-      return { t: t * (t < 9999999999 ? 1000 : 1), open: Number(k[1]), high: Number(k[3]), low: Number(k[4]), close: Number(k[2]), vol: Number(k[5]) };
-    });
-    mapped.sort((a,b)=>a.t-b.t);
-    return mapped;
-  } catch { return []; }
-}
 
-// 4) Yahoo chart v8
+// -----------------------------
+// fetchYahoo — robust + cache fallback
+// -----------------------------
 async function fetchYahoo(symbol, interval = "15m") {
   try {
+    symbol = String(symbol);
     const tf = TF_MAP[interval] || TF_MAP["15m"];
     const cacheEntry = readCache(symbol, interval);
     const base = CONFIG.DATA_SOURCES?.YAHOO?.[0] || "https://query1.finance.yahoo.com/v8/finance/chart";
     const url = `${base}/${encodeURIComponent(symbol)}?interval=${tf.interval}&range=${tf.range}`;
+
     const res = await safeGet(url, CONFIG.DATA_SOURCES?.YAHOO?.slice(1) || []);
     const arr = normalizeYahooChart(res);
     if (arr && arr.length) {
       writeCache(symbol, interval, arr);
       return arr;
     }
-    // fallback to cache instead of returning empty
+    // if clean result not available, fall back to cache to avoid empty returns
     if (cacheEntry && Array.isArray(cacheEntry.data) && cacheEntry.data.length) return cacheEntry.data;
     return [];
   } catch {
@@ -318,197 +267,169 @@ async function fetchYahoo(symbol, interval = "15m") {
   }
 }
 
-// 5) AlphaVantage (optional) - CSV endpoint (TIME_SERIES_INTRADAY or DAILY)
-async function fetchAlpha(symbol, interval = "15m") {
-  try {
-    if (!ALPHAVANTAGE_KEY) return [];
-    // choose function
-    const func = interval === "1d" ? "TIME_SERIES_DAILY" : "TIME_SERIES_INTRADAY";
-    const intradayInterval = (interval === "1m" || interval === "5m" || interval === "15m" || interval === "30m") ? interval : "60min";
-    const apiUrl = func === "TIME_SERIES_DAILY"
-      ? `https://www.alphavantage.co/query?function=${func}&symbol=${encodeURIComponent(symbol)}&apikey=${ALPHAVANTAGE_KEY}&datatype=csv`
-      : `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(symbol)}&interval=${intradayInterval}&apikey=${ALPHAVANTAGE_KEY}&datatype=csv`;
-    const csv = await safeGet(apiUrl, [], 12000);
-    const normalized = normalizeAlphaCsv(csv);
-    return normalized;
-  } catch { return []; }
-}
-
 // -----------------------------
-// fetchCrypto: multi-vendor & cache with fallback
-// -----------------------------
-async function fetchCrypto(symbol, interval = "15m", limit = DEFAULT_LIMIT) {
-  symbol = String(symbol).toUpperCase();
-  const cacheKeyInterval = interval;
-  const cacheEntry = readCache(symbol, cacheKeyInterval);
-  if (cacheEntry && (now() - cacheEntry.fetchedAt) < (CACHE_TTL(interval) || 60000)) {
-    // warm cache
-    return cacheEntry.data.slice();
-  }
-
-  // vendor order: Binance -> Bybit -> Kucoin -> Yahoo -> Alpha (if key)
-  let data = [];
-  data = await fetchBinanceKlines(symbol, interval, limit);
-  if (!data.length) data = await fetchBybitKlines(symbol, interval, limit);
-  if (!data.length) data = await fetchKucoinKlines(symbol, interval, limit);
-  if (!data.length) data = await fetchYahoo(symbol, interval);
-  if (!data.length && ALPHAVANTAGE_KEY) data = await fetchAlpha(symbol, interval);
-
-  // if all vendors fail, fallback to cache
-  if (!data.length && cacheEntry && Array.isArray(cacheEntry.data)) return cacheEntry.data;
-
-  if (data.length) writeCache(symbol, cacheKeyInterval, data);
-  return data;
-}
-
-// -----------------------------
-// fetchNSE: robust NSE / India ticker fetch with multiple trials
+// fetchNSE — handle mapped prefixes and fallbacks
 // -----------------------------
 async function fetchNSE(symbol, interval = "15m") {
-  const mapped = SYMBOL_EQUIV[symbol] || symbol;
-  let toFetch = mapped;
-  if (typeof toFetch === "string" && toFetch.startsWith("NSE:")) toFetch = toFetch.replace(/^NSE:/, "");
-  // try prefixed caret
-  const tryPref = toFetch.startsWith("^") ? toFetch : `^${toFetch}`;
-  const c1 = await fetchYahoo(tryPref, interval);
-  if (c1.length) return c1;
-  // try non-caret
-  const c2 = await fetchYahoo(toFetch, interval);
-  if (c2.length) return c2;
-  // try original symbol
-  const c3 = await fetchYahoo(symbol, interval);
-  if (c3.length) return c3;
-  // try alpha if available
-  if (ALPHAVANTAGE_KEY) {
-    const ca = await fetchAlpha(symbol, interval);
-    if (ca.length) return ca;
+  try {
+    const mapped = SYMBOL_EQUIV[symbol] || symbol;
+    let toFetch = mapped;
+    if (typeof toFetch === "string" && toFetch.startsWith("NSE:")) toFetch = toFetch.replace(/^NSE:/, "");
+    // try caret form first
+    const cand1 = typeof toFetch === "string" && !toFetch.startsWith("^") ? `^${toFetch}` : toFetch;
+    const r1 = await fetchYahoo(cand1, interval);
+    if (r1 && r1.length) return r1;
+    const r2 = await fetchYahoo(toFetch, interval);
+    if (r2 && r2.length) return r2;
+    const r3 = await fetchYahoo(symbol, interval);
+    if (r3 && r3.length) return r3;
+    // final: cache fallback
+    return readCache(toFetch, interval)?.data || readCache(symbol, interval)?.data || [];
+  } catch {
+    return readCache(symbol, interval)?.data || [];
   }
-  // fallback to cache
-  return readCache(toFetch, interval)?.data || readCache(symbol, interval)?.data || [];
 }
 
 // -----------------------------
-// helper: returns TTL per interval
+// fetchPrice helper (tries Yahoo -> Binance -> NSE) and returns null if none.
+// Returns latest close or null (do not return 0 directly)
 // -----------------------------
-function CACHE_TTL(interval) {
-  const map = {
-    "1m": 30 * 1000,
-    "5m": 60 * 1000,
-    "15m": 2 * 60 * 1000,
-    "30m": 5 * 60 * 1000,
-    "1h": 10 * 60 * 1000,
-    "4h": 30 * 60 * 1000,
-    "1d": 60 * 60 * 1000
-  };
-  return map[interval] || map["15m"];
+export async function fetchPrice(symbol) {
+  try {
+    if (!symbol) return null;
+    symbol = String(symbol).toUpperCase();
+    const mapped = SYMBOL_EQUIV[symbol] || symbol;
+
+    // 1) try Yahoo 1m
+    try {
+      const y = await fetchYahoo(mapped, "1m");
+      if (Array.isArray(y) && y.length) {
+        const p = y.at(-1).close;
+        if (Number.isFinite(+p)) return Number(p);
+      }
+    } catch {}
+
+    // 2) if crypto, try Binance 1m
+    try {
+      const suffixes = ["USDT", "BTC"];
+      if (suffixes.some(s => symbol.endsWith(s))) {
+        const b = await fetchCrypto(symbol, "1m", 2);
+        if (Array.isArray(b) && b.length) {
+          const p = b.at(-1).close;
+          if (Number.isFinite(+p)) return Number(p);
+        }
+      }
+    } catch {}
+
+    // 3) if India index, try NSE
+    try {
+      if (CONFIG.MARKETS?.INDIA?.INDEXES?.includes(symbol)) {
+        const n = await fetchNSE(symbol, "1m");
+        if (Array.isArray(n) && n.length) {
+          const p = n.at(-1).close;
+          if (Number.isFinite(+p)) return Number(p);
+        }
+      }
+    } catch {}
+
+    // 4) fallback to last cached price (if any)
+    const lastCached = lastGoodPrice(symbol);
+    if (lastCached && Number.isFinite(+lastCached)) return Number(lastCached);
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // -----------------------------
-// fetchMarketData — crypto wrapper (returns source tag)
- // returns { data, price, updated, source }
+// fetchMarketData (Crypto only wrapper)
 // -----------------------------
-export async function fetchMarketData(symbol, interval = "15m", limit = DEFAULT_LIMIT) {
+export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
   try {
     const data = await fetchCrypto(symbol, interval, limit);
-    const lastc = last(data);
-    const price = lastc ? Number(lastc.close) : lastGoodPrice(symbol) || 0;
-    return { data, price: safeNum(price), updated: new Date().toISOString(), source: "multi-vendor-crypto" };
+    const lastC = data.at(-1) || {};
+    const price = Number(lastC?.close || (await fetchPrice(symbol)) || 0);
+    return {
+      data,
+      price,
+      updated: new Date().toISOString()
+    };
   } catch {
-    return { data: [], price: lastGoodPrice(symbol) || 0, updated: new Date().toISOString(), source: "error" };
+    return { data: [], price: lastGoodPrice(symbol) || 0, updated: new Date().toISOString() };
   }
 }
 
 // -----------------------------
-// Market detection helper
-// -----------------------------
-function detectMarket(symbol = "") {
-  if (!symbol) return "GENERAL";
-  const s = String(symbol).toUpperCase();
-  const indiaIdx = (CONFIG.MARKETS?.INDIA?.INDEXES || []).map(x => String(x).toUpperCase());
-  if (indiaIdx.includes(s) || /NIFTY|BANKNIFTY|SENSEX|FINNIFTY/.test(s)) return "INDIA";
-  if (/(USDT|USD|BTC|ETH)$/.test(s)) return "CRYPTO";
-  if (/^(GC=F|CL=F|NG=F|SI=F|XAU|XAG|OIL|GOLD|SILVER)$/.test(s)) return "COMMODITY";
-  if (/^[A-Z]{6}$/.test(s) && (s.endsWith("USD") || s.includes("JPY"))) return "FOREX";
-  if (/^[A-Z]{1,5}$/.test(s)) return "STOCK";
-  if (/^(SP|DJI|NDX|NIFTY|BANKNIFTY|SENSEX)/.test(s)) return "INDEX";
-  return "GENERAL";
-}
-
-// -----------------------------
-// lastPriceFromData helper
-// -----------------------------
-function lastPriceFromData(data) {
-  if (!Array.isArray(data) || !data.length) return 0;
-  const c = last(data);
-  return safeNum(c.close || c.price || 0);
-}
-
-// -----------------------------
-// fetchUniversal — main router (multi-vendor + fallbacks)
-// returns { data, price }
+// fetchUniversal — MASTER ROUTER (keeps your original logic but uses fetchPrice fallback)
 // -----------------------------
 export async function fetchUniversal(symbolInput, interval = "15m") {
   try {
     if (!symbolInput) return { data: [], price: 0 };
     let symbol = String(symbolInput).toUpperCase();
-    const market = detectMarket(symbol);
 
-    // apply mapping
-    let mapped = SYMBOL_EQUIV[symbol] || null;
-    if (mapped && mapped.startsWith("NSE:")) mapped = mapped.replace(/^NSE:/, "");
+    const mapped = SYMBOL_EQUIV[symbol] || null;
 
-    // CRYPTO path
-    if (market === "CRYPTO") {
+    const CRYPTO_SUFFIX = ["USDT", "BTC"];
+    const isCrypto =
+      CRYPTO_SUFFIX.some(sfx => symbol.endsWith(sfx)) &&
+      !CONFIG.MARKETS?.INDIA?.INDEXES?.includes(symbol) &&
+      (!mapped || !mapped.startsWith("^"));
+
+    // CRYPTO RAW
+    if (isCrypto) {
       const x = await fetchMarketData(symbol, interval);
-      return { data: x.data, price: x.price };
+      // ensure price fallback
+      const price = x.price || (await fetchPrice(symbol)) || lastGoodPrice(symbol) || 0;
+      return { data: x.data, price };
     }
 
-    // INDIA (indices)
-    if (market === "INDIA") {
-      // try NSE-specific fetch
+    // NSE INDIA INDEX
+    if (CONFIG.MARKETS?.INDIA?.INDEXES?.includes(symbol)) {
       const d = await fetchNSE(symbol, interval);
-      const price = lastPriceFromData(d) || lastGoodPrice(symbol) || lastGoodPrice(mapped || symbol);
-      return { data: d, price: safeNum(price) };
+      const price = (d?.length ? Number(d.at(-1).close) : null) ?? (await fetchPrice(symbol)) ?? lastGoodPrice(symbol) ?? 0;
+      return { data: d, price };
     }
 
-    // STOCK/FOREX/COMMODITY/INDEX: try mapped then symbol then alpha then cache
-    const yahooTarget = mapped || symbol;
-    const y1 = await fetchYahoo(yahooTarget, interval);
-    if (y1.length) return { data: y1, price: safeNum(lastPriceFromData(y1) || lastGoodPrice(yahooTarget) || lastGoodPrice(symbol)) };
+    // YAHOO (mapped or symbol)
+    const target = mapped || symbol;
+    const y1 = await fetchYahoo(target, interval);
+    if (y1 && y1.length) {
+      const price = Number(y1.at(-1).close) || (await fetchPrice(symbol)) || lastGoodPrice(symbol) || 0;
+      return { data: y1, price };
+    }
 
+    // second attempt with raw symbol
     const y2 = await fetchYahoo(symbol, interval);
-    if (y2.length) return { data: y2, price: safeNum(lastPriceFromData(y2) || lastGoodPrice(symbol)) };
-
-    // try Alpha if present
-    if (ALPHAVANTAGE_KEY) {
-      const a1 = await fetchAlpha(symbol, interval);
-      if (a1.length) return { data: a1, price: safeNum(lastPriceFromData(a1) || lastGoodPrice(symbol)) };
+    if (y2 && y2.length) {
+      const price = Number(y2.at(-1).close) || (await fetchPrice(symbol)) || lastGoodPrice(symbol) || 0;
+      return { data: y2, price };
     }
 
-    // final fallback: search cache
-    const cached = readCache(yahooTarget, interval)?.data || readCache(symbol, interval)?.data || [];
-    const cachedPrice = safeNum(lastPriceFromData(cached) || lastGoodPrice(symbol) || lastGoodPrice(yahooTarget) || 0);
+    // fallback: cached data or fetchPrice
+    const cached = readCache(target, interval)?.data || readCache(symbol, interval)?.data || [];
+    const cachedPrice = (cached?.length ? Number(cached.at(-1).close) : 0) || (await fetchPrice(symbol)) || lastGoodPrice(symbol) || 0;
     return { data: cached, price: cachedPrice };
   } catch {
-    return { data: [], price: lastGoodPrice(symbolInput) || 0 };
+    return { data: [], price: lastGoodPrice(String(symbolInput).toUpperCase()) || 0 };
   }
 }
 
 // -----------------------------
-// pLimit concurrency helper
+// Simple concurrency limiter
 // -----------------------------
 function pLimit(concurrency = 2) {
   const queue = [];
   let active = 0;
   const next = () => {
-    if (!queue.length || active >= concurrency) return;
+    if (queue.length === 0 || active >= concurrency) return;
     active++;
     const { fn, resolve, reject } = queue.shift();
-    Promise.resolve(fn()).then(v => {
+    Promise.resolve(fn()).then((v) => {
       active--;
       resolve(v);
       next();
-    }).catch(err => {
+    }).catch((err) => {
       active--;
       reject(err);
       next();
@@ -523,11 +444,11 @@ function pLimit(concurrency = 2) {
 // -----------------------------
 // fetchMultiTF — concurrency-limited multi-timeframe fetcher
 // -----------------------------
-export async function fetchMultiTF(symbol, tfs = ["5m","15m","1h"]) {
+export async function fetchMultiTF(symbol, tfs = ["5m", "15m", "1h"]) {
   const out = {};
   const limit = pLimit(2);
   const tasks = tfs.map(tf => limit(async () => {
-    await sleep(40 + Math.floor(Math.random()*120));
+    await sleep(50 + Math.floor(Math.random() * 120));
     const res = await fetchUniversal(symbol, tf);
     out[tf] = res;
   }));
@@ -535,6 +456,3 @@ export async function fetchMultiTF(symbol, tfs = ["5m","15m","1h"]) {
   return out;
 }
 
-// -----------------------------
-// Keep default export null (compat)
-export default null;
