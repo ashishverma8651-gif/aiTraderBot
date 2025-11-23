@@ -99,13 +99,13 @@ async function fetchCrypto(symbol, interval = "15m", limit = 200) {
 }
 
 // =====================================================
-// 2) NSE MULTI-SOURCE FETCH  (MAIN FIX)
+// 2) NSE MULTI-SOURCE FETCH  (BEST + FALLBACK CHAIN)
 // =====================================================
 async function fetchNSE(symbol = "") {
   symbol = symbol.toUpperCase();
 
   const sources = [
-    // 1) RAPIDAPI MIRROR (BEST)
+    // 1) RAPIDAPI (BEST LIVE PRICE)
     async () => {
       if (!process.env.RAPIDAPI_KEY) return [];
       const url = `https://latest-stock-price.p.rapidapi.com/price?Indices=${symbol}`;
@@ -120,6 +120,7 @@ async function fetchNSE(symbol = "") {
       if (!Array.isArray(raw) || raw.length === 0) return [];
       const p = Number(raw[0].lastPrice || raw[0].ltp);
       if (!p) return [];
+
       return [{
         t: Date.now(),
         open: p,
@@ -163,7 +164,7 @@ async function fetchNSE(symbol = "") {
       return out;
     },
 
-    // 3) ORIGINAL NSE API (fallback)
+    // 3) ORIGINAL NSE API
     async () => {
       try {
         const base = CONFIG.DATA_SOURCES.NSE?.[0];
@@ -200,7 +201,7 @@ async function fetchNSE(symbol = "") {
 }
 
 // =====================================================
-// 3) YAHOO FETCH (STOCKS / FOREX / INDICES)
+// 3) YAHOO FETCH
 // =====================================================
 async function fetchYahoo(symbol = "") {
   try {
@@ -232,7 +233,7 @@ async function fetchYahoo(symbol = "") {
 }
 
 // =====================================================
-// EXPORT: fetchMarketData (CRYPTO ONLY + CACHE)
+// EXPORT: fetchMarketData (CRYPTO + CACHE)
 // =====================================================
 export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
   symbol = String(symbol || "").toUpperCase();
@@ -273,7 +274,7 @@ export async function fetchMultiTF(symbol, tfs = ["1m", "5m", "15m"]) {
 }
 
 // =====================================================
-// EXPORT: fetchUniversal  (AUTO-ROUTE)
+// EXPORT: fetchUniversal (AUTO ROUTING)
 // =====================================================
 export async function fetchUniversal(symbol, interval = "15m") {
   symbol = symbol.toUpperCase();
@@ -293,7 +294,7 @@ export async function fetchUniversal(symbol, interval = "15m") {
     };
   }
 
-  // YAHOO (STOCKS / FOREX)
+  // YAHOO STOCKS / FOREX
   const yahoo = await fetchYahoo(symbol);
   if (yahoo.length > 0) {
     return {
