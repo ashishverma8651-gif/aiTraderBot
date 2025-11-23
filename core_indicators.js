@@ -1,38 +1,46 @@
-// core_indicators.js — Universal Indicators (CRYPTO + NSE + STOCKS)
-// All functions preserved exactly — only stability + accuracy upgrades applied.
+// ===================================================
+// core_indicators.js — Enhanced Universal Indicators
+// Crypto + Stocks + Forex + Indices (NSE, US, Global)
+// ===================================================
 
-// =====================================
-// RSI — Smoothed & Safer
-// =====================================
+// ---------------------------
+// SAFE NUMBER
+// ---------------------------
+function N(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// ===================================================
+// RSI — Smoothed & More Accurate
+// ===================================================
 export function computeRSI(candles = [], length = 14) {
   if (!Array.isArray(candles) || candles.length < length + 2) return 50;
 
   let gains = 0, losses = 0;
 
   for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
-    const prev = Number(candles[i].close || 0);
-    const curr = Number(candles[i + 1].close || 0);
+    const prev = N(candles[i].close);
+    const curr = N(candles[i + 1].close);
     const diff = curr - prev;
 
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
 
-  if (gains === 0 && losses === 0) return 50;
+  if (!gains && !losses) return 50;
 
   // Avoid div-zero
   const avgGain = gains / length;
   const avgLoss = (losses || 0.000001) / length;
 
   const rs = avgGain / avgLoss;
-  const rsi = 100 - 100 / (1 + rs);
-
-  return Number(rsi.toFixed(2));
+  return Number((100 - 100 / (1 + rs)).toFixed(2));
 }
 
-// =====================================
-// ATR — True Range Average
-// =====================================
+// ===================================================
+// ATR — True Range
+// ===================================================
 export function computeATR(candles = [], length = 14) {
   if (candles.length < length + 1) return 0;
 
@@ -42,34 +50,42 @@ export function computeATR(candles = [], length = 14) {
     const cur = candles[i];
     const prev = candles[i - 1] || cur;
 
-    const high = Number(cur.high || 0);
-    const low = Number(cur.low || 0);
-    const prevC = Number(prev.close || 0);
+    const high = N(cur.high);
+    const low = N(cur.low);
+    const prevC = N(prev.close);
 
-    const tr = Math.max(
-      high - low,
-      Math.abs(high - prevC),
-      Math.abs(low - prevC)
+    trs.push(
+      Math.max(
+        high - low,
+        Math.abs(high - prevC),
+        Math.abs(low - prevC)
+      )
     );
-
-    trs.push(tr);
   }
 
   const atr = trs.reduce((a, b) => a + b, 0) / trs.length;
   return Number(atr.toFixed(4));
 }
 
-// =====================================
-// EMA Helper
-// =====================================
+// ===================================================
+// EMA — SMA-Initialized (PRO LEVEL)
+// ===================================================
 function ema(values = [], period = 12) {
-  if (!values.length) return [];
+  if (values.length < period) return [];
+
+  // SMA start — MUCH more accurate for small datasets
+  const sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
 
   const k = 2 / (period + 1);
-  let prev = values[0];
+  let prev = sma;
   const out = [];
 
-  for (const v of values) {
+  for (let i = 0; i < values.length; i++) {
+    const v = N(values[i]);
+    if (i < period) {
+      out.push(sma);
+      continue;
+    }
     prev = (v * k) + (prev * (1 - k));
     out.push(prev);
   }
@@ -77,13 +93,13 @@ function ema(values = [], period = 12) {
   return out;
 }
 
-// =====================================
-// MACD — Stable for All Markets
-// =====================================
+// ===================================================
+// MACD — Noise-Reduced Output
+// ===================================================
 export function computeMACD(candles = []) {
   if (candles.length < 35) return { hist: 0, line: 0, signal: 0 };
 
-  const closes = candles.map(c => Number(c.close || 0));
+  const closes = candles.map(c => N(c.close));
 
   const e12 = ema(closes, 12);
   const e26 = ema(closes, 26);
@@ -91,56 +107,59 @@ export function computeMACD(candles = []) {
   const signal = ema(macdLine, 9);
 
   const line = macdLine.at(-1) || 0;
-  const signalVal = signal.at(-1) || 0;
-  const hist = line - signalVal;
+  const sig = signal.at(-1) || 0;
+  const hist = line - sig;
 
   return {
     hist: Number(hist.toFixed(6)),
     line: Number(line.toFixed(6)),
-    signal: Number(signalVal.toFixed(6))
+    signal: Number(sig.toFixed(6))
   };
 }
 
-// =====================================
-// Volume Trend
-// =====================================
+// ===================================================
+// Volume Trend (Safe for Yahoo/NSE null volumes)
+// ===================================================
 export function volumeTrend(candles = []) {
   if (candles.length < 2) return "STABLE";
 
-  const last = Number(candles.at(-1).vol || 0);
-  const prev = Number(candles.at(-2).vol || 0);
+  const last = N(candles.at(-1).vol);
+  const prev = N(candles.at(-2).vol);
+
+  if (!last || !prev) return "STABLE";
 
   if (last > prev) return "INCREASING";
   if (last < prev) return "DECREASING";
   return "STABLE";
 }
 
-// =====================================
-// Volume Analyzer — TG Compatible
-// =====================================
+// ===================================================
+// Volume Analyzer — More granular
+// ===================================================
 export function analyzeVolume(candles = []) {
   if (candles.length < 3) return { status: "UNKNOWN", strength: 0 };
 
-  const v1 = Number(candles.at(-3).vol || 0);
-  const v2 = Number(candles.at(-2).vol || 0);
-  const v3 = Number(candles.at(-1).vol || 0);
+  const v1 = N(candles.at(-3).vol);
+  const v2 = N(candles.at(-2).vol);
+  const v3 = N(candles.at(-1).vol);
 
   if (v3 > v2 && v2 > v1) return { status: "RISING", strength: 3 };
   if (v3 < v2 && v2 < v1) return { status: "FALLING", strength: -3 };
+
   if (v3 > v2) return { status: "SLIGHT_UP", strength: 1 };
   if (v3 < v2) return { status: "SLIGHT_DOWN", strength: -1 };
 
   return { status: "STABLE", strength: 0 };
 }
 
-// =====================================
-// Fibonacci Levels (works for any market)
-// =====================================
+// ===================================================
+// Fibonacci Levels — No change (already optimal)
+// ===================================================
 export function computeFibLevelsFromCandles(candles = []) {
   if (!candles.length) return null;
 
-  const highs = candles.map(c => Number(c.high || 0));
-  const lows = candles.map(c => Number(c.low || 0));
+  const highs = candles.map(c => N(c.high));
+  const lows = candles.map(c => N(c.low));
 
   const hi = Math.max(...highs);
   const lo = Math.min(...lows);
@@ -152,36 +171,61 @@ export function computeFibLevelsFromCandles(candles = []) {
     retrace: {
       "0.236": Number((hi - diff * 0.236).toFixed(6)),
       "0.382": Number((hi - diff * 0.382).toFixed(6)),
-      "0.5": Number((hi - diff * 0.5).toFixed(6)),
+      "0.5":   Number((hi - diff * 0.5).toFixed(6)),
       "0.618": Number((hi - diff * 0.618).toFixed(6)),
       "0.786": Number((hi - diff * 0.786).toFixed(6))
     }
   };
 }
 
-// =====================================
-// Derive Signal — Multi-Market Heuristic
-// =====================================
-export function deriveSignal(indicators) {
-  if (!indicators) return "NEUTRAL";
+// ===================================================
+// Price Trend — NEW! (Better signals)
+// ===================================================
+export function computePriceTrend(candles = []) {
+  if (candles.length < 4) return "FLAT";
+
+  const c1 = N(candles.at(-4).close);
+  const c2 = N(candles.at(-3).close);
+  const c3 = N(candles.at(-2).close);
+  const c4 = N(candles.at(-1).close);
+
+  if (c4 > c3 && c3 > c2 && c2 > c1) return "UP";
+  if (c4 < c3 && c3 < c2 && c2 < c1) return "DOWN";
+
+  return "FLAT";
+}
+
+// ===================================================
+// deriveSignal — Better weighting
+// ===================================================
+export function deriveSignal(ind) {
+  if (!ind) return "NEUTRAL";
 
   let score = 0;
 
-  if (typeof indicators.RSI === "number") {
-    if (indicators.RSI < 30) score += 1;
-    if (indicators.RSI > 70) score -= 1;
+  // RSI Weighting
+  if (typeof ind.RSI === "number") {
+    if (ind.RSI < 30) score += 2;
+    if (ind.RSI < 20) score += 1;
+    if (ind.RSI > 70) score -= 2;
+    if (ind.RSI > 80) score -= 1;
   }
 
-  if (indicators.MACD && typeof indicators.MACD.hist === "number") {
-    score += indicators.MACD.hist > 0 ? 1 : -1;
+  // MACD
+  if (ind.MACD) {
+    score += ind.MACD.hist > 0 ? 2 : -2;
   }
 
-  if (indicators.priceTrend === "UP") score += 1;
-  if (indicators.priceTrend === "DOWN") score -= 1;
+  // Price Trend
+  if (ind.priceTrend === "UP") score += 1;
+  if (ind.priceTrend === "DOWN") score -= 1;
 
-  if (indicators.volumeTrend === "INCREASING") score += 1;
+  // Volume confirmation
+  if (ind.volumeTrend === "INCREASING") score += 1;
+  if (ind.volumeTrend === "DECREASING") score -= 1;
 
-  if (score >= 2) return "BUY";
-  if (score <= -2) return "SELL";
+  // Final Signal
+  if (score >= 3) return "BUY";
+  if (score <= -3) return "SELL";
   return "HOLD";
 }
