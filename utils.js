@@ -1,366 +1,371 @@
-// ================================
-// utils.js — FINAL FULL FIXED VERSION
-// ================================
+// ===============================================================
+// merge_signals.js — FINAL PREMIUM AI PANEL (FOREX + COMMOD FIXED)
+// ===============================================================
 
-import axios from "axios";
-import fs from "fs";
-import path from "path";
-import CONFIG from "./config.js";
+// PRICE ENGINE
+import {
+  fetchUniversal
+} from "./utils.js";
 
-const CACHE_DIR = CONFIG.PATHS?.CACHE_DIR || path.resolve("./cache");
-if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+// AI MODULES
+import { runMLPrediction } from "./ml_module_v8_6.js";
+import { analyzeElliott } from "./elliott_module.js";
+import { fetchNewsBundle } from "./news_social.js";
 
-const AXIOS_TIMEOUT = 12000;
 
-// =====================================================
-// CACHE HELPERS
-// =====================================================
-function cachePath(symbol, interval) {
-  return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
-}
-function readCache(symbol, interval) {
-  try {
-    const p = cachePath(symbol, interval);
-    if (!fs.existsSync(p)) return [];
-    return JSON.parse(fs.readFileSync(p, "utf8") || "[]");
-  } catch {
-    return [];
-  }
-}
-function writeCache(symbol, interval, data) {
-  try {
-    fs.writeFileSync(cachePath(symbol, interval), JSON.stringify(data, null, 2));
-  } catch {}
-}
+// ==============================================================
+// SYMBOL MAP (FULL & FIXED)
+// ==============================================================
+const symbolMap = {
+  // Indian Indices
+  NIFTY50: "^NSEI",
+  BANKNIFTY: "^NSEBANK",
+  SENSEX: "^BSESN",
+  FINNIFTY: "NSE:FINNIFTY",
 
-// =====================================================
-// SAFE MULTI-SOURCE GET (CRYPTO MIRRORS)
-// =====================================================
-async function safeAxiosGet(url, mirrors = []) {
-  let lastErr = null;
+  // Commodities (Yahoo)
+  GOLD: "GC=F",
+  SILVER: "SI=F",
+  CRUDE: "CL=F",
+  NGAS: "NG=F",
 
-  if (!mirrors || mirrors.length === 0) mirrors = [url];
+  // Forex (Yahoo)
+  EURUSD: "EURUSD=X",
+  GBPUSD: "GBPUSD=X",
+  USDJPY: "JPY=X",
+  XAUUSD: "GC=F",
+  XAGUSD: "SI=F",
+  DXY: "DX-Y.NYB",
 
-  for (const base of mirrors) {
-    try {
-      let finalUrl = url;
-
-      if (base.startsWith("http") && url.includes("api.binance.com")) {
-        finalUrl = url.replace("https://api.binance.com", base);
-      }
-
-      const res = await axios.get(finalUrl, {
-        timeout: AXIOS_TIMEOUT,
-        headers: { "User-Agent": "aiTrader/1.0" },
-        proxy: CONFIG.PROXY ? false : undefined
-      });
-
-      if (res && res.data) return res.data;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  return null;
-}
-
-// =====================================================
-// NORMALIZE BINANCE KLINES
-// =====================================================
-function normalizeKline(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map(k => ({
-      t: +k[0],
-      open: +k[1],
-      high: +k[2],
-      low: +k[3],
-      close: +k[4],
-      vol: +k[5]
-    }))
-    .filter(x => Number.isFinite(x.close));
-}
-
-// =====================================================
-// TIMEFRAME MAP (Yahoo/NSE accepted formats)
-// =====================================================
-const TF_MAP = {
-  "1m": { interval: "1m", range: "1d" },
-  "5m": { interval: "5m", range: "5d" },
-  "15m": { interval: "15m", range: "5d" },
-  "30m": { interval: "30m", range: "1mo" },
-  "1h": { interval: "60m", range: "1mo" },
-  "4h": { interval: "60m", range: "3mo" },
-  "1d": { interval: "1d", range: "6mo" }
+  // Crypto (Binance)
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  SOL: "SOLUSDT",
+  XRP: "XRPUSDT",
+  DOGE: "DOGEUSDT",
+  ADA: "ADAUSDT"
 };
 
-// =====================================================
-// REBUILD CANDLES TO TARGET TF (for NSE raw data)
-// =====================================================
-function buildTF(candles, tfMs) {
-  if (!candles.length) return [];
 
-  const out = [];
-  let bucketStart = Math.floor(candles[0].t / tfMs) * tfMs;
-  let bucket = { t: bucketStart, open: candles[0].open, high: -999999, low: 999999, close: candles[0].close, vol: 0 };
+// ==============================================================
+// WRAPPER
+// ==============================================================
+function withHTML(keyboard) {
+  return { ...keyboard, parse_mode: "HTML" };
+}
 
-  for (const c of candles) {
-    const ts = Math.floor(c.t / tfMs) * tfMs;
 
-    if (ts !== bucketStart) {
-      out.push({ ...bucket });
-      bucketStart = ts;
-      bucket = { t: ts, open: c.open, high: c.high, low: c.low, close: c.close, vol: c.vol };
-      continue;
-    }
-
-    bucket.high = Math.max(bucket.high, c.high);
-    bucket.low = Math.min(bucket.low, c.low);
-    bucket.close = c.close;
-    bucket.vol += Number(c.vol || 0);
+// ==============================================================
+// HOME MENU
+// ==============================================================
+export const kbHome = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "💠 Crypto", callback_data: "menu_crypto" },
+        { text: "📘 Indices", callback_data: "menu_indices" }
+      ],
+      [
+        { text: "💱 Forex", callback_data: "menu_forex" },
+        { text: "🛢 Commodities", callback_data: "menu_commodities" }
+      ]
+    ]
   }
+});
 
-  out.push(bucket);
-  return out;
-}
 
-function tfToMs(tf) {
-  const n = parseInt(tf);
-  if (tf.endsWith("m")) return n * 60 * 1000;
-  if (tf.endsWith("h")) return n * 60 * 60 * 1000;
-  if (tf.endsWith("d")) return n * 24 * 60 * 60 * 1000;
-  return 15 * 60 * 1000;
-}
+// ==============================================================
+// MENUS (Crypto / Indices / Forex / Commodities)
+// ==============================================================
 
-// =====================================================
-// 1) CRYPTO FETCH (BINANCE + MIRRORS)
-// =====================================================
-async function fetchCrypto(symbol, interval = "15m", limit = 200) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const mirrors = [
-    ...(CONFIG.DATA_SOURCES.BINANCE || []),
-    ...(CONFIG.DATA_SOURCES.BYBIT || []),
-    ...(CONFIG.DATA_SOURCES.KUCOIN || []),
-    ...(CONFIG.DATA_SOURCES.COINBASE || [])
-  ];
-
-  const raw = await safeAxiosGet(url, mirrors);
-  if (!raw) return [];
-  return normalizeKline(raw);
-}
-
-// =====================================================
-// 2) NSE MULTI-SOURCE FETCH (with TF building)
-// =====================================================
-async function fetchNSE(symbol, interval = "15m") {
-  symbol = symbol.toUpperCase();
-
-  const tfMs = tfToMs(interval);
-
-  const sources = [
-    // RapidAPI
-    async () => {
-      if (!process.env.RAPIDAPI_KEY) return [];
-
-      const url = `https://latest-stock-price.p.rapidapi.com/price?Indices=${symbol}`;
-      const res = await axios.get(url, {
-        timeout: AXIOS_TIMEOUT,
-        headers: {
-          "X-RapidAPI-Key": process.env.RAPIDAPI_KEY,
-          "X-RapidAPI-Host": "latest-stock-price.p.rapidapi.com",
-        }
-      });
-
-      const raw = res.data || [];
-      if (!Array.isArray(raw) || raw.length === 0) return [];
-
-      const p = Number(raw[0].lastPrice || raw[0].ltp);
-      if (!p) return [];
-
-      return [{
-        t: Date.now(),
-        open: p,
-        high: p,
-        low: p,
-        close: p,
-        vol: 0
-      }];
-    },
-
-    // Yahoo
-    async () => {
-      const map = { NIFTY50: "^NSEI", BANKNIFTY: "^NSEBANK" };
-      const ySym = map[symbol];
-      if (!ySym) return [];
-
-      const tf = TF_MAP[interval] || TF_MAP["15m"];
-      const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${ySym}?interval=${tf.interval}&range=${tf.range}`;
-      const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
-
-      const result = res.data?.chart?.result?.[0];
-      if (!result) return [];
-
-      const t = result.timestamp || [];
-      const q = result.indicators?.quote?.[0] || {};
-
-      const out = [];
-      for (let i = 0; i < t.length; i++) {
-        if (!Number.isFinite(q.close?.[i])) continue;
-        out.push({
-          t: t[i] * 1000,
-          open: q.open[i] || q.close[i],
-          high: q.high[i] || q.close[i],
-          low: q.low[i] || q.close[i],
-          close: q.close[i],
-          vol: q.volume[i] || 0
-        });
-      }
-
-      return out;
-    },
-
-    // NSE original API
-    async () => {
-      try {
-        const base = CONFIG.DATA_SOURCES.NSE?.[0];
-        if (!base) return [];
-
-        const url = `${base}/chart-databyindex?index=${symbol}`;
-        const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
-
-        const raw = res.data?.grapthData || [];
-        if (!Array.isArray(raw)) return [];
-
-        const mapped = raw.map(c => ({
-          t: c.time * 1000,
-          open: +c.open,
-          high: +c.high,
-          low: +c.low,
-          close: +(c.price || c.close),
-          vol: Number(c.volume || 0)
-        }));
-
-        return buildTF(mapped, tfMs);
-      } catch {
-        return [];
-      }
-    }
-  ];
-
-  for (const fn of sources) {
-    try {
-      const data = await fn();
-      if (data.length > 0) return buildTF(data, tfMs);
-    } catch {}
+export const kbCrypto = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "BTC", callback_data: "asset_BTC" },
+        { text: "ETH", callback_data: "asset_ETH" }
+      ],
+      [
+        { text: "SOL", callback_data: "asset_SOL" },
+        { text: "XRP", callback_data: "asset_XRP" }
+      ],
+      [
+        { text: "DOGE", callback_data: "asset_DOGE" },
+        { text: "ADA", callback_data: "asset_ADA" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
   }
+});
 
-  return [];
-}
 
-// =====================================================
-// 3) YAHOO FETCH (dynamic TF)
-// =====================================================
-async function fetchYahoo(symbol, interval = "15m") {
-  try {
-    const tf = TF_MAP[interval] || TF_MAP["15m"];
-    const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${symbol}?interval=${tf.interval}&range=${tf.range}`;
-    const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
-
-    const result = res.data?.chart?.result?.[0];
-    if (!result) return [];
-
-    const t = result.timestamp || [];
-    const q = result.indicators?.quote?.[0] || {};
-
-    const out = [];
-    for (let i = 0; i < t.length; i++) {
-      if (!Number.isFinite(q.close?.[i])) continue;
-      out.push({
-        t: t[i] * 1000,
-        open: q.open?.[i] || q.close[i],
-        high: q.high?.[i] || q.close[i],
-        low: q.low?.[i] || q.close[i],
-        close: q.close[i],
-        vol: q.volume?.[i] || 0
-      });
-    }
-    return out;
-  } catch {
-    return [];
+export const kbIndices = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "NIFTY50", callback_data: "asset_NIFTY50" },
+        { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
+      ],
+      [
+        { text: "Sensex", callback_data: "asset_SENSEX" },
+        { text: "FinNifty", callback_data: "asset_FINNIFTY" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
   }
+});
+
+
+export const kbForex = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "EURUSD", callback_data: "asset_EURUSD" },
+        { text: "GBPUSD", callback_data: "asset_GBPUSD" }
+      ],
+      [
+        { text: "USDJPY", callback_data: "asset_USDJPY" },
+        { text: "XAUUSD", callback_data: "asset_XAUUSD" }
+      ],
+      [
+        { text: "XAGUSD", callback_data: "asset_XAGUSD" },
+        { text: "DXY", callback_data: "asset_DXY" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
+});
+
+
+export const kbCommodity = withHTML({
+  reply_markup: {
+    inline_keyboard: [
+      [
+        { text: "GOLD", callback_data: "asset_GOLD" },
+        { text: "SILVER", callback_data: "asset_SILVER" }
+      ],
+      [
+        { text: "CRUDE", callback_data: "asset_CRUDE" },
+        { text: "NGAS", callback_data: "asset_NGAS" }
+      ],
+      [{ text: "⬅ Back", callback_data: "back_home" }]
+    ]
+  }
+});
+
+
+// ==============================================================
+// ACTION BUTTONS
+// ==============================================================
+export function kbActions(symbol) {
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
+          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
+        ],
+        [
+          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
+          { text: "📰 News", callback_data: `news_${symbol}` }
+        ],
+        [{ text: "⬅ Back", callback_data: "back_assets" }]
+      ]
+    }
+  });
 }
 
-// =====================================================
-// EXPORT: fetchMarketData (CRYPTO + CACHE)
-// =====================================================
-export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
-  symbol = String(symbol || "").toUpperCase();
-  let data = readCache(symbol, interval);
 
-  try {
-    const fresh = await fetchCrypto(symbol, interval, limit);
-    if (fresh.length > 0) {
-      writeCache(symbol, interval, fresh);
-      data = fresh;
+// ==============================================================
+// TIMEFRAMES
+// ==============================================================
+export function kbTimeframes(symbol) {
+  return withHTML({
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "5m", callback_data: `tf_${symbol}_5m` },
+          { text: "15m", callback_data: `tf_${symbol}_15m` }
+        ],
+        [
+          { text: "30m", callback_data: `tf_${symbol}_30m` },
+          { text: "1h", callback_data: `tf_${symbol}_1h` }
+        ],
+        [
+          { text: "4h", callback_data: `tf_${symbol}_4h` },
+          { text: "1D", callback_data: `tf_${symbol}_1d` }
+        ],
+        [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
+      ]
     }
-  } catch {}
+  });
+}
 
-  const last = data.at(-1) || {};
+
+// ==============================================================
+// Elliott Helper
+// ==============================================================
+function extractElliottPattern(ell) {
+  if (!ell?.patterns?.length)
+    return { name: "N/A", conf: ell?.confidence || 50 };
+
+  const p = ell.patterns[0];
   return {
-    data,
-    price: +last.close || 0,
-    volume: +last.vol || 0,
-    updated: new Date().toISOString()
+    name: p.type || "Pattern",
+    conf: p.confidence || ell.confidence || 50
   };
 }
 
-// =====================================================
-// EXPORT: fetchMultiTF
-// =====================================================
-export async function fetchMultiTF(symbol, tfs = ["1m", "5m", "15m"]) {
-  const out = {};
-  await Promise.all(
-    tfs.map(async tf => {
-      try {
-        out[tf] = await fetchUniversal(symbol, tf);
-      } catch {
-        out[tf] = { data: [], price: 0 };
-      }
-    })
-  );
-  return out;
+
+// ==============================================================
+// REPORT FORMATTER
+// ==============================================================
+export function formatPremiumReport(r) {
+  return `
+🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
+━━━━━━━━━━━━━━━
+📍 <b>Price:</b> ${r.price}
+🧭 <b>Trend:</b> ${r.biasEmoji} ${r.direction}
+📰 <b>News:</b> ${r.newsImpact} (${r.newsScore}%)
+⚡ <b>Elliott:</b> ${r.elliottPattern} (${r.elliottConf}%)
+
+🎯 <b>TARGETS</b>
+Primary TP: <b>${r.tp1}</b>
+Hedge TP: <b>${r.tp2}</b>
+Confidence: <b>${r.tpConf}%</b>
+
+🤖 <b>ML Probability:</b> ${r.maxProb}%
+━━━━━━━━━━━━━━━
+`;
 }
 
-// =====================================================
-// EXPORT: fetchUniversal (AUTO ROUTING)
-// =====================================================
-export async function fetchUniversal(symbol, interval = "15m") {
-  symbol = symbol.toUpperCase();
 
-  // CRYPTO
-  if (symbol.endsWith("USDT") || symbol.endsWith("USD")) {
-    return await fetchMarketData(symbol, interval, CONFIG.DEFAULT_LIMIT);
+// ==============================================================
+// MAIN REPORT GENERATOR
+// ==============================================================
+export async function generateReport(symbol, tf = "15m") {
+  const mapped = symbolMap[symbol] || symbol;
+
+  const mkt = await fetchUniversal(mapped, tf);
+  const candles = mkt.data || [];
+
+  const price = mkt.price || 0;
+
+  // ML
+  const ml = await runMLPrediction(mapped, tf) || {};
+  const direction = ml.direction || "Neutral";
+  const biasEmoji = direction === "Bullish" ? "📈" :
+                    direction === "Bearish" ? "📉" : "⚪";
+
+  const tp1 = ml.tpEstimate ?? ml.tp1 ?? "—";
+  const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
+  const tpConf = ml.tpConfidence ?? 55;
+
+  // Elliott
+  const ell = await analyzeElliott(candles);
+  const ep = extractElliottPattern(ell);
+
+  // News
+  const news = await fetchNewsBundle(mapped);
+
+  return {
+    text: formatPremiumReport({
+      symbol,
+      price,
+      direction,
+      biasEmoji,
+
+      tp1,
+      tp2,
+      tpConf,
+      maxProb: ml.maxProb || 50,
+
+      elliottPattern: ep.name,
+      elliottConf: ep.conf,
+
+      newsImpact: news.impact || "Neutral",
+      newsScore: news.sentiment || 50
+    }),
+
+    keyboard: kbActions(symbol)
+  };
+}
+
+
+// ==============================================================
+// CALLBACK ROUTER
+// ==============================================================
+export async function handleCallback(query) {
+  const data = query.data;
+
+  // HOME
+  if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
+
+  if (data === "menu_crypto") return { text: "💠 Crypto", keyboard: kbCrypto };
+  if (data === "menu_indices") return { text: "📘 Indices", keyboard: kbIndices };
+  if (data === "menu_forex") return { text: "💱 Forex", keyboard: kbForex };
+  if (data === "menu_commodities") return { text: "🛢 Commodities", keyboard: kbCommodity };
+  if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
+
+  // ASSET
+  if (data.startsWith("asset_")) {
+    const symbol = data.replace("asset_", "");
+    return await generateReport(symbol);
   }
 
-  // NSE INDICES
-  if (CONFIG.MARKETS.INDIA.INDEXES.includes(symbol)) {
-    const data = await fetchNSE(symbol, interval);
+  // TF Menu
+  if (data.startsWith("tfs_")) {
+    const symbol = data.replace("tfs_", "");
     return {
-      data,
-      price: data.at(-1)?.close || 0,
-      updated: new Date().toISOString()
+      text: `🕒 Timeframes for <b>${symbol}</b>`,
+      keyboard: kbTimeframes(symbol)
     };
   }
 
-  // YAHOO STOCKS / FOREX
-  const yahoo = await fetchYahoo(symbol, interval);
-  if (yahoo.length > 0) {
+  // Specific TF
+  if (data.startsWith("tf_")) {
+    const [, symbol, tf] = data.split("_");
+    return await generateReport(symbol, tf);
+  }
+
+  // Refresh
+  if (data.startsWith("refresh_")) {
+    const symbol = data.replace("refresh_", "");
+    return await generateReport(symbol);
+  }
+
+  // News
+  if (data.startsWith("news_")) {
+    const symbol = data.replace("news_", "");
+    const mapped = symbolMap[symbol] || symbol;
+
+    const news = await fetchNewsBundle(mapped);
     return {
-      data: yahoo,
-      price: yahoo.at(-1)?.close || 0,
-      updated: new Date().toISOString()
+      text: `📰 <b>News Report</b>
+Impact: ${news.impact}
+Sentiment: ${news.sentiment}%`,
+      keyboard: kbActions(symbol)
     };
   }
 
-  return { data: [], price: 0, updated: new Date().toISOString() };
+  // Elliott
+  if (data.startsWith("ell_")) {
+    const symbol = data.replace("ell_", "");
+    const mapped = symbolMap[symbol] || symbol;
+
+    const mkt = await fetchUniversal(mapped);
+    const candles = mkt.data || [];
+
+    const ell = await analyzeElliott(candles);
+    const ep = extractElliottPattern(ell);
+
+    return {
+      text: `📊 <b>Elliott Waves</b>
+Pattern: ${ep.name}
+Confidence: ${ep.conf}%`,
+      keyboard: kbActions(symbol)
+    };
+  }
+
+  return { text: "❌ Unknown command", keyboard: kbHome };
 }
