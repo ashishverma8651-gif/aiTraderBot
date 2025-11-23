@@ -75,7 +75,6 @@ function computeExtraMetrics(candles = []) {
   const len = slice.length;
   let slope = 0;
   if (len >= 2) {
-    // linear slope (normalized)
     const xs = Array.from({length:len}, (_,i)=>i);
     const meanX = xs.reduce((a,b)=>a+b,0)/len;
     const meanY = slice.reduce((a,b)=>a+b,0)/len;
@@ -87,10 +86,10 @@ function computeExtraMetrics(candles = []) {
   const momN = 3;
   const mom = len >= momN ? (slice[len-1] - slice[len-momN])/ (slice[len-momN] || 1) : 0;
   // volatility: std dev / mean
-  const mean = closes.reduce((a,b)=>a+b,0)/closes.length || 1;
-  const variance = closes.reduce((a,b)=>a + Math.pow((b-mean),2),0)/closes.length;
+  const meanVal = closes.reduce((a,b)=>a+b,0)/closes.length || 1;
+  const variance = closes.reduce((a,b)=>a + Math.pow((b-meanVal),2),0)/closes.length;
   const std = Math.sqrt(variance);
-  const volRatio = std / Math.max(1, mean);
+  const volRatio = std / Math.max(1, meanVal);
 
   const trendStrength = clamp(50 + (slope * 1000), 5, 95); // scaled
   const momentumScore = clamp(50 + (mom * 1000), 0, 100);
@@ -103,8 +102,6 @@ function computeExtraMetrics(candles = []) {
 // TP filtering + TQF (Target Quality Factor)
 // -----------------------------
 function scoreTarget(tp, price, conf, sourceReliability=50, atr=1) {
-  // conf 0-100, sourceReliability 0-100
-  // proximity factor: closer reasonable targets score higher (for intraday)
   const dist = Math.abs(tp - price);
   const proxFactor = Math.exp(-dist / Math.max(atr*2, Math.abs(price)*0.003 || 1));
   const raw = (conf/100) * 0.6 + (sourceReliability/100) * 0.3 + proxFactor * 0.1;
@@ -166,7 +163,6 @@ function fuseMLTFsImproved(mlList = []) {
   const hedgeTP = hedgeW > 0 ? hedgeSum / hedgeW : (tps[0] ? tps[0].hedge : null);
   const avgConf = confW > 0 ? confSum / confW : (available.reduce((a,b)=>a+(b.maxProb||0),0)/available.length || 0);
 
-  // cap confidence influence
   const capConf = Math.round(clamp(avgConf, 10, 95));
   return { direction: finalDir, primaryTP: isNum(primaryTP) ? Number(primaryTP) : null, hedgeTP: isNum(hedgeTP) ? Number(hedgeTP) : null, confidence: capConf };
 }
@@ -177,40 +173,69 @@ function fuseMLTFsImproved(mlList = []) {
 function buildStableTargetsImproved(clusterTargets = [], mlFusion = null, price = 0, feats = {}) {
   const atr = Math.max(feats?.atr || 0, Math.abs(price) * 0.002 || 1);
   const direction = mlFusion?.direction || "Neutral";
-  // Filter cluster targets by ATR (3x)
   const candidates = filterTPsByATR(clusterTargets, price, atr, 3).slice(0,10);
-  // Score each candidate
+
   const scored = candidates.map(c => {
     const srcRel = c.source && c.source.toLowerCase().includes("ml") ? 85 : (c.source && c.source.toLowerCase().includes("atr") ? 50 : 70);
     const tqf = scoreTarget(c.tp, price, c.confidence || 40, srcRel, atr);
     return { ...c, tqf };
   }).sort((a,b)=>b.tqf - a.tqf);
 
-  // choose primary: prefer matching direction
+  // === ML-first primary selection (if ML confident) ===
   let primary = null;
-  if (scored.length) {
-    if (direction === "Bullish") primary = scored.find(s => s.tp > price) || scored[0];
-    else if (direction === "Bearish") primary = scored.find(s => s.tp < price) || scored[0];
-    else primary = scored[0];
+  if (mlFusion && isNum(mlFusion.primaryTP) && mlFusion.confidence >= 60) {
+    primary = {
+      tp: mlFusion.primaryTP,
+      confidence: mlFusion.confidence,
+      source: "ML-FUSED",
+      tqf: scoreTarget(mlFusion.primaryTP, price, mlFusion.confidence, 90, atr)
+    };
+  } else {
+    if (scored.length) {
+      if (direction === "Bullish") primary = scored.find(s => s.tp > price) || scored[0];
+      else if (direction === "Bearish") primary = scored.find(s => s.tp < price) || scored[0];
+      else primary = scored[0];
+    }
   }
 
-  // fallback to ML
+  // fallback to ML if no cluster primary found
   if (!primary && mlFusion && isNum(mlFusion.primaryTP) && mlFusion.primaryTP > 0) {
-    primary = { tp: mlFusion.primaryTP, source: "ML", confidence: mlFusion.confidence || 40, tqf: scoreTarget(mlFusion.primaryTP, price, mlFusion.confidence || 40, 85, atr) };
+    primary = {
+      tp: mlFusion.primaryTP,
+      confidence: mlFusion.confidence || 40,
+      source: "ML-FUSED",
+      tqf: scoreTarget(mlFusion.primaryTP, price, mlFusion.confidence || 40, 85, atr)
+    };
   }
 
-  // last fallback: ATR-based scenic targets
+  // final fallback ATR-based scenic target
   if (!primary) {
-    primary = { tp: price + atr * 2.5, source: "ATR", confidence: 30, tqf: scoreTarget(price + atr * 2.5, price, 30, 50, atr) };
+    primary = { tp: price + atr * 2.5, confidence: 30, source: "ATR", tqf: scoreTarget(price + atr * 2.5, price, 30, 50, atr) };
   }
 
-  // hedge: opposite best candidate or ML hedge or simple ATR hedge
-  let hedge = scored.find(s => (primary.tp > price ? s.tp < price : s.tp > price)) || null;
-  if (!hedge && mlFusion && isNum(mlFusion.hedgeTP) && mlFusion.hedgeTP > 0) {
-    hedge = { tp: mlFusion.hedgeTP, source: "ML", confidence: mlFusion.confidence || 30, tqf: scoreTarget(mlFusion.hedgeTP, price, mlFusion.confidence || 30, 85, atr) };
+  // Hedge selection: ensure opposite side relative to price and ML direction prioritized
+  let hedge = null;
+  if (mlFusion?.direction === "Bullish") {
+    hedge = scored.find(s => s.tp < price) || null;
+  } else if (mlFusion?.direction === "Bearish") {
+    hedge = scored.find(s => s.tp > price) || null;
+  } else {
+    hedge = scored.find(s => (primary.tp > price ? s.tp < price : s.tp > price)) || null;
   }
+
+  if (!hedge && mlFusion && isNum(mlFusion.hedgeTP) && mlFusion.hedgeTP > 0) {
+    hedge = { tp: mlFusion.hedgeTP, source: "ML-HEDGE", confidence: mlFusion.confidence || 30, tqf: scoreTarget(mlFusion.hedgeTP, price, mlFusion.confidence || 30, 80, atr) };
+  }
+
   if (!hedge) {
     hedge = { tp: (primary.tp > price ? price - atr * 1.2 : price + atr * 1.2), source: "HEDGE_ATR", confidence: 25, tqf: scoreTarget((primary.tp > price ? price - atr * 1.2 : price + atr * 1.2), price, 25, 50, atr) };
+  }
+
+  // Secondary TP = best cluster candidate excluding primary
+  let secondaryTP = null;
+  const clusterCandidates = scored.filter(s => Math.round(s.tp) !== Math.round(primary.tp));
+  if (clusterCandidates.length) {
+    secondaryTP = clusterCandidates[0].tp;
   }
 
   const primaryTP = Number(primary.tp);
@@ -219,12 +244,25 @@ function buildStableTargetsImproved(clusterTargets = [], mlFusion = null, price 
   const hedgeSource = hedge.source || "Cluster";
   const primaryConf = Math.round(primary.confidence || mlFusion?.confidence || 40);
 
-  return { primaryTP, hedgeTP, primarySource, hedgeSource, primaryConf, direction, primaryTQF: primary.tqf || 0, hedgeTQF: hedge.tqf || 0, atrUsed: atr };
+  return {
+    primaryTP,
+    secondaryTP: secondaryTP ? Number(secondaryTP) : null,
+    hedgeTP,
+    primarySource,
+    hedgeSource,
+    primaryConf,
+    direction,
+    primaryTQF: primary.tqf || 0,
+    hedgeTQF: hedge.tqf || 0,
+    atrUsed: atr,
+    // keep ml fused raw values for display
+    mlTP: mlFusion?.primaryTP ?? null,
+    mlTPConf: mlFusion?.confidence ?? 0
+  };
 }
 
 // -----------------------------
 // Main: buildAIReport (enhanced)
- // keeps same signature and returns original fields + new ones
 // -----------------------------
 export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = {}) {
   try {
@@ -287,7 +325,6 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
       let sl = "N/A";
       try {
         if ((filteredTargets.length && filteredTargets[0].tp > price) || (ellSummary.pattern && ellSummary.pattern.toLowerCase().includes("bottom"))) {
-          // bullish -> SL below recent support or price - ATR*1.5
           const support = (ellSummary.supports && ellSummary.supports[0]) || (candles.at(-2)?.low) || (price - ind.ATR);
           sl = Number((safeNum(support) - (ind.ATR * 1.1 || price*0.001)).toFixed(2));
         } else if ((filteredTargets.length && filteredTargets[0].tp < price) || (ellSummary.pattern && ellSummary.pattern.toLowerCase().includes("top"))) {
@@ -309,22 +346,16 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     // compute per-block fusionScore (improved weighting)
     const computeFusionScore = (indObj={}, ellObj={}, extra={}) => {
       let s = 0, w = 0;
-      // RSI component
       const rsi = Number(indObj?.RSI ?? 50);
       s += ((rsi - 50) / 50) * 0.35; w += 0.35;
-      // MACD normalized by ATR
       const macdh = Number(indObj?.MACD?.hist ?? 0);
       const atr = Math.max(1, Number(indObj?.ATR ?? 1));
       s += (Math.tanh(macdh / atr) * 0.30); w += 0.30;
-      // price trend
       s += (indObj?.priceTrend === "UP" ? 0.12 : indObj?.priceTrend === "DOWN" ? -0.12 : 0); w += 0.12;
-      // volume trend
       s += (indObj?.volumeTrend === "INCREASING" ? 0.08 : indObj?.volumeTrend === "DECREASING" ? -0.08 : 0); w += 0.08;
-      // momentum & trendStrength from extra
       s += ((extra?.momentumScore - 50) / 50) * 0.08; w += 0.08;
       s += ((extra?.trendStrength - 50) / 50) * 0.07; w += 0.07;
 
-      // Elliott: use only if confidence > 30
       const ellConf = clamp(Number(ellObj?.confidence ?? 0)/100, 0, 1);
       if (ellConf > 0.3) { s += (ellConf * (ellObj?.sentiment ?? 0)) * 0.1; w += 0.1; }
 
@@ -377,22 +408,9 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     // improved ML fusion
     const mlFusion = fuseMLTFsImproved(mlResults);
 
-    // build stable targets with improved logic
+    // build stable targets with improved logic and inject ML TP
     const feat15 = blocks.find(b=>b.tf==="15m");
     const stableTargets = buildStableTargetsImproved(allTargets, mlFusion, price, { atr: feat15?.indicators?.ATR, candles: feat15?.candles });
-
-    // === NEW: inject ML TP into stableTargets (Option A) ===
-    // Keep existing Primary/Hedge as-is; add mlTP (fused primary from ML) and confidence
-    if (mlFusion && isNum(mlFusion.primaryTP) && mlFusion.primaryTP > 0) {
-      stableTargets.mlTP = Number(mlFusion.primaryTP);
-      stableTargets.mlSource = "ML";
-      stableTargets.mlTPConf = mlFusion.confidence ?? 0;
-    } else {
-      stableTargets.mlTP = null;
-      stableTargets.mlSource = null;
-      stableTargets.mlTPConf = 0;
-    }
-    // ======================================================
 
     // NEWS
     let news = null;
@@ -401,8 +419,8 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     const newsImpactStr = (news.impact || "Low").toLowerCase();
     const newsBoost = clamp((rawNewsSent - 0.5) * 2, -1, 1) * (newsImpactStr === "high" ? 1.0 : (newsImpactStr === "moderate" ? 0.5 : 0.25));
 
-    // Apply ML + news influence (dampened)
-    overallFusion = clamp(overallFusion + (mlFusion?.confidence ? (mlFusion.confidence/100) * 0.16 : 0) + newsBoost * 0.10, -1, 1);
+    // Apply ML + news influence (dampened) — reduced news weight to avoid flip
+    overallFusion = clamp(overallFusion + (mlFusion?.confidence ? (mlFusion.confidence/100) * 0.20 : 0) + newsBoost * 0.06, -1, 1);
 
     // bias label mapping
     const biasLabel = (() => {
@@ -500,13 +518,13 @@ export async function formatAIReport(report = {}) {
 
     const stable = report.stableTargets || {};
     const stablePrimary = isNum(stable.primaryTP) ? nf(stable.primaryTP, 2) : "N/A";
+    const stableSecondary = isNum(stable.secondaryTP) ? nf(stable.secondaryTP, 2) : "N/A";
     const stableHedge = isNum(stable.hedgeTP) ? nf(stable.hedgeTP, 2) : "N/A";
     const stableConf = stable.primaryConf ?? (report.ml?.fusion?.confidence ?? 0);
     const stableTQF = stable.primaryTQF ?? 0;
 
-    // ML TP added (Option A)
+    // ML TP added
     const mlTP = isNum(stable.mlTP) ? nf(stable.mlTP, 2) : "N/A";
-    const mlTPSource = stable.mlSource || "N/A";
     const mlTPConf = isNum(stable.mlTPConf) ? stable.mlTPConf : 0;
 
     const ml = report.ml || {};
@@ -586,10 +604,11 @@ Fusion Score: ${fusionScore}
 Buy ${buyProb}% | Sell ${sellProb}%
 ━━━━━━━━━━━━━━━━━━
 
-🎯 STABLE AI TP (Fused 15m+30m+1h)
-Primary TP: <b>${stablePrimary}</b> (src:${stable.primarySource || "Cluster/ML"})  (TQF:${stableTQF})
-Hedge TP: <b>${stableHedge}</b> (src:${stable.hedgeSource || "Cluster/ML"})  
-ML TP: <b>${mlTP}</b> (src:${mlTPSource} | conf:${mlTPConf}%)
+🎯 AI TARGET SUITE (3-TP System)
+TP1 (Primary): <b>${stablePrimary}</b> (src:${stable.primarySource || "Cluster/ML"})  (TQF:${stableTQF})
+TP2 (Secondary): <b>${stableSecondary}</b>
+TP3 (Hedge): <b>${stableHedge}</b> (src:${stable.hedgeSource || "Cluster/ML"})
+ML TP (raw fused): <b>${mlTP}</b> (conf:${mlTPConf}%)
 Confidence: ${stableConf}%
 Suggested SL: ${report.stableTargets && report.stableTargets.direction === "Bullish" ? (report.defaultSLLong ? nf(report.defaultSLLong,2) : "N/A") : (report.defaultSLShort ? nf(report.defaultSLShort,2) : "N/A")}
 ━━━━━━━━━━━━━━━━━━
