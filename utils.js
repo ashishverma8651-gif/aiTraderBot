@@ -1,5 +1,5 @@
 // ================================
-// utils.js — FINAL FULL VERSION
+// utils.js — FINAL FULL FIXED VERSION
 // ================================
 
 import axios from "axios";
@@ -82,6 +82,57 @@ function normalizeKline(raw) {
 }
 
 // =====================================================
+// TIMEFRAME MAP (Yahoo/NSE accepted formats)
+// =====================================================
+const TF_MAP = {
+  "1m": { interval: "1m", range: "1d" },
+  "5m": { interval: "5m", range: "5d" },
+  "15m": { interval: "15m", range: "5d" },
+  "30m": { interval: "30m", range: "1mo" },
+  "1h": { interval: "60m", range: "1mo" },
+  "4h": { interval: "60m", range: "3mo" },
+  "1d": { interval: "1d", range: "6mo" }
+};
+
+// =====================================================
+// REBUILD CANDLES TO TARGET TF (for NSE raw data)
+// =====================================================
+function buildTF(candles, tfMs) {
+  if (!candles.length) return [];
+
+  const out = [];
+  let bucketStart = Math.floor(candles[0].t / tfMs) * tfMs;
+  let bucket = { t: bucketStart, open: candles[0].open, high: -999999, low: 999999, close: candles[0].close, vol: 0 };
+
+  for (const c of candles) {
+    const ts = Math.floor(c.t / tfMs) * tfMs;
+
+    if (ts !== bucketStart) {
+      out.push({ ...bucket });
+      bucketStart = ts;
+      bucket = { t: ts, open: c.open, high: c.high, low: c.low, close: c.close, vol: c.vol };
+      continue;
+    }
+
+    bucket.high = Math.max(bucket.high, c.high);
+    bucket.low = Math.min(bucket.low, c.low);
+    bucket.close = c.close;
+    bucket.vol += Number(c.vol || 0);
+  }
+
+  out.push(bucket);
+  return out;
+}
+
+function tfToMs(tf) {
+  const n = parseInt(tf);
+  if (tf.endsWith("m")) return n * 60 * 1000;
+  if (tf.endsWith("h")) return n * 60 * 60 * 1000;
+  if (tf.endsWith("d")) return n * 24 * 60 * 60 * 1000;
+  return 15 * 60 * 1000;
+}
+
+// =====================================================
 // 1) CRYPTO FETCH (BINANCE + MIRRORS)
 // =====================================================
 async function fetchCrypto(symbol, interval = "15m", limit = 200) {
@@ -99,15 +150,18 @@ async function fetchCrypto(symbol, interval = "15m", limit = 200) {
 }
 
 // =====================================================
-// 2) NSE MULTI-SOURCE FETCH  (BEST + FALLBACK CHAIN)
+// 2) NSE MULTI-SOURCE FETCH (with TF building)
 // =====================================================
-async function fetchNSE(symbol = "") {
+async function fetchNSE(symbol, interval = "15m") {
   symbol = symbol.toUpperCase();
 
+  const tfMs = tfToMs(interval);
+
   const sources = [
-    // 1) RAPIDAPI (BEST LIVE PRICE)
+    // RapidAPI
     async () => {
       if (!process.env.RAPIDAPI_KEY) return [];
+
       const url = `https://latest-stock-price.p.rapidapi.com/price?Indices=${symbol}`;
       const res = await axios.get(url, {
         timeout: AXIOS_TIMEOUT,
@@ -116,8 +170,10 @@ async function fetchNSE(symbol = "") {
           "X-RapidAPI-Host": "latest-stock-price.p.rapidapi.com",
         }
       });
+
       const raw = res.data || [];
       if (!Array.isArray(raw) || raw.length === 0) return [];
+
       const p = Number(raw[0].lastPrice || raw[0].ltp);
       if (!p) return [];
 
@@ -131,15 +187,14 @@ async function fetchNSE(symbol = "") {
       }];
     },
 
-    // 2) YAHOO FINANCE
+    // Yahoo
     async () => {
-      const yahooSymbol =
-        symbol === "NIFTY50" ? "^NSEI" :
-        symbol === "BANKNIFTY" ? "^NSEBANK" : null;
+      const map = { NIFTY50: "^NSEI", BANKNIFTY: "^NSEBANK" };
+      const ySym = map[symbol];
+      if (!ySym) return [];
 
-      if (!yahooSymbol) return [];
-
-      const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${yahooSymbol}?interval=15m&range=1d`;
+      const tf = TF_MAP[interval] || TF_MAP["15m"];
+      const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${ySym}?interval=${tf.interval}&range=${tf.range}`;
       const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
 
       const result = res.data?.chart?.result?.[0];
@@ -147,24 +202,24 @@ async function fetchNSE(symbol = "") {
 
       const t = result.timestamp || [];
       const q = result.indicators?.quote?.[0] || {};
-      const close = q.close || [];
 
       const out = [];
       for (let i = 0; i < t.length; i++) {
-        if (!Number.isFinite(close[i])) continue;
+        if (!Number.isFinite(q.close?.[i])) continue;
         out.push({
           t: t[i] * 1000,
-          open: close[i],
-          high: close[i],
-          low: close[i],
-          close: close[i],
-          vol: 0
+          open: q.open[i] || q.close[i],
+          high: q.high[i] || q.close[i],
+          low: q.low[i] || q.close[i],
+          close: q.close[i],
+          vol: q.volume[i] || 0
         });
       }
+
       return out;
     },
 
-    // 3) ORIGINAL NSE API
+    // NSE original API
     async () => {
       try {
         const base = CONFIG.DATA_SOURCES.NSE?.[0];
@@ -176,7 +231,7 @@ async function fetchNSE(symbol = "") {
         const raw = res.data?.grapthData || [];
         if (!Array.isArray(raw)) return [];
 
-        return raw.map(c => ({
+        const mapped = raw.map(c => ({
           t: c.time * 1000,
           open: +c.open,
           high: +c.high,
@@ -184,6 +239,8 @@ async function fetchNSE(symbol = "") {
           close: +(c.price || c.close),
           vol: Number(c.volume || 0)
         }));
+
+        return buildTF(mapped, tfMs);
       } catch {
         return [];
       }
@@ -193,7 +250,7 @@ async function fetchNSE(symbol = "") {
   for (const fn of sources) {
     try {
       const data = await fn();
-      if (data.length > 0) return data;
+      if (data.length > 0) return buildTF(data, tfMs);
     } catch {}
   }
 
@@ -201,11 +258,12 @@ async function fetchNSE(symbol = "") {
 }
 
 // =====================================================
-// 3) YAHOO FETCH
+// 3) YAHOO FETCH (dynamic TF)
 // =====================================================
-async function fetchYahoo(symbol = "") {
+async function fetchYahoo(symbol, interval = "15m") {
   try {
-    const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${symbol}?interval=15m&range=5d`;
+    const tf = TF_MAP[interval] || TF_MAP["15m"];
+    const url = `${CONFIG.DATA_SOURCES.YAHOO[0]}/${symbol}?interval=${tf.interval}&range=${tf.range}`;
     const res = await axios.get(url, { timeout: AXIOS_TIMEOUT });
 
     const result = res.data?.chart?.result?.[0];
@@ -219,11 +277,11 @@ async function fetchYahoo(symbol = "") {
       if (!Number.isFinite(q.close?.[i])) continue;
       out.push({
         t: t[i] * 1000,
-        open: +q.open[i],
-        high: +q.high[i],
-        low: +q.low[i],
-        close: +q.close[i],
-        vol: Number(q.volume[i] || 0)
+        open: q.open?.[i] || q.close[i],
+        high: q.high?.[i] || q.close[i],
+        low: q.low?.[i] || q.close[i],
+        close: q.close[i],
+        vol: q.volume?.[i] || 0
       });
     }
     return out;
@@ -264,7 +322,7 @@ export async function fetchMultiTF(symbol, tfs = ["1m", "5m", "15m"]) {
   await Promise.all(
     tfs.map(async tf => {
       try {
-        out[tf] = await fetchMarketData(symbol, tf, CONFIG.DEFAULT_LIMIT);
+        out[tf] = await fetchUniversal(symbol, tf);
       } catch {
         out[tf] = { data: [], price: 0 };
       }
@@ -286,7 +344,7 @@ export async function fetchUniversal(symbol, interval = "15m") {
 
   // NSE INDICES
   if (CONFIG.MARKETS.INDIA.INDEXES.includes(symbol)) {
-    const data = await fetchNSE(symbol);
+    const data = await fetchNSE(symbol, interval);
     return {
       data,
       price: data.at(-1)?.close || 0,
@@ -295,7 +353,7 @@ export async function fetchUniversal(symbol, interval = "15m") {
   }
 
   // YAHOO STOCKS / FOREX
-  const yahoo = await fetchYahoo(symbol);
+  const yahoo = await fetchYahoo(symbol, interval);
   if (yahoo.length > 0) {
     return {
       data: yahoo,
