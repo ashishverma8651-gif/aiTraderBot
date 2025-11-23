@@ -1,5 +1,11 @@
-// merge_signals.js — FINAL PREMIUM AI PANEL (FULL UI + MULTIMARKET + ELLIOTTv2.4 + HARMONICS)
-// =========================================================================================
+// ====================================================================
+//  MERGE SIGNAL ENGINE — PREMIUM v2.3 (FINAL CLEAN VERSION)
+//  - Multi-market (Crypto, Indices, Forex, Commodities)
+//  - Multi-timeframe
+//  - Elliott v2.3 (top-3 unique patterns)
+//  - Harmonics unique filtering
+//  - Full UI + Keyboard intact
+// ====================================================================
 
 import {
   fetchUniversal,
@@ -11,60 +17,86 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-/* ===========================
-   SYMBOL MAP (multimarket)
-   =========================== */
+// =============================================================
+// SYMBOL MAP
+// =============================================================
 const symbolMap = {
-  // India
   NIFTY50: "^NSEI",
   BANKNIFTY: "^NSEBANK",
   SENSEX: "^BSESN",
   FINNIFTY: "NSE:FINNIFTY",
 
-  // Commodities / Metals / Energies
   GOLD: "GC=F",
-  XAUUSD: "GC=F",
   SILVER: "SI=F",
-  XAGUSD: "SI=F",
   CRUDE: "CL=F",
   NGAS: "NG=F",
 
-  // Forex / FX indices
   DXY: "DX-Y.NYB",
+  XAUUSD: "GC=F",
+  XAGUSD: "SI=F",
+
   EURUSD: "EURUSD=X",
   GBPUSD: "GBPUSD=X",
   USDJPY: "JPY=X"
 };
 
-/* ===========================
-   Helpers
-   =========================== */
-function withHTML(obj) { return { ...obj, parse_mode: "HTML" }; }
-function safeNum(v){ const n = Number(v); return Number.isFinite(n)?n:0; }
+// =============================================================
+// HELPERS
+// =============================================================
+function withHTML(kb) {
+  return { ...kb, parse_mode: "HTML" };
+}
+
 function isCryptoSymbol(s) {
   if (!s) return false;
   const u = String(s).toUpperCase();
-  return u.endsWith("USDT") || u.endsWith("BTC") || u.endsWith("ETH") || u.endsWith("USD");
+  return (
+    u.endsWith("USDT") ||
+    u.endsWith("USD") ||
+    u.endsWith("BTC") ||
+    u.endsWith("ETH")
+  );
 }
 
-/* ===========================
-   Keyboards / UI
-   =========================== */
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// =============================================================
+// KEYBOARDS
+// =============================================================
 export const kbHome = withHTML({
   reply_markup: {
     inline_keyboard: [
-      [{ text: "💠 Crypto", callback_data: "menu_crypto" }, { text: "📘 Indices", callback_data: "menu_indices" }],
-      [{ text: "💱 Forex", callback_data: "menu_forex" }, { text: "🛢 Commodities", callback_data: "menu_commodities" }]
+      [
+        { text: "💠 Crypto", callback_data: "menu_crypto" },
+        { text: "📘 Indices", callback_data: "menu_indices" }
+      ],
+      [
+        { text: "💱 Forex", callback_data: "menu_forex" },
+        { text: "🛢 Commodities", callback_data: "menu_commodities" }
+      ]
     ]
   }
 });
 
+// ----- Market selections -----
 export const kbCrypto = withHTML({
   reply_markup: {
     inline_keyboard: [
-      [{ text: "BTC", callback_data: "asset_BTCUSDT" }, { text: "ETH", callback_data: "asset_ETHUSDT" }],
-      [{ text: "SOL", callback_data: "asset_SOLUSDT" }, { text: "XRP", callback_data: "asset_XRPUSDT" }],
-      [{ text: "DOGE", callback_data: "asset_DOGEUSDT" }, { text: "ADA", callback_data: "asset_ADAUSDT" }],
+      [
+        { text: "BTC", callback_data: "asset_BTCUSDT" },
+        { text: "ETH", callback_data: "asset_ETHUSDT" }
+      ],
+      [
+        { text: "SOL", callback_data: "asset_SOLUSDT" },
+        { text: "XRP", callback_data: "asset_XRPUSDT" }
+      ],
+      [
+        { text: "DOGE", callback_data: "asset_DOGEUSDT" },
+        { text: "ADA", callback_data: "asset_ADAUSDT" }
+      ],
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
@@ -73,8 +105,14 @@ export const kbCrypto = withHTML({
 export const kbIndices = withHTML({
   reply_markup: {
     inline_keyboard: [
-      [{ text: "NIFTY50", callback_data: "asset_NIFTY50" }, { text: "BankNifty", callback_data: "asset_BANKNIFTY" }],
-      [{ text: "Sensex", callback_data: "asset_SENSEX" }, { text: "FinNifty", callback_data: "asset_FINNIFTY" }],
+      [
+        { text: "NIFTY50", callback_data: "asset_NIFTY50" },
+        { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
+      ],
+      [
+        { text: "Sensex", callback_data: "asset_SENSEX" },
+        { text: "FinNifty", callback_data: "asset_FINNIFTY" }
+      ],
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
@@ -83,9 +121,18 @@ export const kbIndices = withHTML({
 export const kbForex = withHTML({
   reply_markup: {
     inline_keyboard: [
-      [{ text: "EURUSD", callback_data: "asset_EURUSD" }, { text: "GBPUSD", callback_data: "asset_GBPUSD" }],
-      [{ text: "USDJPY", callback_data: "asset_USDJPY" }, { text: "XAUUSD", callback_data: "asset_XAUUSD" }],
-      [{ text: "XAGUSD", callback_data: "asset_XAGUSD" }, { text: "DXY", callback_data: "asset_DXY" }],
+      [
+        { text: "EURUSD", callback_data: "asset_EURUSD" },
+        { text: "GBPUSD", callback_data: "asset_GBPUSD" }
+      ],
+      [
+        { text: "USDJPY", callback_data: "asset_USDJPY" },
+        { text: "XAUUSD", callback_data: "asset_XAUUSD" }
+      ],
+      [
+        { text: "XAGUSD", callback_data: "asset_XAGUSD" },
+        { text: "DXY", callback_data: "asset_DXY" }
+      ],
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
@@ -94,55 +141,102 @@ export const kbForex = withHTML({
 export const kbCommodity = withHTML({
   reply_markup: {
     inline_keyboard: [
-      [{ text: "GOLD", callback_data: "asset_GOLD" }, { text: "SILVER", callback_data: "asset_SILVER" }],
-      [{ text: "CRUDE", callback_data: "asset_CRUDE" }, { text: "NGAS", callback_data: "asset_NGAS" }],
+      [
+        { text: "GOLD", callback_data: "asset_GOLD" },
+        { text: "SILVER", callback_data: "asset_SILVER" }
+      ],
+      [
+        { text: "CRUDE", callback_data: "asset_CRUDE" },
+        { text: "NGAS", callback_data: "asset_NGAS" }
+      ],
       [{ text: "⬅ Back", callback_data: "back_home" }]
     ]
   }
 });
 
-export function kbActions(symbol){
+export function kbActions(symbol) {
   return withHTML({
     reply_markup: {
       inline_keyboard: [
-        [{ text: "🔄 Refresh", callback_data: `refresh_${symbol}` }, { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }],
-        [{ text: "📊 Elliott", callback_data: `ell_${symbol}` }, { text: "📰 News", callback_data: `news_${symbol}` }],
+        [
+          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
+          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
+        ],
+        [
+          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
+          { text: "📰 News", callback_data: `news_${symbol}` }
+        ],
         [{ text: "⬅ Back", callback_data: "back_assets" }]
       ]
     }
   });
 }
 
-export function kbTimeframes(symbol){
+export function kbTimeframes(symbol) {
   return withHTML({
     reply_markup: {
       inline_keyboard: [
-        [{ text: "5m", callback_data: `tf_${symbol}_5m` }, { text: "15m", callback_data: `tf_${symbol}_15m` }],
-        [{ text: "30m", callback_data: `tf_${symbol}_30m` }, { text: "1h", callback_data: `tf_${symbol}_1h` }],
-        [{ text: "4h", callback_data: `tf_${symbol}_4h` }, { text: "1D", callback_data: `tf_${symbol}_1d` }],
+        [
+          { text: "5m", callback_data: `tf_${symbol}_5m` },
+          { text: "15m", callback_data: `tf_${symbol}_15m` }
+        ],
+        [
+          { text: "30m", callback_data: `tf_${symbol}_30m` },
+          { text: "1h", callback_data: `tf_${symbol}_1h` }
+        ],
+        [
+          { text: "4h", callback_data: `tf_${symbol}_4h` },
+          { text: "1D", callback_data: `tf_${symbol}_1d` }
+        ],
         [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
       ]
     }
   });
 }
 
-/* ===========================
-   Formatter (report text)
-   =========================== */
-export function formatPremiumReport(r){
-  // include harmonics & elliott summary if present
-  const harmonicLine = r.harmonics && r.harmonics.length
-    ? `${r.harmonics.map(h=>`${h.type}(${Math.round(h.conf)}%)`).join(" + ")}`
-    : "N/A";
+// ====================================================================
+//   ELLIOTT DEDUP + TOP 3
+// ====================================================================
+function dedupeElliott(patterns = []) {
+  const map = new Map();
+  for (const p of patterns) {
+    if (!p.type) continue;
+    const conf = Math.round(p.confidence || p.conf || 50);
+    if (!map.has(p.type) || conf > map.get(p.type)) {
+      map.set(p.type, conf);
+    }
+  }
+  return [...map.entries()]
+    .map(([type, conf]) => ({ type, conf }))
+    .sort((a, b) => b.conf - a.conf)
+    .slice(0, 3);
+}
 
+// ====================================================================
+//   HARMONICS DEDUP
+// ====================================================================
+function dedupeHarmonics(list = []) {
+  const map = new Map();
+  for (const h of list) {
+    if (!h.type) continue;
+    if (!map.has(h.type) || h.conf > map.get(h.type).conf) {
+      map.set(h.type, h);
+    }
+  }
+  return [...map.values()];
+}
+
+// ====================================================================
+// FORMATTER
+// ====================================================================
+function formatPremiumReport(r) {
   return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL
 ━━━━━━━━━━━━━━━━━━
 📍 <b>Price:</b> ${r.price}
 🧭 <b>Trend:</b> ${r.biasEmoji} ${r.direction}
 📰 <b>News:</b> ${r.newsImpact} (${r.newsScore}%)
-⚡ <b>Elliott:</b> ${r.elliottPattern} (${r.elliottConf}%)
-🔶 <b>Harmonics:</b> ${harmonicLine}
+⚡ <b>Elliott:</b> ${r.elliottPattern}
 
 🎯 <b>TARGETS</b>
 Primary TP: <b>${r.tp1}</b>
@@ -154,302 +248,159 @@ Confidence: <b>${r.tpConf}%</b>
 `;
 }
 
-/* ===========================
-   Harmonic Detector (simple/fast)
-   - uses pivots from analyzeElliott (if available) to detect Gartley/AB=CD patterns
-   - returns list of {type, conf, target}
-   =========================== */
-function detectHarmonicsFromPivots(pivots = []) {
-  const out = [];
-  if (!Array.isArray(pivots) || pivots.length < 4) return out;
-
-  // helper: ratio approx
-  const approx = (a,b,tol=0.08) => Math.abs(a-b)/Math.max(1e-9,Math.abs(b)) <= tol;
-
-  // iterate sliding windows of 5 pivots to detect 4-leg patterns
-  for (let i=0;i<=pivots.length-4;i++){
-    const A = pivots[i];
-    const B = pivots[i+1];
-    const C = pivots[i+2];
-    const D = pivots[i+3];
-
-    if (!A || !B || !C || !D) continue;
-
-    // AB, BC, CD lengths
-    const AB = Math.abs(B.price - A.price);
-    const BC = Math.abs(C.price - B.price);
-    const CD = Math.abs(D.price - C.price);
-
-    // Ratios AB/BC, BC/CD etc
-    const r1 = AB/BC || 0;
-    const r2 = BC/CD || 0;
-
-    // Gartley rough heuristics:
-    // AB retraces 61.8% of XA — we don't have X here; use relative checks:
-    // look for AB < BC and CD similar to AB (AB ~ CD) -> AB=CD pattern
-    if (approx(AB, CD, 0.18) && BC > AB*0.6 && BC < AB*3) {
-      // classify AB=CD
-      const conf = Math.max(30, Math.min(90, 100 * (1 - Math.abs(AB - CD)/Math.max(1e-9, (AB+CD)/2))));
-      out.push({
-        type: "AB=CD",
-        conf,
-        pivots: [A,B,C,D],
-        target: D.price + (B.price - A.price) * (D.price < C.price ? -1 : 1) // naive
-      });
-    }
-
-    // Gartley-ish: BC approx 0.618*AB and CD approx 1.272*AB
-    if (approx(BC, AB*0.618, 0.2) && approx(CD, AB*1.272, 0.28)) {
-      out.push({
-        type: "Gartley",
-        conf: 60,
-        pivots:[A,B,C,D],
-        target: D.price + (D.price < C.price ? -1 : 1) * AB*1.272
-      });
-    }
-
-    // Butterfly-ish: CD extension ~1.618 * AB
-    if (approx(CD, AB*1.618, 0.25)) {
-      out.push({
-        type: "Butterfly",
-        conf: 55,
-        pivots:[A,B,C,D],
-        target: D.price + (D.price < C.price ? -1 : 1) * AB*1.618
-      });
-    }
-  }
-
-  // dedupe similar by type and higher confidence
-  const merged = [];
-  for (const h of out) {
-    const existing = merged.find(m => m.type === h.type && Math.abs(m.target - h.target) < (Math.abs(h.target)*0.01 + 1e-6));
-    if (!existing) merged.push(h);
-    else if (h.conf > existing.conf) {
-      const idx = merged.indexOf(existing);
-      merged[idx] = h;
-    }
-  }
-
-  return merged;
-}
-
-/* ===========================
-   resolvePriceAndCandles — robust multi-source fetch (multi-tf support)
-   - tries fetchUniversal(tf)
-   - if no data: multiTF/fallbacks
-   =========================== */
-async function resolvePriceAndCandles(rawSymbol, tf = "15m") {
-  const mapped = symbolMap[rawSymbol] || rawSymbol;
-
-  // primary: fetchUniversal for requested TF
+// ====================================================================
+// SAFE CANDLE FETCH
+// ====================================================================
+async function resolvePriceAndCandles(symbol, tf = "15m") {
   try {
-    const primary = await fetchUniversal(mapped, tf);
-    if (primary && ((primary.price && primary.price !== 0) || (Array.isArray(primary.data) && primary.data.length))) {
-      return { data: primary.data || [], price: safeNum(primary.price || (primary.data?.at(-1)?.close)), source: "universal" };
+    const universal = await fetchUniversal(symbol, tf);
+    if (universal?.data?.length)
+      return {
+        data: universal.data,
+        price: universal.price || universal.data.at(-1).close,
+        source: "universal"
+      };
+
+    if (isCryptoSymbol(symbol)) {
+      const m = await fetchMarketData(symbol, tf);
+      if (m?.data?.length)
+        return {
+          data: m.data,
+          price: m.price,
+          source: "marketData"
+        };
     }
+
+    const multi = await fetchMultiTF(symbol, [tf]);
+    if (multi?.[tf]?.data?.length)
+      return {
+        data: multi[tf].data,
+        price: multi[tf].price,
+        source: "multiTF"
+      };
+
+    return { data: [], price: 0, source: "none" };
   } catch (e) {
-    // continue
+    return { data: [], price: 0, source: "error" };
   }
-
-  // If crypto-like, try fetchMarketData
-  if (isCryptoSymbol(mapped)) {
-    try {
-      const m = await fetchMarketData(mapped, tf);
-      if (m && (m.price && m.price !== 0 || (Array.isArray(m.data) && m.data.length))) {
-        return { data: m.data || [], price: safeNum(m.price), source: "marketData" };
-      }
-    } catch {}
-  }
-
-  // try fetchMultiTF (ask for TF directly)
-  try {
-    const multi = await fetchMultiTF(mapped, [tf]);
-    if (multi && multi[tf] && (multi[tf].price || (multi[tf].data && multi[tf].data.length))) {
-      return { data: multi[tf].data || [], price: safeNum(multi[tf].price || multi[tf].data?.at(-1)?.close), source: "multiTF" };
-    }
-  } catch {}
-
-  // fallback: try universal with 15m (broad)
-  try {
-    const p2 = await fetchUniversal(mapped, "15m");
-    if (p2 && (p2.price || (p2.data && p2.data.length))) {
-      return { data: p2.data || [], price: safeNum(p2.price || p2.data?.at(-1)?.close), source: "universal-15m" };
-    }
-  } catch {}
-
-  return { data: [], price: 0, source: "none" };
 }
 
-/* ===========================
-   generateReport (main) — uses ML + Elliott + Harmonics + News
-   - returns { text, keyboard }
-   =========================== */
+// ====================================================================
+//   MAIN REPORT
+// ====================================================================
 export async function generateReport(symbol, tf = "15m") {
   const mappedSymbol = symbolMap[symbol] || symbol;
 
-  // 1) fetch candles + price (for requested TF)
-  const { data: candlesRaw, price: livePrice, source } = await resolvePriceAndCandles(mappedSymbol, tf);
-  const candles = Array.isArray(candlesRaw) ? candlesRaw : [];
+  // candles
+  const { data: candles, price: livePrice } = await resolvePriceAndCandles(mappedSymbol, tf);
 
-  // 2) ML prediction (best-effort)
+  // ML
   let ml = {};
-  try {
-    ml = (await runMLPrediction(mappedSymbol, tf)) || {};
-  } catch (e) {
-    console.debug("[merge_signals] runMLPrediction error:", e?.message || e);
-    ml = {};
-  }
+  try { ml = await runMLPrediction(mappedSymbol, tf) || {} } catch {}
 
-  // 3) Elliott (existing analyzer) — prefer ML-provided candles, else fetched candles
+  const direction = ml.direction || "Neutral";
+  const biasEmoji = direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪";
+
+  const tp1 = ml.tpEstimate ?? ml.tp1 ?? "—";
+  const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
+  const tpConf = ml.tpConfidence ?? 55;
+
+  // Elliott
   let ell = {};
-  try {
-    // If ML returns candle feature set use that for Elliott (more consistent)
-    const mlCandles = ml?.explanation?.features?.candles;
-    ell = await analyzeElliott(Array.isArray(mlCandles) && mlCandles.length ? mlCandles : candles);
-  } catch (e) {
-    console.debug("[merge_signals] analyzeElliott error:", e?.message || e);
-    ell = {};
-  }
+  try { ell = await analyzeElliott(candles || []); } catch {}
 
-  // 4) Harmonincs detector — use pivots from ell if present, otherwise try to compute simple pivots
-  let harmonics = [];
-  try {
-    const pivots = ell?.pivots || [];
-    if (pivots.length >= 4) {
-      harmonics = detectHarmonicsFromPivots(pivots);
-    } else {
-      // fallback: try to compute quick pivots by simple turning points on candles (cheap)
-      const quickPivots = [];
-      for (let i=2;i<candles.length-2;i++){
-        const c = candles[i];
-        if (!c) continue;
-        // local high
-        if (candles[i-2].high <= c.high && candles[i-1].high <= c.high && candles[i+1].high <= c.high && candles[i+2].high <= c.high) {
-          quickPivots.push({ idx:i, t:c.t, price:c.high, type:"H" });
-        }
-        // local low
-        if (candles[i-2].low >= c.low && candles[i-1].low >= c.low && candles[i+1].low >= c.low && candles[i+2].low >= c.low) {
-          quickPivots.push({ idx:i, t:c.t, price:c.low, type:"L" });
-        }
-      }
-      if (quickPivots.length >= 4) harmonics = detectHarmonicsFromPivots(quickPivots);
-    }
-  } catch (e) {
-    console.debug("[merge_signals] harmonics detect error:", e?.message || e);
-    harmonics = [];
-  }
-
-  // 5) News (best-effort)
-  let news = {};
-  try { news = (await fetchNewsBundle(mappedSymbol)) || {}; } catch (e) { news = {}; }
-
-  // 6) Compose targets (prefer ML tps, else Elliott/harmonic targets)
-  const tp1 = ml.tpEstimate ?? ml.tp1 ?? (ell?.targets && ell.targets[0] ? ell.targets[0].tp : (harmonics[0] ? harmonics[0].target : "—"));
-  const tp2 = ml.tp2Estimate ?? ml.tp2 ?? (ell?.targets && ell.targets[1] ? ell.targets[1].tp : (harmonics[1] ? harmonics[1].target : "—"));
-  const tpConf = ml.tpConfidence ?? ell?.confidence ?? 50;
-
-  // 7) Build readable Elliott summary
-  const ellSummary = (ell && Array.isArray(ell.patterns) && ell.patterns.length)
-    ? ell.patterns.map(p => `${p.type}(${Math.round(p.confidence||ell.conf||50)}%)`).join(" + ")
+  const cleanEll = dedupeElliott(ell?.patterns || []);
+  const ellSummary = cleanEll.length
+    ? cleanEll.map(p => `${p.type}(${p.conf}%)`).join(" + ")
     : "N/A";
 
-  // 8) Build final object
+  // News
+  let news = {};
+  try { news = await fetchNewsBundle(mappedSymbol) || {}; } catch {}
+
   const out = {
     symbol,
-    price: safeNum(livePrice),
-    direction: ml.direction || "Neutral",
-    biasEmoji: (ml.direction === "Bullish") ? "📈" : (ml.direction === "Bearish") ? "📉" : "⚪",
-
+    price: livePrice,
+    direction,
+    biasEmoji,
     tp1,
     tp2,
     tpConf,
-
-    maxProb: ml.maxProb || Math.round((ell?.confidence||50)),
-
+    maxProb: ml.maxProb || 50,
     elliottPattern: ellSummary,
-    elliottConf: ell?.confidence || 50,
-
-    harmonics: harmonics.map(h => ({ type: h.type, conf: Math.round(h.conf), target: safeNum(h.target) })),
-
-    newsImpact: news?.impact || "Neutral",
-    newsScore: news?.sentiment || 50,
-
-    _meta: {
-      mappedSymbol,
-      source,
-      candles: Array.isArray(candles) ? candles.length : 0,
-      ellFound: Array.isArray(ell?.patterns) ? ell.patterns.length : 0,
-      harmonicsFound: harmonics.length
-    }
+    newsImpact: news.impact || "Neutral",
+    newsScore: news.sentiment || 50
   };
 
-  // log internal meta for debugging (useful when "data missing" issues)
-  console.debug("[merge_signals] report meta:", out._meta);
-
-  return { text: formatPremiumReport(out), keyboard: kbActions(symbol) };
+  return {
+    text: formatPremiumReport(out),
+    keyboard: kbActions(symbol)
+  };
 }
 
-/* ===========================
-   Callback routing
-   =========================== */
-export async function handleCallback(query){
-  const data = query.data;
+// ====================================================================
+// CALLBACK ROUTER
+// ====================================================================
+export async function handleCallback(query) {
+  const d = query.data;
 
-  // HOME
-  if (data === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
-  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
-  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
-  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
-  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-  if (data === "back_assets") return { text: "Choose Market", keyboard: kbHome };
+  if (d === "back_home") return { text: "🏠 HOME", keyboard: kbHome };
+  if (d === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
+  if (d === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
+  if (d === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
+  if (d === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
+  if (d === "back_assets") return { text: "Choose Market", keyboard: kbHome };
 
-  // ASSET select
-  if (data.startsWith("asset_")) {
-    const symbol = data.replace("asset_", "");
-    return await generateReport(symbol, "15m");
+  // Asset selection
+  if (d.startsWith("asset_")) {
+    const symbol = d.replace("asset_", "");
+    return await generateReport(symbol);
   }
 
-  // TIMEFRAME menu open
-  if (data.startsWith("tfs_")) {
-    const symbol = data.replace("tfs_", "");
+  // Timeframes
+  if (d.startsWith("tfs_")) {
+    const symbol = d.replace("tfs_", "");
     return { text: `🕒 Timeframes for <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
   }
 
-  // TF select: format tf_{symbol}_{5m|15m|...}
-  if (data.startsWith("tf_")) {
-    const clean = data.replace("tf_", "");
-    const idx = clean.indexOf("_");
-    if (idx === -1) return { text: "❌ Invalid timeframe", keyboard: kbHome };
-    const symbol = clean.slice(0, idx);
-    const tf = clean.slice(idx + 1);
+  if (d.startsWith("tf_")) {
+    const [_, symbol, tf] = d.split("_");
     return await generateReport(symbol, tf);
   }
 
   // Refresh
-  if (data.startsWith("refresh_")) {
-    const symbol = data.replace("refresh_", "");
-    return await generateReport(symbol, "15m");
+  if (d.startsWith("refresh_")) {
+    const symbol = d.replace("refresh_", "");
+    return await generateReport(symbol);
   }
 
   // News
-  if (data.startsWith("news_")) {
-    const symbol = data.replace("news_", "");
+  if (d.startsWith("news_")) {
+    const symbol = d.replace("news_", "");
     const mapped = symbolMap[symbol] || symbol;
-    let n = {};
-    try{ n = await fetchNewsBundle(mapped); } catch(e){ n = {}; }
-    return { text: `📰 <b>News Report</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment || 0}%`, keyboard: kbActions(symbol) };
+    const n = await fetchNewsBundle(mapped);
+    return {
+      text: `📰 <b>News Report</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+      keyboard: kbActions(symbol)
+    };
   }
 
-  // Elliott details
-  if (data.startsWith("ell_")) {
-    const symbol = data.replace("ell_", "");
+  // Elliott page
+  if (d.startsWith("ell_")) {
+    const symbol = d.replace("ell_", "");
     const mapped = symbolMap[symbol] || symbol;
     const pd = await resolvePriceAndCandles(mapped, "15m");
     const ell = await analyzeElliott(pd.data || []);
-    const patt = (ell && Array.isArray(ell.patterns) && ell.patterns.length) ? ell.patterns.map(p=>`${p.type}(${Math.round(p.confidence||ell.confidence||50)}%)`).join(", ") : "N/A";
-    return { text: `📊 <b>Elliott Waves</b>\nPatterns: ${patt}\nConfidence: ${ell.confidence || 50}%`, keyboard: kbActions(symbol) };
+    const cleaned = dedupeElliott(ell?.patterns || []);
+    const out = cleaned.length
+      ? cleaned.map(p => `${p.type} (${p.conf}%)`).join("\n")
+      : "No clear pattern";
+
+    return {
+      text: `📊 <b>Elliott Waves</b>\n${out}`,
+      keyboard: kbActions(symbol)
+    };
   }
 
   return { text: "❌ Unknown command", keyboard: kbHome };
 }
-
