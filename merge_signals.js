@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — FINAL MERGED (UI + Multi-TF + Elliott fixes)
+// merge_signals.js — FINAL MERGED (UI + Multi-TF + Elliott fixes V3)
 // ============================================================
 
 import {
@@ -13,7 +13,7 @@ import { analyzeElliott } from "./elliott_module.js"; // Assumes elliott_module 
 import { fetchNewsBundle } from "./news_social.js";
 
 // Internal version tag for debugging
-const VERSION = "v2_6_FIXED";
+const VERSION = "v2_7_CONFIDENCE_FIX";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -178,7 +178,7 @@ export function kbTimeframes(symbol) {
 }
 
 
-// ================= ELLIOTT UTIL (FIXED LOGIC for Filtering) =================
+// ================= ELLIOTT UTIL (FIXED LOGIC for Filtering and Confidence) =================
 function extractTopPatterns(ellResult, max = 3) {
   if (!ellResult || !Array.isArray(ellResult.patterns)) return { list: [], conf: 50, primarySentiment: "Neutral" };
 
@@ -190,7 +190,7 @@ function extractTopPatterns(ellResult, max = 3) {
   let bullCount = 0;
   let bearCount = 0;
   
-  // First pass: Count Bullish/Bearish patterns to find the dominant side *before* filtering by type
+  // First pass: Count Bullish/Bearish patterns to find the dominant side
   for (const p of ellResult.patterns) {
     const patternSentiment = p.side || "Neutral"; 
     if (patternSentiment === "Bullish") bullCount++;
@@ -198,17 +198,16 @@ function extractTopPatterns(ellResult, max = 3) {
   }
 
   // Determine the dominant pattern side for filtering
-  // If the counts are equal, default to the overall sentiment score.
   const dominantSide = bullCount > bearCount ? "Bullish" : bearCount > bullCount ? "Bearish" : overallSentiment;
   
   // Second pass: Filter and dedupe by type
   for (const p of ellResult.patterns) {
     const t = String(p.type || "Pattern");
-    const conf = safeNum(p.confidence ?? p.conf ?? ellResult.confidence ?? 50, 0); 
+    // Use confidence from pattern object, falling back to 50 if missing
+    const conf = safeNum(p.confidence ?? p.conf ?? 50, 0); 
     const patternSentiment = p.side || "Neutral";
 
     // 🛑 CRITICAL FILTER: Only keep patterns that align with the DOMINANT side.
-    // If the dominantSide is Neutral, we still keep everything (though theoretically the count logic should prevent this).
     if (dominantSide !== "Neutral" && patternSentiment !== dominantSide) {
         continue; 
     }
@@ -224,13 +223,16 @@ function extractTopPatterns(ellResult, max = 3) {
 
   // Format human-friendly
   const list = arr.map(a => `${a.type}(${round(a.conf, 0)}%)`);
-  const topConf = arr.length ? Math.round(arr[0].conf) : Math.round(ellResult.confidence ?? 50);
+  
+  // 🎯 NEW CONFIDENCE LOGIC: Use the confidence of the most confident pattern as the display confidence (or 50 if none found)
+  const topConf = arr.length ? Math.round(arr[0].conf) : 50;
 
   // If the filtered list is empty, but we had a dominant side, use that side.
   const finalSentiment = arr.length ? dominantSide : overallSentiment;
 
   return { 
     list, 
+    // Use the top confidence found in the *patterns*, not the overall ellResult confidence.
     conf: topConf, 
     primarySentiment: finalSentiment 
   };
@@ -343,7 +345,9 @@ export async function generateReport(symbolLabel, tf = "15m") {
   // Use the FIXED pattern extraction logic
   const patternsObj = ellRes ? extractTopPatterns(ellRes, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
   const formattedPatterns = formatPatternsForText(patternsObj.list);
-  const ellConf = Math.round(patternsObj.conf || ellRes?.confidence || 50);
+  
+  // 🎯 Using the specific confidence calculated by extractTopPatterns
+  const ellConf = Math.round(patternsObj.conf);
   const ellSentiment = patternsObj.primarySentiment || "Neutral"; // This is the FILTERED sentiment
 
   // 6. Final Trend Logic: Prioritize ML if probability is high (>60), otherwise Elliott, otherwise News
