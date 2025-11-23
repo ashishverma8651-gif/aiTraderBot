@@ -220,17 +220,21 @@ function extractTopPatterns(ell, max = 3) {
 
 // ================= FORMATTER =================
 function formatPremiumReport(r) {
+    const formattedPrice = Number.isFinite(r.price) ? r.price.toFixed(4) : "N/A";
+    const formattedTP1 = Number.isFinite(r.tp1) ? r.tp1.toFixed(4) : r.tp1;
+    const formattedTP2 = Number.isFinite(r.tp2) ? r.tp2.toFixed(4) : r.tp2;
+    
     return `
 🔥 <b>${r.symbol}</b> — PREMIUM AI SIGNAL (${r._meta.tfUsed})
 ━━━━━━━━━━━━━━━━━━
-📍 <b>Price:</b> ${r.price}
+📍 <b>Price:</b> ${formattedPrice}
 🧭 <b>Trend:</b> ${r.biasEmoji} ${r.direction}
 📰 <b>News:</b> ${r.newsImpact} (${r.newsScore}%)
 ⚡ <b>Elliott:</b> ${r.elliottPattern} (${r.elliottConf}%)
 
 🎯 <b>TARGETS</b>
-Primary TP: <b>${r.tp1}</b>
-Hedge TP: <b>${r.tp2}</b>
+Primary TP: <b>${formattedTP1}</b>
+Hedge TP: <b>${formattedTP2}</b>
 Confidence: <b>${r.tpConf}%</b>
 
 🤖 <b>ML Probability:</b> ${r.maxProb}%
@@ -243,6 +247,7 @@ Confidence: <b>${r.tpConf}%</b>
 async function resolvePriceAndCandles(symbol, tf) {
     try {
         const tryFetch = async (sym, timeframe) => {
+            // Note: fetchUniversal must be defined in utils.js
             const r = await fetchUniversal(sym, timeframe);
             const data = r?.data ?? r?.candles ?? [];
             const price = safeNum(r?.price || data.at(-1)?.close);
@@ -254,11 +259,13 @@ async function resolvePriceAndCandles(symbol, tf) {
         if (p) return { ...p, source: "universal" };
 
         if (isCryptoLike(symbol)) {
+            // Note: fetchMarketData must be defined in utils.js
             const m = await fetchMarketData(symbol, tf);
             if (m?.price && Array.isArray(m.data))
                 return { data: m.data, price: safeNum(m.price), source: "marketData" };
         }
 
+        // Note: fetchMultiTF must be defined in utils.js
         const multi = await fetchMultiTF(symbol, [tf]);
         if (multi?.[tf]) {
             const d = multi[tf].data || [];
@@ -266,14 +273,17 @@ async function resolvePriceAndCandles(symbol, tf) {
             if (pr) return { data: d, price: pr, source: "multiTF" };
         }
 
-        if (tf !== "15m") {
+        // Fallback to 15m only if the initial requested TF was not 15m and all previous steps failed
+        if (tf !== "15m") { 
             let p2 = await tryFetch(symbol, "15m");
             if (p2) return { ...p2, source: "universal-15m" };
         }
 
+        // If all attempts fail, return a known "failure" state
         return { data: [], price: 0, source: "none" };
 
     } catch (e) {
+        console.error(`Error in resolvePriceAndCandles for ${symbol}/${tf}:`, e);
         return { data: [], price: 0, source: "error" };
     }
 }
@@ -282,20 +292,33 @@ async function resolvePriceAndCandles(symbol, tf) {
 export async function generateReport(symbolLabel, tf = "15m") {
     const mapped = symbolMap[symbolLabel] || symbolLabel;
 
+    // --- 1. Fetch Price & Candles ---
     const { data: candles, price, source } = await resolvePriceAndCandles(mapped, tf);
+    
+    // Check if critical data (price or candles) is missing
+    if (price === 0 || candles.length < 5) {
+        // Return a special report indicating data failure
+        return {
+            text: `⚠️ <b>${symbolLabel}</b> — DATA UNAVAILABLE\n\nCould not fetch current price or enough candle data for analysis (Source: ${source}). Please try <b>🔄 Refresh</b>.`,
+            keyboard: kbActions(symbolLabel)
+        };
+    }
 
+    // --- 2. Run Analyses (Wrapped in try/catch for soft failure) ---
     let ml = {};
-    try { ml = await runMLPrediction(mapped, tf) || {}; } catch {}
+    try { ml = await runMLPrediction(mapped, tf) || {}; } catch (e) { console.error("ML Prediction failed:", e); }
 
     let ell = null;
     try {
         if (candles.length >= 8)
             ell = await analyzeElliott(candles.slice(-400), { left: 3, right: 3 });
-    } catch {}
+    } catch (e) { console.error("Elliott Analysis failed:", e); }
 
     let news = {};
-    try { news = await fetchNewsBundle(mapped) || {}; } catch {}
+    try { news = await fetchNewsBundle(mapped) || {}; } catch (e) { console.error("News Fetch failed:", e); }
 
+
+    // --- 3. Consolidate Results ---
     const patt = ell ? extractTopPatterns(ell, 3) : { list: [], conf: 50, primarySentiment: "Neutral" };
     const ellConf = Math.round(patt.conf);
     const ellSent = patt.primarySentiment;
@@ -306,9 +329,9 @@ export async function generateReport(symbolLabel, tf = "15m") {
     let finalDir = "Neutral";
     if (mlProb > 60) finalDir = mlDir;
     else if (ellSent !== "Neutral" && ellConf >= 60) finalDir = ellSent;
-    else if (news.sentiment > 70) finalDir = "Bullish";
-    else if (news.sentiment < 30) finalDir = "Bearish";
-    else finalDir = mlDir;
+    else if (safeNum(news.sentiment, 50) > 70) finalDir = "Bullish";
+    else if (safeNum(news.sentiment, 50) < 30) finalDir = "Bearish";
+    else finalDir = mlDir; // Fallback to ML direction if other signals are weak
 
     const biasEmoji = finalDir === "Bullish" ? "📈" : finalDir === "Bearish" ? "📉" : "⚪";
 
@@ -352,9 +375,19 @@ export async function handleCallback(q) {
     if (d === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
     if (d === "back_assets") return { text: "Choose Market", keyboard: kbHome };
 
+    // *** FIX: Added robust error handling for report generation ***
     if (d.startsWith("asset_")) {
         const s = d.replace("asset_", "");
-        return await generateReport(s);
+        try {
+            return await generateReport(s);
+        } catch (e) {
+            console.error(`❌ CRITICAL ERROR: Failed to generate report for ${s} at the top level.`, e);
+            // Return a safe error message with the original symbol's keyboard
+            return {
+                text: `❌ <b>CRITICAL ERROR for ${s}</b>\n\nReport generation failed due to a system error or missing dependencies. Please check console logs.`,
+                keyboard: kbActions(s)
+            };
+        }
     }
 
     if (d.startsWith("tfs_")) {
@@ -369,20 +402,43 @@ export async function handleCallback(q) {
         const parts = d.split("_");
         const symbol = parts[1];
         const tf = parts[2];
-        return await generateReport(symbol, tf);
+        try {
+             return await generateReport(symbol, tf);
+        } catch (e) {
+            console.error(`❌ CRITICAL ERROR: Failed to generate report for ${symbol}/${tf}.`, e);
+            return {
+                text: `❌ <b>CRITICAL ERROR for ${symbol} (${tf})</b>\n\nReport generation failed due to a system error.`,
+                keyboard: kbActions(symbol)
+            };
+        }
     }
 
     if (d.startsWith("refresh_")) {
         const s = d.replace("refresh_", "");
-        return await generateReport(s);
+        try {
+            return await generateReport(s);
+        } catch (e) {
+            console.error(`❌ CRITICAL ERROR: Failed to refresh report for ${s}.`, e);
+            return {
+                text: `❌ <b>CRITICAL ERROR during Refresh for ${s}</b>\n\nReport generation failed due to a system error.`,
+                keyboard: kbActions(s)
+            };
+        }
     }
 
     if (d.startsWith("news_")) {
         const s = d.replace("news_", "");
         const mapped = symbolMap[s] || s;
-        const n = await fetchNewsBundle(mapped);
+        let n = {};
+        try {
+             n = await fetchNewsBundle(mapped);
+        } catch (e) {
+            console.error(`News fetch failed for ${s}:`, e);
+            return { text: `❌ News Fetch Failed for ${s}.`, keyboard: kbActions(s) };
+        }
+        
         return {
-            text: `📰 <b>News Report</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
+            text: `📰 <b>News Report</b>\nImpact: ${n.impact || 'N/A'}\nSentiment: ${safeNum(n.sentiment, 50)}%`,
             keyboard: kbActions(s)
         };
     }
@@ -393,11 +449,17 @@ export async function handleCallback(q) {
 
         const { data } = await resolvePriceAndCandles(mapped, "15m");
         let ell = null;
-        try { ell = await analyzeElliott(data.slice(-500)); } catch {}
+        try { 
+            if (data.length >= 8) {
+               ell = await analyzeElliott(data.slice(-500)); 
+            }
+        } catch (e) {
+            console.error(`Elliott analysis failed for ${s}:`, e);
+        }
 
         if (!ell?.patterns?.length)
             return {
-                text: `📊 <b>Elliott Waves</b>\nPattern: N/A\nConfidence: ${ell?.confidence ?? 50}%`,
+                text: `📊 <b>Elliott Waves (15m)</b>\nSentiment: N/A\nConfidence: ${ell?.confidence ? Math.round(ell.confidence) : 50}%\n\nPatterns: No major pattern found or insufficient data.`,
                 keyboard: kbActions(s)
             };
 
@@ -417,4 +479,3 @@ export async function handleCallback(q) {
 
     return { text: "❌ Unknown command", keyboard: kbHome };
 }
-
