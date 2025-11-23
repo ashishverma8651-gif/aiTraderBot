@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — v3.3 FINAL STABLE (UI + TF FIX + Elliott V3)
+// merge_signals.js — v3.3 FINAL STABLE (UI + TF FIX + Elliott V3) - FIXED
 // ============================================================
 
 import {
@@ -12,7 +12,7 @@ import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
-const VERSION = "v3.3_FINAL_STABLE";
+const VERSION = "v3.3_FINAL_STABLE_FIXED";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
@@ -43,7 +43,7 @@ function withHTML(kb) {
 function isCryptoLike(sym) {
   if (!sym) return false;
   const s = String(sym).toUpperCase();
-  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
+  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC") || s.includes("ETH");
 }
 
 function safeNum(v, fb = 0) {
@@ -187,14 +187,31 @@ export function kbTimeframes(symbol) {
   });
 }
 
+// ==================== AUX: dedupe + top patterns ====================
+function dedupeAndPickTop(patterns = [], maxKeep = 4) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return [];
+  const map = new Map(); // type -> best pattern
+  for (const p of patterns) {
+    const t = String(p.type || "Pattern");
+    const conf = safeNum(p.confidence ?? p.conf ?? 0);
+    if (!map.has(t) || conf > safeNum(map.get(t).confidence ?? map.get(t).conf ?? 0)) {
+      map.set(t, { ...p, confidence: conf });
+    }
+  }
+  // sort by confidence desc and keep top N
+  return Array.from(map.values())
+    .sort((a, b) => safeNum(b.confidence) - safeNum(a.confidence))
+    .slice(0, maxKeep);
+}
+
 // ==================== PRICE RESOLVER ====================
 async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
   try {
     const fetchAndCheck = async (sym, timeframe) => {
       const r = await fetchUniversal(sym, timeframe);
       const data = r?.data || r?.candles || [];
-      const price = safeNum(r?.price || data.at(-1)?.close);
-      return (price && data.length) ? { data, price } : null;
+      const price = safeNum(r?.price || (Array.isArray(data) && data.length ? data.at(-1)?.close : 0));
+      return (price && data && data.length) ? { data, price } : null;
     };
 
     // 1. Universal
@@ -204,15 +221,15 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
     // 2. Crypto fallback
     if (isCryptoLike(symbolRaw)) {
       const c = await fetchMarketData(symbolRaw, tf);
-      if (c?.price && c?.data) return { data: c.data, price: c.price, source: "marketData" };
+      if (c?.price && Array.isArray(c.data) && c.data.length) return { data: c.data, price: c.price, source: "marketData" };
     }
 
     // 3. MultiTF fallback
     const m = await fetchMultiTF(symbolRaw, [tf]);
     if (m?.[tf]) {
       const d = m[tf].data || [];
-      const p = safeNum(m[tf].price || d.at(-1)?.close);
-      if (p) return { data: d, price: p, source: "multiTF" };
+      const p = safeNum(m[tf].price || (d.length ? d.at(-1)?.close : 0));
+      if (p && d.length) return { data: d, price: p, source: "multiTF" };
     }
 
     // 4. Universal 15m fallback
@@ -224,6 +241,7 @@ async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
     return { data: [], price: 0, source: "none" };
 
   } catch (e) {
+    console.debug(`[${VERSION}] resolvePriceAndCandles error:`, e?.message || e);
     return { data: [], price: 0, source: "error" };
   }
 }
@@ -237,34 +255,53 @@ export async function generateReport(symbolLabel, tf = "15m") {
 
   // 2. ML
   let ml = {};
-  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch {}
+  try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch (e) { console.debug(`[${VERSION}] runML failed:`, e?.message || e); }
 
-  // 3. Elliott
+  // 3. Elliott (multi-TF ideally but here we analyze the current tf slice)
   let ell = null;
   try {
-    if (candles.length >= 8) ell = await analyzeElliott(candles.slice(-400));
-  } catch {}
+    if (Array.isArray(candles) && candles.length >= 8) {
+      const slice = candles.slice(-400);
+      ell = await analyzeElliott(slice);
+    }
+  } catch (e) { console.debug(`[${VERSION}] ell analyze failed:`, e?.message || e); }
 
   // 4. News
   let news = {};
-  try { news = (await fetchNewsBundle(mapped)) || {}; } catch {}
+  try { news = (await fetchNewsBundle(mapped)) || {}; } catch (e) { console.debug(`[${VERSION}] news fetch failed:`, e?.message || e); }
 
   const direction = ml.direction || "Neutral";
-  const prob = safeNum(ml.maxProb || 50);
+  const prob = safeNum(ml.maxProb ?? ml.probability ?? ml.confidence ?? 50);
+
+  // Process Elliott patterns safely and dedupe
+  const rawPatterns = Array.isArray(ell?.patterns) ? ell.patterns : [];
+  const topPatterns = dedupeAndPickTop(rawPatterns, 4); // keep up to 4 best unique patterns
+  const ellText = topPatterns.length
+    ? topPatterns.map(p => `${String(p.type)}(${round(safeNum(p.confidence ?? p.conf ?? 0), 0)}%)`).join(" + ")
+    : "N/A";
+  const ellConf = safeNum(ell?.confidence ?? (topPatterns[0] ? topPatterns[0].confidence : 50), 50);
 
   const out = {
     symbol: symbolLabel,
-    price: round(livePrice, 4),
+    price: round(safeNum(livePrice), 4),
     direction,
     biasEmoji: direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪",
-    tp1: ml.tp1 ?? "—",
-    tp2: ml.tp2 ?? "—",
+    tp1: ml.tp1 ?? ml.tpEstimate ?? "—",
+    tp2: ml.tp2 ?? ml.tp2Estimate ?? "—",
     tpConf: ml.tpConfidence ?? 50,
     maxProb: prob,
-    ellText: ell?.patterns?.map(p => `${p.type}(${round(p.confidence, 0)}%)`).join(" + ") || "N/A",
-    ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
+    ellText,
+    ellConf,
     newsImpact: news.impact || "Neutral",
-    newsScore: news.sentiment || 50
+    newsScore: safeNum(news.sentiment ?? news.score ?? 50, 50),
+    _meta: {
+      version: VERSION,
+      mapped,
+      fetchSource: source,
+      candlesFound: Array.isArray(candles) ? candles.length : 0,
+      ellFound: !!ell,
+      ellPatternsFound: rawPatterns.length
+    }
   };
 
   const txt = `
@@ -277,6 +314,7 @@ export async function generateReport(symbolLabel, tf = "15m") {
 🎯 <b>TP:</b> ${out.tp1} | Hedge: ${out.tp2}
 🤖 <b>ML Prob:</b> ${out.maxProb}%
 ━━━━━━━━━━━━━━
+<small>Src:${out._meta.fetchSource} | candles:${out._meta.candlesFound} | ell:${out._meta.ellPatternsFound}</small>
 `;
 
   return { text: txt, keyboard: kbActions(symbolLabel) };
@@ -300,16 +338,18 @@ export async function handleCallback(query) {
     return await generateReport(symbol);
   }
 
-  // Timeframe menu
+  // Timeframes menu
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
     return { text: `🕒 Timeframes: <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
   }
 
-  // FIXED: Timeframe selection
+  // Timeframe selection: tf_<SYMBOL>_<TF>
   if (data.startsWith("tf_")) {
     const clean = data.replace("tf_", "");
-    const [symbol, tf] = clean.split("_");
+    const parts = clean.split("_");
+    const tf = parts.pop();
+    const symbol = parts.join("_");
     return await generateReport(symbol, tf);
   }
 
@@ -337,19 +377,17 @@ export async function handleCallback(query) {
     const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
 
     let ell = null;
-    try { ell = await analyzeElliott(cdl.slice(-500)); } catch {}
+    try { if (Array.isArray(cdl) && cdl.length >= 8) ell = await analyzeElliott(cdl.slice(-500)); } catch (e) { console.debug(`[${VERSION}] ell detail err:`, e?.message || e); }
 
-    if (!ell || !ell.patterns?.length) {
+    if (!ell || !Array.isArray(ell.patterns) || !ell.patterns.length) {
       return { text: `📊 Elliott: N/A`, keyboard: kbActions(symbol) };
     }
 
-    const det = ell.patterns
-      .map(p => `${p.type} (${round(p.confidence, 0)}%)`)
-      .slice(0, 6)
-      .join(" + ");
+    const top = dedupeAndPickTop(ell.patterns, 6);
+    const det = top.map(p => `${String(p.type)} (${round(safeNum(p.confidence ?? p.conf ?? 0), 0)}%)`).join(" + ");
 
     return {
-      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence, 0)}%`,
+      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(safeNum(ell.confidence ?? top[0]?.confidence ?? 50, 50), 0)}%`,
       keyboard: kbActions(symbol)
     };
   }
