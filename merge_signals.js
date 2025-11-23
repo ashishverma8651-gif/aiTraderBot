@@ -16,10 +16,10 @@ const VERSION = "v3.1_FINAL_STABLE";
 
 // ================= SYMBOL MAP =================
 const symbolMap = {
-    NIFTY50: "^NSEI",
-    BANKNIFTY: "^NSEBANK",
-    SENSEX: "^BSESN",
-    FINNIFTY: "NSE:FINNIFTY",
+    NIFTY50: "NSEI",
+    BANKNIFTY: "NSEBANK",
+    SENSEX: "BSESN",
+    FINNIFTY: "NSE:FINNIFTY",  // यह बाद में fallback देगा
 
     GOLD: "GC=F",
     SILVER: "SI=F",
