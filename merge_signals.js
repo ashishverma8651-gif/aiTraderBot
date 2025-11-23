@@ -358,4 +358,3 @@ export async function handleCallback(query) {
 }
 
 // EXPORTS
-export { generateReport, kbHome, kbCrypto, kbIndices, kbForex, kbCommodity };
