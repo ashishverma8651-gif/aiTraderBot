@@ -1,5 +1,5 @@
-// merge_signals.js — FINAL PREMIUM AI PANEL (MULTI-TF FIXED)
-// ============================================================
+// merge_signals.js — PREMIUM AI PANEL (FINAL + ELLIOTT V2.3)
+// =================================================================
 
 import {
   fetchUniversal,
@@ -39,7 +39,7 @@ function withHTML(kb) {
 
 function isCryptoSymbol(s) {
   if (!s) return false;
-  const u = String(s).toUpperCase();
+  const u = s.toUpperCase();
   return u.endsWith("USDT") || u.endsWith("USD") || u.endsWith("BTC") || u.endsWith("ETH");
 }
 
@@ -167,13 +167,28 @@ export function kbTimeframes(symbol) {
   });
 }
 
-// ================= ELLIOTT UTIL =================
+// ================= ELLIOTT V2.3 MULTI-PATTERN =================
 function extractElliottPattern(ell) {
   if (!ell || !ell.patterns || !ell.patterns.length) {
     return { name: "N/A", conf: ell?.confidence || 50 };
   }
-  const p = ell.patterns[0];
-  return { name: p.type || "Structure", conf: p.confidence || ell.confidence || 50 };
+
+  const sorted = ell.patterns.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+
+  const names = sorted
+    .slice(0, 3)
+    .map(p => p.type)
+    .filter(Boolean);
+
+  const combinedName = names.length ? names.join(" + ") : "Structure";
+
+  const conf = Math.round(
+    (sorted[0]?.confidence || 0) * 0.6 +
+    (sorted[1]?.confidence || 0) * 0.3 +
+    (sorted[2]?.confidence || 0) * 0.1
+  );
+
+  return { name: combinedName, conf: conf || ell.confidence || 55 };
 }
 
 // ================= FORMATTER =================
@@ -201,24 +216,20 @@ async function resolvePriceAndCandles(symbol, tf = "15m") {
   try {
     const primary = await fetchUniversal(symbol, tf);
     if (primary && (primary.price || primary.data?.length))
-      return { data: primary.data || [], price: safeNum(primary.price || primary.data.at(-1)?.close), source: "universal" };
+      return { data: primary.data || [], price: safeNum(primary.price || primary.data.at(-1)?.close) };
 
     if (isCryptoSymbol(symbol)) {
       const m = await fetchMarketData(symbol, tf);
-      if (m?.price) return { data: m.data || [], price: safeNum(m.price), source: "marketData" };
+      if (m?.price) return { data: m.data || [], price: safeNum(m.price) };
     }
 
     const multi = await fetchMultiTF(symbol, [tf]);
     if (multi?.[tf]?.data?.length)
-      return {
-        data: multi[tf].data,
-        price: safeNum(multi[tf].price || multi[tf].data.at(-1)?.close),
-        source: "multiTF"
-      };
+      return { data: multi[tf].data, price: safeNum(multi[tf].price || multi[tf].data.at(-1)?.close) };
 
-    return { data: [], price: 0, source: "none" };
+    return { data: [], price: 0 };
   } catch (e) {
-    return { data: [], price: 0, source: "error" };
+    return { data: [], price: 0 };
   }
 }
 
@@ -229,30 +240,31 @@ export async function generateReport(symbol, tf = "15m") {
   const { data: candles, price: livePrice } = await resolvePriceAndCandles(mappedSymbol, tf);
 
   let ml = {};
-  try { ml = await runMLPrediction(mappedSymbol, tf) || {}; } catch { ml = {}; }
+  try { ml = await runMLPrediction(mappedSymbol, tf) || {}; } catch {}
 
   const direction = ml.direction || "Neutral";
-  const biasEmoji = direction === "Bullish" ? "📈" : direction === "Bearish" ? "📉" : "⚪";
+  const biasEmoji =
+    direction === "Bullish" ? "📈" :
+    direction === "Bearish" ? "📉" : "⚪";
 
   const tp1 = ml.tpEstimate ?? ml.tp1 ?? "—";
   const tp2 = ml.tp2Estimate ?? ml.tp2 ?? "—";
-  const tpConf = ml.tpConfidence ?? 55;
 
   let ell = {};
-  try { ell = await analyzeElliott(candles || []); } catch { ell = {}; }
+  try { ell = await analyzeElliott(candles || []); } catch {}
   const ep = extractElliottPattern(ell);
 
   let news = {};
-  try { news = await fetchNewsBundle(mappedSymbol) || {}; } catch { news = {}; }
+  try { news = await fetchNewsBundle(mappedSymbol) || {}; } catch {}
 
-  const out = {
+  const output = {
     symbol,
     price: livePrice,
     direction,
     biasEmoji,
     tp1,
     tp2,
-    tpConf,
+    tpConf: ml.tpConfidence || 55,
     maxProb: ml.maxProb || 50,
     elliottPattern: ep.name,
     elliottConf: ep.conf,
@@ -261,7 +273,7 @@ export async function generateReport(symbol, tf = "15m") {
   };
 
   return {
-    text: formatPremiumReport(out),
+    text: formatPremiumReport(output),
     keyboard: kbActions(symbol)
   };
 }
@@ -287,9 +299,8 @@ export async function handleCallback(query) {
     return { text: `🕒 Timeframes for <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
   }
 
-  // ===== FIXED MULTI-TF HANDLER =====
   if (data.startsWith("tf_")) {
-    const clean = data.replace("tf_", "");  // BTCUSDT_5m
+    const clean = data.replace("tf_", "");
     const [symbol, tf] = clean.split("_");
     return await generateReport(symbol, tf);
   }
@@ -315,6 +326,7 @@ export async function handleCallback(query) {
     const pd = await resolvePriceAndCandles(mapped, "15m");
     const ell = await analyzeElliott(pd.data || []);
     const ep = extractElliottPattern(ell);
+
     return {
       text: `📊 <b>Elliott Waves</b>\nPattern: ${ep.name}\nConfidence: ${ep.conf}%`,
       keyboard: kbActions(symbol)
