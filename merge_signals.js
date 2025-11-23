@@ -1,5 +1,5 @@
 // ============================================================
-// merge_signals.js — v3.4 FINAL FIXED (UI + TF FIX + Elliott V3)
+// merge_signals.js — v3.4 FINAL FIXED (UI + TF FIX + Elliott V3 + CLEAN OUTPUT)
 // ============================================================
 
 import {
@@ -39,18 +39,15 @@ const symbolMap = {
 function withHTML(kb) {
   return { ...kb, parse_mode: "HTML" };
 }
-
 function isCryptoLike(sym) {
   if (!sym) return false;
   const s = String(sym).toUpperCase();
   return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
 }
-
 function safeNum(v, fb = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : fb;
 }
-
 function round(v, d = 2) {
   if (!Number.isFinite(v)) return v;
   const m = Math.pow(10, d);
@@ -233,15 +230,43 @@ export async function generateReport(symbolLabel, tf = "15m") {
   let ml = {};
   try { ml = (await runMLPrediction(mapped, tf)) || {}; } catch {}
 
+  // =============== ELLIOTT FIXED CLEAN FORMAT ===============
   let ell = null;
+  let ellText = "N/A";
+  let ellConf = 50;
+
   try {
-    if (candles.length >= 8)
-      ell = await analyzeElliott(candles.slice(-400));
+    if (candles.length >= 12) {
+      ell = await analyzeElliott(candles.slice(-450));
+
+      if (ell?.patterns?.length) {
+        const uniq = [];
+
+        for (const p of ell.patterns) {
+          if (!uniq.find(x => x.type === p.type)) {
+            uniq.push({
+              type: p.type,
+              confidence: round(p.confidence || 0, 0)
+            });
+          }
+        }
+
+        uniq.sort((a, b) => b.confidence - a.confidence);
+
+        const top5 = uniq.slice(0, 5);
+
+        ellText = top5.map(p => `${p.type}(${p.confidence}%)`).join(" + ");
+      }
+
+      ellConf = ell?.confidence ? round(ell.confidence, 0) : 50;
+    }
   } catch {}
 
+  // ================= NEWS =====================
   let news = {};
   try { news = (await fetchNewsBundle(mapped)) || {}; } catch {}
 
+  // ========== ML ======================
   const direction = ml.direction || "Neutral";
   const prob = safeNum(ml.maxProb || 50);
 
@@ -251,11 +276,15 @@ export async function generateReport(symbolLabel, tf = "15m") {
     direction,
     biasEmoji: direction === "Bullish" ? "📈" :
                direction === "Bearish" ? "📉" : "⚪",
+
     tp1: ml.tp1 ?? "—",
     tp2: ml.tp2 ?? "—",
     maxProb: prob,
-    ellText: ell?.patterns?.map(p => `${p.type}(${round(p.confidence, 0)}%)`).join(" + ") || "N/A",
-    ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
+
+    // FIXED OUTPUT
+    ellText,
+    ellConf,
+
     newsImpact: news.impact || "Neutral",
     newsScore: news.sentiment || 50
   };
@@ -353,5 +382,3 @@ export async function handleCallback(query) {
 
   return { text: "❌ Unknown", keyboard: kbHome };
 }
-
-// EXPORTS
