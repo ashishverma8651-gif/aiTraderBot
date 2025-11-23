@@ -1,22 +1,22 @@
 // ===============================================================
-// merge_signals.js — FINAL PREMIUM AI PANEL (COMPLETE + FIXED)
+// merge_signals.js — FINAL PREMIUM AI PANEL (FIXED + VERIFIED)
 // ===============================================================
 
-// 🔥 PRICE ENGINE (UTILS)
+// 🔥 PRICE ENGINE
 import {
   fetchUniversal,
-  fetchMarketData,
-  fetchMultiTF
+  fetchMultiTF,
+  fetchMarketData
 } from "./utils.js";
 
-// 🔥 ML + ELLIOTT + NEWS
+// 🔥 AI MODULES
 import { runMLPrediction } from "./ml_module_v8_6.js";
 import { analyzeElliott } from "./elliott_module.js";
 import { fetchNewsBundle } from "./news_social.js";
 
 
 // ===============================
-// SYMBOL MAP (REAL MARKET SYMBOLS)
+// SYMBOL MAP
 // ===============================
 const symbolMap = {
   NIFTY50: "^NSEI",
@@ -40,12 +40,11 @@ const symbolMap = {
 
 
 // ===============================
-// WRAPPER
+// WRAPPER (SAFE HTML)
 // ===============================
 function withHTML(keyboard) {
   return { ...keyboard, parse_mode: "HTML" };
 }
-
 
 
 // ===============================
@@ -112,7 +111,7 @@ export const kbIndices = withHTML({
 
 
 // ===============================
-// FOREX MENU (FIXED)
+// FOREX MENU
 // ===============================
 export const kbForex = withHTML({
   reply_markup: {
@@ -136,7 +135,7 @@ export const kbForex = withHTML({
 
 
 // ===============================
-// COMMODITIES MENU (FIXED)
+// COMMODITIES MENU
 // ===============================
 export const kbCommodity = withHTML({
   reply_markup: {
@@ -153,7 +152,6 @@ export const kbCommodity = withHTML({
     ]
   }
 });
-
 
 
 // =====================================================
@@ -176,7 +174,6 @@ export function kbActions(symbol) {
     }
   });
 }
-
 
 
 // =====================================================
@@ -231,35 +228,34 @@ Confidence: <b>${r.tpConf}%</b>
 
 
 // =====================================================
-// MAIN REPORT BUILDER
+// MAIN AI REPORT BUILDER
 // =====================================================
 export async function generateReport(symbol, tf = "15m") {
 
   const mappedSymbol = symbolMap[symbol] || symbol;
 
   // PRICE
-  let priceData = await fetchUniversal(mappedSymbol, tf);
+  const priceData = await fetchUniversal(mappedSymbol, tf);
   let livePrice = priceData?.price || 0;
 
   // ML
   const ml = await runMLPrediction(mappedSymbol, tf) || {};
   const candles = ml?.explanation?.features?.candles || [];
 
-  // ELLIOTT
-  const ell = await analyzeElliott(candles);
+  // Elliott (SAFE)
+  const ell = await analyzeElliott(candles || []);
 
-  // NEWS
-  const news = await fetchNewsBundle(mappedSymbol);
+  // NEWS (with mappedSymbol fix)
+  const news = await fetchNewsBundle(mappedSymbol) || {};
 
-  // MERGE
   const out = {
     symbol,
     price: livePrice,
 
     direction: ml.direction || "Neutral",
-    biasEmoji: ml.direction === "Bullish" ? "📈"
-              : ml.direction === "Bearish" ? "📉"
-              : "⚪",
+    biasEmoji:
+      ml.direction === "Bullish" ? "📈" :
+      ml.direction === "Bearish" ? "📉" : "⚪",
 
     maxProb: ml.maxProb || 50,
     tp1: ml.tpEstimate || "—",
@@ -269,8 +265,8 @@ export async function generateReport(symbol, tf = "15m") {
     elliottPattern: ell?.pattern || "N/A",
     elliottConf: ell?.confidence || 50,
 
-    newsImpact: news?.impact || "Neutral",
-    newsScore: news?.sentiment || 50
+    newsImpact: news.impact || "Neutral",
+    newsScore: news.sentiment || 50
   };
 
   return {
@@ -282,12 +278,12 @@ export async function generateReport(symbol, tf = "15m") {
 
 
 // =====================================================
-// CALLBACK ROUTER
+// CALLBACK ROUTER (FIXED)
 // =====================================================
 export async function handleCallback(query) {
   const data = query.data;
 
-  // HOME
+  // HOME NAV
   if (data === "back_home")
     return { text: "🏠 HOME", keyboard: kbHome };
 
@@ -306,13 +302,13 @@ export async function handleCallback(query) {
   if (data === "back_assets")
     return { text: "Choose Market", keyboard: kbHome };
 
-  // ASSETS
+  // SELECTED ASSET
   if (data.startsWith("asset_")) {
     const symbol = data.replace("asset_", "");
-    return await generateReport(symbol, "15m");
+    return await generateReport(symbol);
   }
 
-  // TIMEFRAMES
+  // TIMEFRAME MENU
   if (data.startsWith("tfs_")) {
     const symbol = data.replace("tfs_", "");
     return {
@@ -321,25 +317,28 @@ export async function handleCallback(query) {
     };
   }
 
+  // SPECIFIC TF
   if (data.startsWith("tf_")) {
-    const parts = data.split("_");
-    const symbol = parts[1];
-    const tf = parts[2];
+    const [, symbol, tf] = data.split("_");
     return await generateReport(symbol, tf);
   }
 
   // REFRESH
   if (data.startsWith("refresh_")) {
     const symbol = data.replace("refresh_", "");
-    return await generateReport(symbol, "15m");
+    return await generateReport(symbol);
   }
 
   // NEWS
   if (data.startsWith("news_")) {
     const symbol = data.replace("news_", "");
-    const news = await fetchNewsBundle(symbol);
+    const mappedSymbol = symbolMap[symbol] || symbol;
+    const news = await fetchNewsBundle(mappedSymbol);
+
     return {
-      text: `📰 <b>News Report</b>\nImpact: ${news.impact}\nSentiment: ${news.sentiment}%`,
+      text: `📰 <b>News Report</b>
+Impact: ${news.impact}
+Sentiment: ${news.sentiment}%`,
       keyboard: kbActions(symbol)
     };
   }
@@ -347,9 +346,18 @@ export async function handleCallback(query) {
   // ELLIOTT
   if (data.startsWith("ell_")) {
     const symbol = data.replace("ell_", "");
-    const ell = await analyzeElliott([]);
+    const mappedSymbol = symbolMap[symbol] || symbol;
+
+    // get candles from main fetch
+    const priceData = await fetchUniversal(mappedSymbol, "15m");
+    const candles = priceData?.data || [];
+
+    const ell = await analyzeElliott(candles);
+
     return {
-      text: `📊 <b>Elliott Waves</b>\nPattern: ${ell.pattern}\nConfidence: ${ell.confidence}%`,
+      text: `📊 <b>Elliott Waves</b>
+Pattern: ${ell.pattern}
+Confidence: ${ell.confidence}%`,
       keyboard: kbActions(symbol)
     };
   }
