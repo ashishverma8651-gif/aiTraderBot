@@ -381,6 +381,19 @@ export async function buildAIReport(symbol = CONFIG.SYMBOL || "BTCUSDT", opts = 
     const feat15 = blocks.find(b=>b.tf==="15m");
     const stableTargets = buildStableTargetsImproved(allTargets, mlFusion, price, { atr: feat15?.indicators?.ATR, candles: feat15?.candles });
 
+    // === NEW: inject ML TP into stableTargets (Option A) ===
+    // Keep existing Primary/Hedge as-is; add mlTP (fused primary from ML) and confidence
+    if (mlFusion && isNum(mlFusion.primaryTP) && mlFusion.primaryTP > 0) {
+      stableTargets.mlTP = Number(mlFusion.primaryTP);
+      stableTargets.mlSource = "ML";
+      stableTargets.mlTPConf = mlFusion.confidence ?? 0;
+    } else {
+      stableTargets.mlTP = null;
+      stableTargets.mlSource = null;
+      stableTargets.mlTPConf = 0;
+    }
+    // ======================================================
+
     // NEWS
     let news = null;
     try { news = await fetchNewsBundle(symbol); } catch (e) { news = { ok:false, sentiment:0.5, impact:"Low", items:[], headline:"No news" }; }
@@ -491,6 +504,11 @@ export async function formatAIReport(report = {}) {
     const stableConf = stable.primaryConf ?? (report.ml?.fusion?.confidence ?? 0);
     const stableTQF = stable.primaryTQF ?? 0;
 
+    // ML TP added (Option A)
+    const mlTP = isNum(stable.mlTP) ? nf(stable.mlTP, 2) : "N/A";
+    const mlTPSource = stable.mlSource || "N/A";
+    const mlTPConf = isNum(stable.mlTPConf) ? stable.mlTPConf : 0;
+
     const ml = report.ml || {};
     const mlPerTF = ml.perTF || [];
     const mlFusion = ml.fusion || {};
@@ -571,6 +589,7 @@ Buy ${buyProb}% | Sell ${sellProb}%
 🎯 STABLE AI TP (Fused 15m+30m+1h)
 Primary TP: <b>${stablePrimary}</b> (src:${stable.primarySource || "Cluster/ML"})  (TQF:${stableTQF})
 Hedge TP: <b>${stableHedge}</b> (src:${stable.hedgeSource || "Cluster/ML"})  
+ML TP: <b>${mlTP}</b> (src:${mlTPSource} | conf:${mlTPConf}%)
 Confidence: ${stableConf}%
 Suggested SL: ${report.stableTargets && report.stableTargets.direction === "Bullish" ? (report.defaultSLLong ? nf(report.defaultSLLong,2) : "N/A") : (report.defaultSLShort ? nf(report.defaultSLShort,2) : "N/A")}
 ━━━━━━━━━━━━━━━━━━
