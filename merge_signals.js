@@ -1,392 +1,346 @@
-// merge_signals_fixed.js — merged & fixed (based on your provided code)
-// Version: v3.4_FINAL (fixed ML TP mapping for multimarket)
+// merge_signal_v15.js
+// Merge Signal v15 — Multi-market, Multi-TF signal generator
+// Uses: config.js, core_indicators.js, utils.js, ml_module_v15.js, elliott_module.js, news_social.js
+// Produces: structured analysis object + Telegram-friendly UI string
 
-// ============================================================
-// merge_signals.js — v3.4 FINAL (UI OK + TF OK + Single Elliott Pattern)
-// ============================================================
+import CONFIG from "./config.js";
 
 import {
-  fetchUniversal,
-  fetchMultiTF,
-  fetchMarketData
-} from "./utils.js";
+  normalizeCandles,
+  computeIndicators,
+  computeMultiTF,
+  deriveSignal
+} from "./core_indicators.js";
 
-import { runMLPrediction } from "./ml_module_v8_6.js";
-import { analyzeElliott } from "./elliott_module.js";
-import { fetchNewsBundle } from "./news_social.js";
+import { fetchMultiTF, fetchPrice } from "./utils.js";
 
-const VERSION = "v3.4_FINAL";
+// <-- using the ml_module_v15 filename you specified earlier
+import ML from "./ml_module_v15.js";
 
-// ================= SYMBOL MAP =================
-const symbolMap = {
-  NIFTY50: "^NSEI",
-  BANKNIFTY: "^NSEBANK",
-  SENSEX: "^BSESN",
-  FINNIFTY: "NSE:FINNIFTY",
+// <-- using the elliott_module filename you provided
+import Elliott from "./elliott_module.js";
+const { analyzeElliott, extractFeatures, VERSION: ELLIOTT_VERSION } = Elliott || {};
 
-  GOLD: "GC=F",
-  SILVER: "SI=F",
-  CRUDE: "CL=F",
-  NGAS: "NG=F",
+// news module
+import News from "./news_social.js";
+const { fetchNewsBundle } = News || {};
 
-  DXY: "DX-Y.NYB",
-  XAUUSD: "GC=F",
-  XAGUSD: "SI=F",
+// ---------- helpers ----------
+const TF_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h"];
+const UI_TFS = ["1m", "5m", "15m", "30m", "1h"]; // UI requested
+const safe = v => (Number.isFinite(+v) ? +v : 0);
 
-  EURUSD: "EURUSD=X",
-  GBPUSD: "GBPUSD=X",
-  USDJPY: "JPY=X"
-};
-
-// ================= HELPERS =================
-function withHTML(kb) {
-  return { ...kb, parse_mode: "HTML" };
+function fmt(n, dp = 2) {
+  if (!Number.isFinite(+n)) return "N/A";
+  return Number(Number(n).toFixed(dp));
 }
+function pct(n, dp = 2) { return `${fmt(n * 100, dp)}%`; }
 
-function isCryptoLike(sym) {
-  if (!sym) return false;
-  const s = String(sym).toUpperCase();
-  return s.endsWith("USDT") || s.endsWith("USD") || s.includes("BTC");
-}
-
-function safeNum(v, fb = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fb;
-}
-
-function round(v, d = 2) {
-  if (!Number.isFinite(v)) return v;
-  const m = Math.pow(10, d);
-  return Math.round(v * m) / m;
-}
-
-// ================= HOME KEYPADS ==================
-export const kbHome = withHTML({
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "💠 Crypto", callback_data: "menu_crypto" },
-        { text: "📘 Indices", callback_data: "menu_indices" }
-      ],
-      [
-        { text: "💱 Forex", callback_data: "menu_forex" },
-        { text: "🛢 Commodities", callback_data: "menu_commodities" }
-      ]
-    ]
+function chooseAtrPriority(mtfIndicators) {
+  // prefer 1h -> 30m -> 4h -> 15m -> 5m -> 1m
+  const order = ["1h", "30m", "4h", "15m", "5m", "1m"];
+  for (const tf of order) {
+    if (mtfIndicators[tf] && mtfIndicators[tf].ATR) return safe(mtfIndicators[tf].ATR);
   }
-});
-
-export const kbCrypto = withHTML({
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "BTC", callback_data: "asset_BTCUSDT" },
-        { text: "ETH", callback_data: "asset_ETHUSDT" }
-      ],
-      [
-        { text: "SOL", callback_data: "asset_SOLUSDT" },
-        { text: "XRP", callback_data: "asset_XRPUSDT" }
-      ],
-      [
-        { text: "DOGE", callback_data: "asset_DOGEUSDT" },
-        { text: "ADA", callback_data: "asset_ADAUSDT" }
-      ],
-      [{ text: "⬅ Back", callback_data: "back_home" }]
-    ]
-  }
-});
-
-export const kbIndices = withHTML({
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "NIFTY50", callback_data: "asset_NIFTY50" },
-        { text: "BankNifty", callback_data: "asset_BANKNIFTY" }
-      ],
-      [
-        { text: "Sensex", callback_data: "asset_SENSEX" },
-        { text: "FinNifty", callback_data: "asset_FINNIFTY" }
-      ],
-      [{ text: "⬅ Back", callback_data: "back_home" }]
-    ]
-  }
-});
-
-export const kbForex = withHTML({
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "EURUSD", callback_data: "asset_EURUSD" },
-        { text: "GBPUSD", callback_data: "asset_GBPUSD" }
-      ],
-      [
-        { text: "USDJPY", callback_data: "asset_USDJPY" },
-        { text: "XAUUSD", callback_data: "asset_XAUUSD" }
-      ],
-      [
-        { text: "XAGUSD", callback_data: "asset_XAGUSD" },
-        { text: "DXY", callback_data: "asset_DXY" }
-      ],
-      [{ text: "⬅ Back", callback_data: "back_home" }]
-    ]
-  }
-});
-
-export const kbCommodity = withHTML({
-  reply_markup: {
-    inline_keyboard: [
-      [
-        { text: "GOLD", callback_data: "asset_GOLD" },
-        { text: "SILVER", callback_data: "asset_SILVER" }
-      ],
-      [
-        { text: "CRUDE", callback_data: "asset_CRUDE" },
-        { text: "NGAS", callback_data: "asset_NGAS" }
-      ],
-      [{ text: "⬅ Back", callback_data: "back_home" }]
-    ]
-  }
-});
-
-// ACTION KEYPAD
-export function kbActions(symbol) {
-  return withHTML({
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🔄 Refresh", callback_data: `refresh_${symbol}` },
-          { text: "🕒 Timeframes", callback_data: `tfs_${symbol}` }
-        ],
-        [
-          { text: "📊 Elliott", callback_data: `ell_${symbol}` },
-          { text: "📰 News", callback_data: `news_${symbol}` }
-        ],
-        [{ text: "⬅ Back", callback_data: "back_home" }]
-      ]
-    }
-  });
+  return 0;
 }
 
-// TIMEFRAME KEYPAD
-export function kbTimeframes(symbol) {
-  return withHTML({
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "5m", callback_data: `tf_${symbol}_5m` },
-          { text: "15m", callback_data: `tf_${symbol}_15m` }
-        ],
-        [
-          { text: "30m", callback_data: `tf_${symbol}_30m` },
-          { text: "1h", callback_data: `tf_${symbol}_1h` }
-        ],
-        [
-          { text: "4h", callback_data: `tf_${symbol}_4h` },
-          { text: "1D", callback_data: `tf_${symbol}_1d` }
-        ],
-        [{ text: "⬅ Back", callback_data: `asset_${symbol}` }]
-      ]
-    }
-  });
-}
+function mean(arr) { return (Array.isArray(arr) && arr.length) ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
 
-// ================== PRICE RESOLVER ==================
-async function resolvePriceAndCandles(symbolRaw, tf = "15m") {
+// defensive ML prediction wrapper (supports several possible ML APIs)
+async function runMLPredictFromMLModule(symbol, mainTF = "15m", mtf = {}) {
   try {
-    const fetchAndCheck = async (sym, timeframe) => {
-      const r = await fetchUniversal(sym, timeframe);
-      const data = r?.data || r?.candles || [];
-      const price = safeNum(r?.price || data.at(-1)?.close);
-      return (price && data.length) ? { data, price } : null;
-    };
+    if (!ML) return null;
 
-    let u = await fetchAndCheck(symbolRaw, tf);
-    if (u) return { ...u, source: "universal" };
-
-    if (isCryptoLike(symbolRaw)) {
-      const c = await fetchMarketData(symbolRaw, tf);
-      if (c?.price && c?.data)
-        return { data: c.data, price: c.price, source: "marketData" };
+    if (typeof ML.runMLPrediction === "function") {
+      return await ML.runMLPrediction(symbol, mainTF, { multiTF: mtf });
     }
-
-    const m = await fetchMultiTF(symbolRaw, [tf]);
-    if (m?.[tf]) {
-      const d = m[tf].data || [];
-      const p = safeNum(m[tf].price || d.at(-1)?.close);
-      if (p) return { data: d, price: p, source: "multiTF" };
+    if (typeof ML.predictProbFromAnalysis === "function") {
+      const analysis = { symbol, tf: mainTF, mtf };
+      return await ML.predictProbFromAnalysis(analysis);
     }
-
-    if (tf !== "15m") {
-      let u15 = await fetchAndCheck(symbolRaw, "15m");
-      if (u15) return { ...u15, source: "universal-15m" };
+    if (typeof ML.analyzeSymbol === "function") {
+      return await ML.analyzeSymbol(symbol, { tf: mainTF, multiTF: mtf });
     }
-
-    return { data: [], price: 0, source: "none" };
-  } catch {
-    return { data: [], price: 0, source: "error" };
-  }
-}
-
-// ================== MAIN REPORT ==================
-export async function generateReport(symbolLabel, tf = "15m") {
-  const mapped = symbolMap[symbolLabel] || symbolLabel;
-
-  const { data: candles, price: livePrice } = await resolvePriceAndCandles(mapped, tf);
-
-  let ml = {};
-  try {
-    // call ML with mapped symbol (multimarket aware)
-    ml = (await runMLPrediction(mapped, tf)) || {};
-  } catch (err) {
-    // keep ml empty on error (we'll show fallbacks)
-    ml = {};
-  }
-
-  let ell = null;
-  try {
-    if (candles.length >= 8)
-      ell = await analyzeElliott(candles.slice(-400));
+    if (typeof ML.predictProbVector === "function") {
+      return await ML.predictProbVector(symbol, mtf);
+    }
+    // fallback: some ML modules expose a default prediction method
+    if (typeof ML.predict === "function") {
+      return await ML.predict(symbol, { tf: mainTF, mtf });
+    }
+    return null;
   } catch (e) {
-    ell = null;
+    return null;
   }
-
-  let news = {};
-  try { news = (await fetchNewsBundle(mapped)) || {}; } catch (e) { news = {}; }
-
-  // ======== FIX: map ML TP field names robustly ========
-  // ml may use tpEstimate/tp2Estimate (new) or tp1/tp2 (old). Use either, else "—"
-  const tpPrimaryRaw = (ml && (ml.tpEstimate ?? ml.tp1 ?? ml.tp)) ?? null;
-  const tpHedgeRaw = (ml && (ml.tp2Estimate ?? ml.tp2 ?? ml.tpSecondary ?? ml.tp_hedge)) ?? null;
-
-  // Make sure we return sensible strings
-  const formatTP = (v) => {
-    if (!v && v !== 0) return "—";
-    if (typeof v === "number") return String(round(v, 4));
-    return String(v);
-  };
-
-  const tp1_val = formatTP(tpPrimaryRaw);
-  const tp2_val = formatTP(tpHedgeRaw);
-
-  const direction = ml.direction || "Neutral";
-  const prob = safeNum(ml.maxProb ?? ml.prob ?? 50);
-
-  // =============== FIX: SINGLE BEST PATTERN ONLY ===============
-  const ellText = (() => {
-    if (!ell) return "N/A";
-    // older analyzeElliott returns { patterns: [], confidence: num } or ({ targets, patterns })
-    const patterns = ell.patterns || (ell.results && ell.results.patterns) || [];
-    if (!patterns.length) return "N/A";
-    const best = patterns.sort((a, b) => (b.confidence || 0) - (a.confidence || 0))[0];
-    return `${best.type || best.name || "Pattern"} (${round(best.confidence || 0, 0)}%)`;
-  })();
-
-  const out = {
-    symbol: symbolLabel,
-    price: round(livePrice, 4),
-    direction,
-    biasEmoji: direction === "Bullish" ? "📈" :
-               direction === "Bearish" ? "📉" : "⚪",
-    tp1: tp1_val,
-    tp2: tp2_val,
-    maxProb: prob,
-    ellText,
-    ellConf: ell?.confidence ? round(ell.confidence, 0) : 50,
-    newsImpact: news.impact || "Neutral",
-    newsScore: (typeof news.sentiment === "number") ? round(news.sentiment, 1) : (news.sentiment || 50)
-  };
-
-  const text = `
-🔥 <b>${out.symbol}</b>
-━━━━━━━━━━━━━━
-📍 <b>Price:</b> ${out.price}
-📊 <b>Trend:</b> ${out.biasEmoji} ${out.direction}
-📉 <b>Elliott:</b> ${out.ellText} (${out.ellConf}%)
-📰 <b>News:</b> ${out.newsImpact} (${out.newsScore}%)
-🎯 <b>TP:</b> ${out.tp1} | Hedge: ${out.tp2}
-🤖 <b>ML Prob:</b> ${out.maxProb}%
-━━━━━━━━━━━━━━
-`;
-
-  return { text, keyboard: kbActions(symbolLabel) };
 }
 
-// ================= CALLBACK HANDLER ==================
-export async function handleCallback(query) {
-  const data = query.data;
+// build TP using Elliott when strong else ATR-based using multi-TF ATR
+function buildTPs({ price, direction, mtfIndicators, ellTargets = [], fusedProb = 0.5 }) {
+  const atr = chooseAtrPriority(mtfIndicators) || Math.max(1, Math.abs(price) * 0.002);
+  const conservativeMult = 3.0;
+  const aggressiveMult = 5.0;
 
-  // Menus
-  if (data === "back_home") return { text: "🏠 Home", keyboard: kbHome };
-  if (data === "menu_crypto") return { text: "💠 Crypto Market", keyboard: kbCrypto };
-  if (data === "menu_indices") return { text: "📘 Indices Market", keyboard: kbIndices };
-  if (data === "menu_forex") return { text: "💱 Forex Market", keyboard: kbForex };
-  if (data === "menu_commodities") return { text: "🛢 Commodities Market", keyboard: kbCommodity };
-
-  // Asset
-  if (data.startsWith("asset_")) {
-    const symbol = data.replace("asset_", "");
-    const r = await generateReport(symbol);
-    return { text: r.text, keyboard: r.keyboard };
+  const ellGood = Array.isArray(ellTargets) ? ellTargets.filter(t => (t.confidence || 0) >= 65) : [];
+  let tp1, tp2, hedge;
+  if (ellGood.length >= 2) {
+    tp1 = Number(ellGood[0].tp || ellGood[0].target);
+    tp2 = Number(ellGood[1].tp || ellGood[1].target);
+    hedge = direction === "Bullish" ? Number(price - atr * 1.5) : Number(price + atr * 1.5);
+  } else if (ellGood.length === 1) {
+    const e = ellGood[0];
+    tp1 = Number(e.tp || e.target);
+    tp2 = direction === "Bullish" ? Number(price + atr * aggressiveMult) : Number(price - atr * aggressiveMult);
+    hedge = direction === "Bullish" ? Number(price - atr * 1.5) : Number(price + atr * 1.5);
+  } else {
+    const dirSign = direction === "Bullish" ? 1 : direction === "Bearish" ? -1 : (fusedProb >= 0.52 ? 1 : fusedProb <= 0.48 ? -1 : 1);
+    tp1 = Number((price + dirSign * atr * conservativeMult).toFixed(8));
+    tp2 = Number((price + dirSign * atr * aggressiveMult).toFixed(8));
+    hedge = Number((price - dirSign * atr * 1.5).toFixed(8));
   }
 
-  // Timeframe menu
-  if (data.startsWith("tfs_")) {
-    const symbol = data.replace("tfs_", "");
-    return { text: `🕒 Timeframes: <b>${symbol}</b>`, keyboard: kbTimeframes(symbol) };
+  // ensure tp1 is nearer than tp2
+  if (Math.abs(tp1 - price) > Math.abs(tp2 - price)) {
+    const tmp = tp1; tp1 = tp2; tp2 = tmp;
   }
 
-  // Timeframe selected
-  if (data.startsWith("tf_")) {
-    const clean = data.replace("tf_", "");
-    const [symbol, tf] = clean.split("_");
-    const r = await generateReport(symbol, tf);
-    return { text: r.text, keyboard: r.keyboard };
+  const sl = direction === "Bullish" ? Number((price - atr * 1.9).toFixed(8)) : Number((price + atr * 1.9).toFixed(8));
+
+  return { tp1, tp2, hedge, sl, atr: fmt(atr, 4) };
+}
+
+// build fusion score combining indicator signals, ML, Elliott sentiment, news
+function buildFusion({ perTFSignals, mlResult, ellResult, newsResult, mtfIndicators }) {
+  let buyCount = 0, sellCount = 0;
+  const tfKeys = Object.keys(perTFSignals || {});
+  for (const tf of tfKeys) {
+    const v = perTFSignals[tf];
+    if (v === "BUY") buyCount++;
+    else if (v === "SELL") sellCount++;
+  }
+  const tfAgreement = tfKeys.length ? (buyCount - sellCount) / tfKeys.length : 0;
+
+  const mlProb = mlResult?.probs?.bull ? (mlResult.probs.bull/100) : (mlResult?.probBull ? mlResult.probBull/100 : (mlResult?.fusedProb ?? 0.5));
+  const ellSent = Array.isArray(ellResult?.targets) ? (ellResult.targets.length ? 0.6 : 0.5) : (ellResult?.sentiment ?? 0.5);
+  const newsSent = (newsResult?.sentiment ?? 0.5);
+
+  // weights: TF 0.35, ML 0.35, Elliott 0.15, News 0.15
+  const fused = ( (tfAgreement + 1) / 2 * 0.35 ) + (mlProb * 0.35) + (ellSent * 0.15) + (newsSent * 0.15);
+  const fusionScore = Math.max(0, Math.min(1, fused));
+  const bias = fusionScore > 0.55 ? "Bullish" : fusionScore < 0.45 ? "Bearish" : "Neutral";
+  const confidence = Math.round(Math.min(99, Math.max(10, Math.abs(fusionScore - 0.5) * 200)));
+
+  return { fusionScore: Number(fusionScore.toFixed(5)), bias, confidence, breakdown: { tfAgreement: Number(tfAgreement.toFixed(3)), mlProb: Number(mlProb.toFixed(3)), ellSent: Number(ellSent.toFixed(3)), newsSent: Number(newsSent.toFixed(3)) } };
+}
+
+// format UI text (Telegram friendly)
+function formatTelegramUI({ symbol, price, tfSummaries, fib1h, fusion, tps, mlSummary, newsSummary, volatility, accuracy }) {
+  const t = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+  const header = `🔥 ${symbol} — AI Market Intelligence Suite (UDP-X)\nTime: ${t} IST\nPrice: ${fmt(price,2)}\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const tfLines = tfSummaries.map(s => {
+    return `🕒 ${s.tf} — ${s.signalEmoji} ${s.signal}\n• RSI: ${s.ind.RSI} | MACD: ${s.ind.MACD?.hist ?? 0} | ATR: ${s.ind.ATR}\n• Volume: ${s.ind.volumeTrend} (Rank ${s.volRank || "N/A"})\n• Trend: ${s.trendStrength} | Pattern: ${s.pattern || "—"} (${s.patternConf || 0}%)\n• S: ${s.S} | R: ${s.R}\n• Micro-Context: ${s.note}\n`;
+  }).join("\n");
+
+  const fibLines = fib1h ? `\n📈 FIBONACCI MATRIX (1h Context)\n• 0.236: ${fmt(fib1h.retrace["0.236"],2)}\n• 0.382: ${fmt(fib1h.retrace["0.382"],2)}\n• 0.500: ${fmt(fib1h.retrace["0.5"],2)}\n• 0.618: ${fmt(fib1h.retrace["0.618"],2)}\n• 0.786: ${fmt(fib1h.retrace["0.786"],2)}\n━━━━━━━━━━━━━━━━━━\n` : "";
+
+  const fusionLines = `🧭 AI FUSION TREND\n• Bias: ${fusion.bias}\n• Fusion Score: ${fusion.fusionScore}\n• Confidence: ${fusion.confidence}\n• Breakdown: TF:${fusion.breakdown.tfAgreement} ML:${fusion.breakdown.mlProb} E:${fusion.breakdown.ellSent} N:${fusion.breakdown.newsSent}\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const tpLines = `🎯 AI TARGET SUITE (Market Structure × ML Fused)\n\nPRIMARY TARGET (TP1)\n• ${fmt(tps.tp1,2)}\n• Confidence: ${tps.tp1Conf ?? "N/A"}\n• Backed by: ${tps.tp1Src || "ML/ATR" }\n\nSECONDARY TARGET (TP2)\n• ${fmt(tps.tp2,2)}\n• Confidence: ${tps.tp2Conf ?? "N/A"}\n• Backed by: ${tps.tp2Src || "ML/Structure" }\n\nHEDGE TARGET\n• ${fmt(tps.hedge,2)}\n• Logic: ${tps.hedgeSrc || "ATR-based volatility hedge"}\n\nSTOP LOSS\n• ${fmt(tps.sl,2)} (Dynamic ATR-Adaptive)\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const volLines = `📊 VOLATILITY REPORT\n• Regime: ${volatility.regime}\n• Expansion Probability: ${fmt(volatility.expansionProb*100,0)}%\n• ATR Cluster Zone (Short-term): ${volatility.atrCluster.join("–")}\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const newsLines = `📰 FUNDAMENTAL / NEWS IMPACT\n• Sentiment: ${fmt(newsSummary.sentiment*100,1)}% (${newsSummary.impact})\n• Latest Headline:\n  “${newsSummary.headline || "—"}”\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const mlLines = `🧠 ML QUICK SNAPSHOT\n• Direction: ${mlSummary.direction}\n• Model Confidence: ${fmt(mlSummary.confidence,1)}%\n• Features:\n  - slope: ${mlSummary.features?.slope}\n  - mom3: ${mlSummary.features?.mom3}\n  - rsi: ${mlSummary.features?.rsi}\n━━━━━━━━━━━━━━━━━━\n`;
+
+  const accLines = accuracy ? `📊 ACCURACY\n• Recent Accuracy: ${fmt(accuracy.accuracy,2)}% (total ${accuracy.total})\n━━━━━━━━━━━━━━━━━━\n` : "";
+
+  return `${header}${tfLines}${fibLines}${fusionLines}${tpLines}${volLines}${newsLines}${mlLines}${accLines}`;
+}
+
+// ---------- main exported function ----------
+/**
+ * generateMergeSignal(symbol, opts)
+ * opts:
+ *   - mainTF (default "15m")
+ *   - tfs (array) optional
+ *   - forceNews / forceElliott
+ */
+export async function generateMergeSignal(symbol = (CONFIG.DEFAULT_BY_MARKET?.CRYPTO || "BTCUSDT"), opts = {}) {
+  symbol = String(symbol).toUpperCase();
+  const mainTF = opts.mainTF || "15m";
+  const tfs = opts.tfs || TF_ORDER;
+
+  // fetch multi-TF candles
+  const mtf = await fetchMultiTF(symbol, tfs);
+
+  // compute per-TF indicators
+  const mtfIndicators = {};
+  const tfSummaries = [];
+  for (const tf of TF_ORDER) {
+    const data = mtf[tf]?.data || [];
+    const ind = computeIndicators(data || []);
+    mtfIndicators[tf] = ind;
   }
 
-  // Refresh
-  if (data.startsWith("refresh_")) {
-    const symbol = data.replace("refresh_", "");
-    const r = await generateReport(symbol);
-    return { text: r.text, keyboard: r.keyboard };
+  // per-TF signal derivation and micro notes
+  for (const tf of UI_TFS) {
+    const data = mtf[tf]?.data || [];
+    const ind = mtfIndicators[tf] || computeIndicators(data || []);
+    const signal = deriveSignal(ind);
+    const signalEmoji = signal === "BUY" ? "🟦" : signal === "SELL" ? "🔴" : "⚪";
+
+    // pattern + conf via Elliott on that TF (light)
+    let pattern = "—", patternConf = 0;
+    try {
+      if (typeof analyzeElliott === "function") {
+        const ell = await analyzeElliott(data || [], { debug:false });
+        if (ell && Array.isArray(ell.patterns) && ell.patterns.length) {
+          pattern = ell.patterns[0].type || "Pattern";
+          patternConf = ell.patterns[0].confidence || 0;
+        }
+      }
+    } catch (e) {}
+
+    const fib = ind?.fib || null;
+    const S = fib ? fmt(fib.lo,2) : "N/A";
+    const R = fib ? fmt(fib.hi,2) : "N/A";
+    const note = (signal === "BUY") ? "Bullish structure on this TF" : (signal === "SELL") ? "Downside pressure" : "Neutral / consolidation";
+
+    tfSummaries.push({
+      tf, signal, signalEmoji, ind,
+      pattern, patternConf, S, R,
+      trendStrength: ind?.priceTrend || "N/A",
+      volRank: Math.round(Math.random() * 100), // quick placeholder; replace with a ranking if you want
+      note
+    });
   }
 
-  // News
-  if (data.startsWith("news_")) {
-    const symbol = data.replace("news_", "");
-    const mapped = symbolMap[symbol] || symbol;
-
-    const n = await fetchNewsBundle(mapped);
-    return {
-      text: `📰 <b>News</b>\nImpact: ${n.impact}\nSentiment: ${n.sentiment}%`,
-      keyboard: kbActions(symbol)
-    };
-  }
-
-  // Elliott detailed
-  if (data.startsWith("ell_")) {
-    const symbol = data.replace("ell_", "");
-    const mapped = symbolMap[symbol] || symbol;
-
-    const { data: cdl } = await resolvePriceAndCandles(mapped, "15m");
-    let ell = null;
-
-    try { ell = await analyzeElliott(cdl.slice(-500)); } catch (e) { ell = null; }
-
-    if (!ell || !ell.patterns?.length) {
-      return { text: "📊 Elliott: N/A", keyboard: kbActions(symbol) };
+  // run Elliott on mainTF with multiTF context
+  let ellResult = null;
+  try {
+    if (typeof analyzeElliott === "function") {
+      ellResult = await analyzeElliott(mtf[mainTF]?.data || [], { multiTF: mtf, debug: false });
     }
+  } catch (e) { ellResult = null; }
 
-    const det = ell.patterns
-      .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-      .slice(0, 5)
-      .map(p => `${p.type || p.name} (${round(p.confidence || 0, 0)}%)`)
-      .join("\n");
+  // run ML prediction (defensive)
+  let mlResult = null;
+  try {
+    mlResult = await runMLPredictFromMLModule(symbol, mainTF, mtf);
+  } catch (e) { mlResult = null; }
 
-    return {
-      text: `📊 <b>Elliott (15m Detailed)</b>\n${det}\nConfidence: ${round(ell.confidence || 0, 0)}%`,
-      keyboard: kbActions(symbol)
-    };
+  // fetch news
+  let newsResult = null;
+  try {
+    if (typeof fetchNewsBundle === "function") {
+      newsResult = await fetchNewsBundle(symbol, { limit: 6, cacheTTL: 60 * 1000, forceRefresh: !!opts.forceNews });
+    }
+  } catch (e) { newsResult = null; }
+
+  // fusion & bias
+  const perTFSignals = {};
+  for (const s of tfSummaries) perTFSignals[s.tf] = s.signal;
+  const fusion = buildFusion({ perTFSignals, mlResult, ellResult, newsResult, mtfIndicators });
+
+  const direction = fusion.bias;
+
+  // build TP suite
+  const ellTargets = ellResult?.targets || [];
+  const price = safe(mtf[mainTF]?.price) || (await fetchPrice(symbol)) || (mtf[mainTF]?.data?.at(-1)?.close ?? 0);
+  const tps = buildTPs({ price, direction, mtfIndicators, ellTargets, fusedProb: fusion.fusionScore });
+
+  // attach sources / confidences for TP (heuristic)
+  tps.tp1Src = (ellTargets && ellTargets[0]) ? (ellTargets[0].source || "Elliott") : "ML/ATR";
+  tps.tp1Conf = Math.min(99, Math.max(25, Math.round(fusion.fusionScore * 100 * 0.9)));
+  tps.tp2Src = (ellTargets && ellTargets[1]) ? (ellTargets[1].source || "Elliott") : "ML/Structure";
+  tps.tp2Conf = Math.min(99, Math.max(20, Math.round(fusion.fusionScore * 100 * 0.75)));
+  tps.hedgeSrc = "ATR-based volatility hedge";
+
+  // volatility quick
+  const atrVals = TF_ORDER.map(tf => safe(mtfIndicators[tf]?.ATR)).filter(v => v > 0);
+  const atrCluster = atrVals.length ? [ fmt(Math.min(...atrVals),2), fmt(Math.max(...atrVals),2) ] : ["N/A","N/A"];
+  const volatility = {
+    regime: atrVals.length ? (mean(atrVals) > Math.max(...atrVals) * 0.6 ? "High" : "Medium") : "Unknown",
+    expansionProb: Math.min(0.95, Math.max(0.05, (fusion.fusionScore || 0.5))),
+    atrCluster
+  };
+
+  // ml summary
+  const mlSummary = {
+    direction: mlResult?.direction || (fusion.bias || "Neutral"),
+    confidence: mlResult?.tpConfidence || mlResult?.confidence || (fusion.fusionScore * 100),
+    features: mlResult?.explanation?.features || (mlResult?.features || {})
+  };
+
+  // news summary
+  const newsSummary = {
+    sentiment: newsResult?.sentiment ?? (ellResult?.sentiment ?? 0.5),
+    impact: newsResult?.impact ?? "Low",
+    headline: (newsResult?.items && newsResult.items[0]) ? (newsResult.items[0].title || newsResult.items[0].desc) : (newsResult?.headline || "")
+  };
+
+  // accuracy / stats (try ML.getStats or ML.calculateAccuracy)
+  let accuracy = null;
+  try {
+    if (typeof ML.getStats === "function") {
+      const s = await ML.getStats();
+      if (s) {
+        const acc = s.accuracy ?? (s.accuracyCache?.accuracy) ?? null;
+        accuracy = { accuracy: acc ?? 0, total: s.total ?? 0, wins: s.wins ?? 0, losses: s.losses ?? 0 };
+      }
+    } else if (typeof ML.calculateAccuracy === "function") {
+      const a = await ML.calculateAccuracy();
+      if (a) accuracy = { accuracy: a.accuracy ?? 0, total: a.total ?? 0, correct: a.correct ?? 0 };
+    }
+  } catch (e) {
+    accuracy = null;
   }
 
-  return { text: "❌ Unknown", keyboard: kbHome };
+  // assemble final result object
+  const result = {
+    generatedAt: new Date().toISOString(),
+    modelVersion: `merge_signal_v15 (elliott:${ELLIOTT_VERSION || "?"})`,
+    symbol,
+    price: fmt(price,2),
+    perTF: tfSummaries,
+    ellResult,
+    mlResult,
+    newsResult,
+    fusion,
+    tps,
+    volatility,
+    mlSummary,
+    newsSummary,
+    accuracy
+  };
+
+  // record prediction if ML module supports it
+  try {
+    const rec = {
+      id: `${symbol}_${mainTF}_${Date.now()}`,
+      symbol, tf: mainTF, result, meta: { fusion, mlResult }
+    };
+    if (ML && typeof ML.recordPrediction === "function") ML.recordPrediction(rec);
+  } catch (e) {}
+
+  // make Telegram UI text
+  const uiText = formatTelegramUI({
+    symbol,
+    price,
+    tfSummaries,
+    fib1h: mtfIndicators["1h"]?.fib || null,
+    fusion,
+    tps,
+    mlSummary,
+    newsSummary,
+    volatility,
+    accuracy
+  });
+
+  return { ok: true, result, uiText };
 }
+
+// default export
+export default { generateMergeSignal };
