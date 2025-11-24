@@ -8,7 +8,7 @@ import axios from "axios";
 import { Telegraf } from "telegraf";
 
 import CONFIG from "./config.js";
-import { generateMergeSignal } from "./merge_signal.js";
+import { generateMergeSignal } from "./merge_signals.js";
 
 // --------------------------------------
 //  INSTANCE LOCK
