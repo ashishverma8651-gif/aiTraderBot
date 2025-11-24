@@ -1,429 +1,390 @@
-// utils.js — UNIVERSAL MULTI-MARKET DATA ENGINE (FINAL VERSION)
-// Works for: Crypto, India/NSE, US Stocks, Forex, Commodities
+// ============================================================================
+// utils.js — FINAL FUTURE-PROOF VERSION (NO CRASH, ALL MARKETS SUPPORTED)
+// Works for: CRYPTO, INDIA (NSE), COMMODITIES, FOREX, US STOCKS
+// ============================================================================
 
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 
-/************************************************************
- * CONSTANTS & SETUP
- ************************************************************/
-const CACHE_DIR =
-  (CONFIG?.PATHS?.CACHE_DIR) || path.resolve("./cache");
-
-if (!fs.existsSync(CACHE_DIR))
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+// ============================================================================
+// BASIC CONSTANTS
+// ============================================================================
+const CACHE_DIR = CONFIG.PATHS?.CACHE_DIR || path.resolve("./cache");
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const TIMEOUT = Number(process.env.AXIOS_TIMEOUT_MS || 12000);
 const RETRIES = Number(CONFIG.FALLBACK?.MAX_RETRIES ?? 3);
-const RETRY_DELAY = Number(CONFIG.FALLBACK?.RETRY_DELAY_MS ?? 400);
+const RETRY_DELAY = Number(CONFIG.FALLBACK?.RETRY_DELAY_MS ?? 500);
 
-const PROXY =
-  CONFIG.PROXY ||
-  process.env.HTTP_PROXY ||
-  process.env.HTTPS_PROXY ||
-  null;
-
-/************************************************************
- * PROXY SUPPORT
- ************************************************************/
-function parseProxy(proxyUrl) {
-  if (!proxyUrl) return null;
+// ============================================================================
+// UNIVERSAL SAFE STRING (Stops ALL undefined crash FOREVER)
+// ============================================================================
+function safeString(x) {
   try {
-    const u = new URL(proxyUrl);
-    const auth = u.username
-      ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) }
-      : undefined;
+    if (x === null || x === undefined) return "";
+    return String(x).trim();
+  } catch {
+    return "";
+  }
+}
 
+// ============================================================================
+// SAFE SYMBOL (no null, no undefined, always UPPERCASE)
+// ============================================================================
+function safeSymbol(raw) {
+  let s = safeString(raw);
+
+  if (!s) s = safeString(CONFIG.ACTIVE_SYMBOL);
+  if (!s) s = safeString(CONFIG.DEFAULT_BY_MARKET?.[CONFIG.ACTIVE_MARKET]);
+  if (!s) s = safeString(CONFIG.DEFAULT_SYMBOL);
+  if (!s) s = "";
+
+  return s.toUpperCase();
+}
+
+// ============================================================================
+// PROXY SETUP
+// ============================================================================
+function parseProxy(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
     return {
       protocol: u.protocol.replace(":", ""),
       host: u.hostname,
-      port: Number(u.port) || 80,
-      auth
+      port: Number(u.port || 80),
+      auth: u.username ? { username: u.username, password: u.password } : undefined
     };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-const PARSED_PROXY = parseProxy(PROXY);
+const PARSED_PROXY = parseProxy(CONFIG.PROXY);
 
 function axiosOptions(timeout = TIMEOUT) {
-  const opts = { timeout };
+  const o = { timeout };
   if (PARSED_PROXY) {
-    opts.proxy = {
+    o.proxy = {
       host: PARSED_PROXY.host,
-      port: PARSED_PROXY.port
+      port: PARSED_PROXY.port,
+      auth: PARSED_PROXY.auth
     };
-    if (PARSED_PROXY.auth)
-      opts.proxy.auth = PARSED_PROXY.auth;
   }
-  return opts;
+  return o;
 }
 
-/************************************************************
- * HELPERS
- ************************************************************/
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ============================================================================
+// HELPERS
+// ============================================================================
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-function safeSymbol(s) {
-  if (!s) return "";
-  return String(s)
-    .replace("NSE:", "")
-    .trim()
-    .toUpperCase();
+function cacheFile(symbol, interval) {
+  symbol = safeString(symbol).replace(/[^A-Za-z0-9_\-]/g, "_");
+  interval = safeString(interval).replace(/[^A-Za-z0-9_\-]/g, "_");
+  return path.join(CACHE_DIR, `${symbol}_${interval}.json`);
 }
 
-function cacheFile(symbol, tf) {
-  const s = safeSymbol(symbol).replace(/[^A-Z0-9]/g, "_");
-  const t = tf.replace(/[^A-Za-z0-9]/g, "_");
-  return path.join(CACHE_DIR, `${s}_${t}.json`);
-}
-
-function readCache(symbol, tf) {
-  const file = cacheFile(symbol, tf);
+function readCache(symbol, interval) {
   try {
-    if (!fs.existsSync(file)) return null;
-    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    return raw;
-  } catch {
-    return null;
-  }
+    const f = cacheFile(symbol, interval);
+    if (!fs.existsSync(f)) return null;
+    return JSON.parse(fs.readFileSync(f, "utf8"));
+  } catch { return null; }
 }
 
-function writeCache(symbol, tf, data) {
+function writeCache(symbol, interval, data) {
   try {
-    fs.writeFileSync(
-      cacheFile(symbol, tf),
-      JSON.stringify({ fetchedAt: Date.now(), data }, null, 2)
-    );
+    fs.writeFileSync(cacheFile(symbol, interval), JSON.stringify({ data, ts: Date.now() }, null, 2));
   } catch {}
 }
 
+// last good price from cache
 function lastGoodPrice(symbol) {
-  symbol = safeSymbol(symbol);
   try {
-    const files = fs.readdirSync(CACHE_DIR).filter((f) =>
-      f.startsWith(symbol + "_")
-    );
-    files.sort(
-      (a, b) =>
-        fs.statSync(path.join(CACHE_DIR, b)).mtimeMs -
-        fs.statSync(path.join(CACHE_DIR, a)).mtimeMs
-    );
+    const s = safeString(symbol).toUpperCase();
+    const files = fs.readdirSync(CACHE_DIR)
+      .filter(f => f.startsWith(s + "_"))
+      .sort((a, b) => fs.statSync(path.join(CACHE_DIR, b)).mtimeMs - fs.statSync(path.join(CACHE_DIR, a)).mtimeMs);
+
     for (const f of files) {
-      try {
-        const raw = JSON.parse(
-          fs.readFileSync(path.join(CACHE_DIR, f), "utf8")
-        );
-        const data = raw?.data;
-        if (Array.isArray(data) && data.length) {
-          const p = Number(data.at(-1).close);
-          if (!isNaN(p)) return p;
-        }
-      } catch {}
+      const d = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, f), "utf8") || "{}");
+      const arr = d.data;
+      if (Array.isArray(arr) && arr.length && Number.isFinite(+arr.at(-1).close))
+        return Number(arr.at(-1).close);
     }
   } catch {}
   return null;
 }
 
-/************************************************************
- * SAFE GET (Retry + Mirrors + Public Proxy Fallbacks)
- ************************************************************/
-async function safeGet(url, mirrors = []) {
-  // primary
+// ============================================================================
+// UNIVERSAL SAFE GET (retries + fallback + proxy)
+// ============================================================================
+async function safeGet(url, mirrors = [], timeout = TIMEOUT) {
+  if (!url) return null;
+
   for (let i = 0; i < RETRIES; i++) {
     try {
-      const r = await axios.get(url, axiosOptions());
+      const r = await axios.get(url, axiosOptions(timeout));
       if (r?.data) return r.data;
     } catch {}
     await sleep(RETRY_DELAY);
   }
 
-  // mirrors
-  for (const m of mirrors) {
-    const rebuilt = m + url.substring(url.indexOf("/", 8));
-    for (let i = 0; i < RETRIES; i++) {
-      try {
-        const r = await axios.get(rebuilt, axiosOptions());
-        if (r?.data) return r.data;
-      } catch {}
-      await sleep(RETRY_DELAY);
-    }
+  // mirror bases
+  for (const base of mirrors) {
+    if (!base) continue;
+    try {
+      const u = new URL(url);
+      const final = base.replace(/\/+$/, "") + u.pathname + u.search;
+
+      for (let i = 0; i < RETRIES; i++) {
+        try {
+          const r = await axios.get(final, axiosOptions(timeout));
+          if (r?.data) return r.data;
+        } catch {}
+        await sleep(RETRY_DELAY);
+      }
+    } catch {}
   }
 
-  // simple external proxy
-  const FALLBACKS = [
+  // external lightweight proxies
+  const wrappers = [
     "https://api.codetabs.com/v1/proxy?quest=",
     "https://api.allorigins.win/raw?url=",
     "https://corsproxy.io/?"
   ];
 
-  for (const p of FALLBACKS) {
-    const final = p + encodeURIComponent(url);
+  for (const w of wrappers) {
     try {
-      const r = await axios.get(final, axiosOptions());
-      if (r?.data) return r.data;
+      const proxied = w + encodeURIComponent(url);
+
+      for (let i = 0; i < RETRIES; i++) {
+        try {
+          const r = await axios.get(proxied, axiosOptions(timeout));
+          if (r?.data) return r.data;
+        } catch {}
+        await sleep(RETRY_DELAY);
+      }
     } catch {}
   }
 
   return null;
 }
 
-/************************************************************
- * NORMALIZERS
- ************************************************************/
+// ============================================================================
+// NORMALIZERS
+// ============================================================================
 function normalizeKline(raw) {
   if (!Array.isArray(raw)) return [];
-  const out = raw.map((k) => ({
+  return raw.map(k => ({
     t: +k[0],
     open: +k[1],
     high: +k[2],
     low: +k[3],
     close: +k[4],
     vol: +k[5]
-  }));
-  out.sort((a, b) => a.t - b.t);
-  return out;
+  })).sort((a, b) => a.t - b.t);
 }
 
-function normalizeYahoo(r) {
+function normalizeYahoo(res) {
   try {
-    const res = r.chart?.result?.[0];
-    if (!res) return [];
+    if (!res?.chart?.result?.[0]) return [];
+    const r = res.chart.result[0];
+    const ts = r.timestamp || [];
+    const q = r.indicators?.quote?.[0] || {};
 
-    const ts = res.timestamp;
-    const qt = res.indicators?.quote?.[0];
     const out = [];
-
     for (let i = 0; i < ts.length; i++) {
-      const close = qt.close[i];
+      const close = q.close?.[i];
       if (!Number.isFinite(close)) continue;
 
       out.push({
         t: ts[i] * 1000,
-        open: qt.open[i] ?? close,
-        high: qt.high[i] ?? close,
-        low: qt.low[i] ?? close,
-        close: close,
-        vol: qt.volume[i] || 0
+        open: q.open?.[i] ?? close,
+        high: q.high?.[i] ?? close,
+        low: q.low?.[i] ?? close,
+        close,
+        vol: q.volume?.[i] ?? 0
       });
     }
-
-    out.sort((a, b) => a.t - b.t);
-    return out;
-  } catch {
-    return [];
-  }
+    return out.sort((a, b) => a.t - b.t);
+  } catch { return []; }
 }
 
-/************************************************************
- * MARKET FETCHERS
- ************************************************************/
-async function fetchCrypto(symbol, tf = "15m", limit = 200) {
-  symbol = safeSymbol(symbol);
-  const cfg = CONFIG.DATA_SOURCES_BY_MARKET.CRYPTO;
-  const base = cfg[0];
+// ============================================================================
+// MARKET FETCHERS
+// ============================================================================
 
-  const url =
-    base +
-    `/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=${limit}`;
+// CRYPTO via Binance
+async function fetchCrypto(symbol, interval = "15m", limit = 200) {
+  const base = CONFIG.DATA_SOURCES_BY_MARKET?.CRYPTO?.[0] || "https://api.binance.com";
+  const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const mirrors = CONFIG.DATA_SOURCES_BY_MARKET?.CRYPTO?.slice(1) || [];
 
-  const mirrors = cfg.slice(1);
-
+  const cache = readCache(symbol, interval);
   const raw = await safeGet(url, mirrors);
-  if (Array.isArray(raw)) {
+
+  if (Array.isArray(raw) && raw.length) {
     const k = normalizeKline(raw);
-    writeCache(symbol, tf, k);
+    writeCache(symbol, interval, k);
     return k;
   }
-
-  return readCache(symbol, tf)?.data || [];
+  return cache?.data || [];
 }
 
-async function fetchYahooGeneric(symbol, tf = "15m") {
-  const map = {
-    "1m": { interval: "1m", range: "1d" },
-    "5m": { interval: "5m", range: "5d" },
-    "15m": { interval: "15m", range: "5d" },
-    "30m": { interval: "30m", range: "1mo" },
-    "1h": { interval: "60m", range: "1mo" },
-    "4h": { interval: "240m", range: "3mo" },
-    "1d": { interval: "1d", range: "6mo" }
-  }[tf] || { interval: "15m", range: "5d" };
+// NSE / BSE / COMMODITIES via Yahoo
+async function fetchYahooMarket(symbol, interval = "15m") {
+  const mapTF = {
+    "1m": ["1m", "1d"],
+    "5m": ["5m", "5d"],
+    "15m": ["15m", "5d"],
+    "30m": ["30m", "1mo"],
+    "1h": ["60m", "1mo"],
+    "4h": ["240m", "3mo"],
+    "1d": ["1d", "6mo"]
+  };
+  const [intv, range] = mapTF[interval] || ["15m", "5d"];
 
-  const sources =
-    CONFIG.DATA_SOURCES_BY_MARKET.US_STOCKS; // Yahoo same for all
+  const base = CONFIG.DATA_SOURCES_BY_MARKET?.YAHOO?.[0] ||
+               "https://query1.finance.yahoo.com/v8/finance/chart";
 
-  const base = sources[0];
-  const url =
-    `${base}/${encodeURIComponent(symbol)}?interval=${map.interval}&range=${map.range}`;
+  const url = `${base}/${symbol}?interval=${intv}&range=${range}`;
+  const mirrors = CONFIG.DATA_SOURCES_BY_MARKET?.YAHOO?.slice(1) || [];
 
-  const raw = await safeGet(url, sources.slice(1));
-  if (raw) {
-    const k = normalizeYahoo(raw);
+  const cache = readCache(symbol, interval);
+  const res = await safeGet(url, mirrors);
+
+  if (res) {
+    const k = normalizeYahoo(res);
     if (k.length) {
-      writeCache(symbol, tf, k);
+      writeCache(symbol, interval, k);
       return k;
     }
   }
 
-  return readCache(symbol, tf)?.data || [];
+  return cache?.data || [];
 }
 
-async function fetchNSE(symbol, tf = "15m") {
-  symbol = safeSymbol(symbol).replace("NSE:", "");
+// ============================================================================
+// MASTER PRICE SAFE
+// ============================================================================
+export async function fetchPrice(rawSymbol) {
+  const symbol = safeSymbol(rawSymbol);
 
-  const tries = [
-    symbol,
-    symbol + ".NS",
-    "^" + symbol
-  ];
-
-  for (const t of tries) {
-    const d = await fetchYahooGeneric(t, tf);
-    if (d.length) return d;
-  }
-
-  return readCache(symbol, tf)?.data || [];
-}
-
-/************************************************************
- * MASTER PRICE (Yahoo → Binance → Cache)
- ************************************************************/
-export async function fetchPrice(symbol) {
-  symbol = safeSymbol(symbol);
   if (!symbol) return null;
 
-  // Yahoo 1m
-  const y = await fetchYahooGeneric(symbol, "1m");
-  if (y.length) return +y.at(-1).close;
+  try {
+    // Yahoo
+    const y = await fetchYahooMarket(symbol, "1m");
+    if (y?.length) return Number(y.at(-1).close);
+  } catch {}
 
-  // Crypto
-  if (/USDT$|BTC$/i.test(symbol)) {
-    const c = await fetchCrypto(symbol, "1m", 1);
-    if (c.length) return +c.at(-1).close;
+  // Crypto fallback
+  if (symbol.endsWith("USDT") || symbol.endsWith("BTC")) {
+    try {
+      const b = await fetchCrypto(symbol, "1m");
+      if (b?.length) return Number(b.at(-1).close);
+    } catch {}
   }
 
-  // NSE
-  const n = await fetchNSE(symbol, "1m");
-  if (n.length) return +n.at(-1).close;
-
+  // Cached
   return lastGoodPrice(symbol);
 }
 
-/************************************************************
- * UNIVERSAL FETCHER
- ************************************************************/
-export async function fetchUniversal(symbol, tf = "15m") {
-  symbol = safeSymbol(symbol);
+// ============================================================================
+// UNIVERSAL MARKET ROUTER
+// ============================================================================
+export async function fetchUniversal(inputSymbol, interval = "15m") {
+  const symbol = safeSymbol(inputSymbol);
   if (!symbol) return { data: [], price: null };
 
-  const market = CONFIG.ACTIVE_MARKET?.toUpperCase() || "AUTO";
-  const isCrypto = /USDT$|BTC$/i.test(symbol);
-  const isCom = CONFIG.SYMBOLS.COMMODITIES.includes(symbol);
+  const s = symbol;
 
-  // Forced market
-  if (market === "CRYPTO" || isCrypto)
-    return {
-      data: await fetchCrypto(symbol, tf),
-      price: await fetchPrice(symbol)
-    };
+  const isCrypto = s.endsWith("USDT") || s.endsWith("BTC");
+  const isIndia = CONFIG.SYMBOLS?.INDIA?.includes(s);
+  const isCommodity = CONFIG.SYMBOLS?.COMMODITIES?.includes(s);
 
-  if (market === "INDIA")
-    return {
-      data: await fetchNSE(symbol, tf),
-      price: await fetchPrice(symbol)
-    };
-
-  if (market === "COMMODITIES" || isCom)
-    return {
-      data: await fetchYahooGeneric(symbol, tf),
-      price: await fetchPrice(symbol)
-    };
-
-  // AUTO MODE — Detect
+  // CRYPTO
   if (isCrypto) {
-    return {
-      data: await fetchCrypto(symbol, tf),
-      price: await fetchPrice(symbol)
-    };
+    const d = await fetchCrypto(s, interval);
+    return { data: d, price: d?.at(-1)?.close || (await fetchPrice(s)) || null };
   }
 
-  if (symbol.endsWith(".NS") || CONFIG.SYMBOLS.INDIA.includes(symbol)) {
-    return {
-      data: await fetchNSE(symbol, tf),
-      price: await fetchPrice(symbol)
-    };
+  // INDIA / NSE
+  if (isIndia) {
+    const d = await fetchYahooMarket(s, interval);
+    return { data: d, price: d?.at(-1)?.close || (await fetchPrice(s)) };
   }
 
-  // Default: Yahoo (US / Forex / Commodities)
-  return {
-    data: await fetchYahooGeneric(symbol, tf),
-    price: await fetchPrice(symbol)
-  };
+  // COMMODITIES (Gold, Silver, Crude)
+  if (isCommodity) {
+    const d = await fetchYahooMarket(s, interval);
+    return { data: d, price: d?.at(-1)?.close || (await fetchPrice(s)) };
+  }
+
+  // fallback: forex/us stocks via yahoo
+  const d = await fetchYahooMarket(s, interval);
+  return { data: d, price: d?.at(-1)?.close || (await fetchPrice(s)) };
 }
 
-/************************************************************
- * Multi-TF Fetcher
- ************************************************************/
-function pLimit(max = 2) {
-  let active = 0;
+// ============================================================================
+// Multi-TF fetch (Thread-safe)
+// ============================================================================
+function pLimit(concurrency = 2) {
   const queue = [];
+  let active = 0;
 
   const next = () => {
-    if (active >= max || queue.length === 0) return;
-
-    const { fn, resolve, reject } = queue.shift();
+    if (!queue.length || active >= concurrency) return;
     active++;
-
+    const { fn, resolve, reject } = queue.shift();
     Promise.resolve(fn())
-      .then((res) => {
-        active--;
-        resolve(res);
-        next();
-      })
-      .catch((err) => {
-        active--;
-        reject(err);
-        next();
-      });
+      .then(v => { active--; resolve(v); next(); })
+      .catch(e => { active--; reject(e); next(); });
   };
 
-  return (fn) =>
-    new Promise((resolve, reject) => {
-      queue.push({ fn, resolve, reject });
-      next();
-    });
+  return fn => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    next();
+  });
 }
 
 export async function fetchMultiTF(symbol, tfs = ["5m", "15m", "1h"]) {
+  const s = safeSymbol(symbol);
   const out = {};
   const limit = pLimit(2);
-
-  await Promise.all(
-    tfs.map((tf) =>
-      limit(async () => {
-        await sleep(50 + Math.random() * 100);
-        out[tf] = await fetchUniversal(symbol, tf);
-      })
-    )
+  const tasks = tfs.map(tf =>
+    limit(async () => {
+      out[tf] = await fetchUniversal(s, tf);
+    })
   );
-
+  await Promise.all(tasks);
   return out;
 }
 
-/************************************************************
- * Legacy Compatible fetchMarketData()
- ************************************************************/
-export async function fetchMarketData(symbol, tf = "15m", limit = 200) {
-  const d = await fetchCrypto(symbol, tf, limit);
-  const p = await fetchPrice(symbol);
+// ============================================================================
+// Legacy API
+// ============================================================================
+export async function fetchMarketData(symbol, interval = "15m", limit = 200) {
+  const s = safeSymbol(symbol);
+  const d = await fetchCrypto(s, interval, limit);
+  const price = d?.at(-1)?.close || (await fetchPrice(s)) || null;
 
   return {
     data: d,
-    price: p,
+    price,
     updated: new Date().toISOString()
   };
 }
+
+// ============================================================================
+// EXPORT
+// ============================================================================
+export default {
+  safeSymbol,
+  fetchUniversal,
+  fetchPrice,
+  fetchMarketData,
+  fetchMultiTF
+};
