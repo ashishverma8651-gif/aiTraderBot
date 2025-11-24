@@ -406,7 +406,18 @@ async function fetchExchangeRate(symbol) {
     const b = s.slice(0,3), q = s.slice(3,6);
     const url = `${base}/latest?base=${encodeURIComponent(b)}&symbols=${encodeURIComponent(q)}`;
     const raw = await safeGet(url, { responseType: "json" });
-    const rate = raw?.rates?.[q] ?? raw?.rates && Object.values(raw.rates)[0];
+
+
+    let rate = null;
+
+if (raw?.rates?.[q]) {
+    rate = raw.rates[q];
+} else if (raw?.rates) {
+    const first = Object.values(raw.rates)[0];
+    rate = first || null;
+}
+
+
     if (isFiniteNum(rate)) {
       const now = Date.now();
       const candle = [{ t: now - 60000, open: rate, high: rate, low: rate, close: rate, vol: 0 }];
