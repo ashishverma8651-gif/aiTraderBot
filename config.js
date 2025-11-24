@@ -1,6 +1,6 @@
 // ===============================
-//  AI Trader - Multi-Market Config
-//  Lightweight REST + Multi-Source Fallback
+//  AI Trader - Multi-Market Config (FINAL FIXED)
+//  Supports: Crypto / India / Forex / US Stocks / Commodities
 // ===============================
 
 import fs from "fs";
@@ -17,24 +17,55 @@ export const CONFIG = {
   // ---------------------------------
   // MARKET SELECTION
   // ---------------------------------
-  ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO", // CRYPTO / INDIA / FOREX / US_STOCKS
-  ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT", // Market-wise overridden
+  ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO", 
+  ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT",
 
   // ---------------------------------
-  // MULTI-MARKET SYMBOL SETS
+  // CORRECTED MULTI-MARKET SYMBOL SETS
   // ---------------------------------
   SYMBOLS: {
     CRYPTO: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"],
-    INDIA: ["NIFTY50", "BANKNIFTY", "FINNIFTY", "SENSEX", "RELIANCE", "TCS"],
-    FOREX: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"],
-    US_STOCKS: ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"]
+
+    // 🔥 FIXED — Yahoo requires correct mapped symbols
+    INDIA: {
+      NIFTY50: "^NSEI",
+      BANKNIFTY: "^NSEBANK",
+      FINNIFTY: "^CNXFIN",
+      SENSEX: "^BSESN",
+      RELIANCE: "RELIANCE.NS",
+      TCS: "TCS.NS"
+    },
+
+    FOREX: {
+      EURUSD: "EURUSD=X",
+      GBPUSD: "GBPUSD=X",
+      USDJPY: "JPY=X",
+      AUDUSD: "AUDUSD=X"
+    },
+
+    US_STOCKS: {
+      AAPL: "AAPL",
+      TSLA: "TSLA",
+      NVDA: "NVDA",
+      MSFT: "MSFT",
+      AMZN: "AMZN"
+    },
+
+    // 🔥 Added COMMODITIES
+    COMMODITIES: {
+      GOLD: "GC=F",
+      SILVER: "SI=F",
+      CRUDEOIL: "CL=F",
+      NATGAS: "NG=F"
+    }
   },
 
   DEFAULT_BY_MARKET: {
     CRYPTO: "BTCUSDT",
     INDIA: "NIFTY50",
     FOREX: "EURUSD",
-    US_STOCKS: "AAPL"
+    US_STOCKS: "AAPL",
+    COMMODITIES: "GOLD"
   },
 
   // ---------------------------------
@@ -49,19 +80,19 @@ export const CONFIG = {
   REPORT_INTERVAL_MS: Number(process.env.REPORT_INTERVAL_MS || 15 * 60 * 1000),
 
   // =====================================================
-  // MULTI-SOURCE FALLBACK PRICE FETCHING (NO WS)
+  // MULTI-SOURCE FETCHERS (Correct Priority)
   // =====================================================
   DATA_SOURCES_BY_MARKET: {
     CRYPTO: [
-      "https://data-api.binance.vision",
       "https://api.binance.com",
+      "https://data-api.binance.vision",
       "https://api1.binance.com",
       "https://api2.binance.com"
     ],
 
     INDIA: [
-      "https://www.nseindia.com/api",
-      "https://query1.finance.yahoo.com/v8/finance/chart"
+      "https://query1.finance.yahoo.com/v8/finance/chart",
+      "https://query2.finance.yahoo.com/v8/finance/chart"
     ],
 
     FOREX: [
@@ -71,12 +102,16 @@ export const CONFIG = {
 
     US_STOCKS: [
       "https://query1.finance.yahoo.com/v8/finance/chart",
-      "https://api.financialmodelingprep.com/api/v3"
+      "https://financialmodelingprep.com/api/v3"
+    ],
+
+    COMMODITIES: [
+      "https://query1.finance.yahoo.com/v8/finance/chart"
     ]
   },
 
   // ---------------------------------
-  // NSE SPECIAL HEADERS
+  // NSE HEADERS (if used later)
   // ---------------------------------
   NSE_HEADERS: {
     "User-Agent": "Mozilla/5.0",
@@ -85,7 +120,7 @@ export const CONFIG = {
   },
 
   // ---------------------------------
-  // PROXY SUPPORT (Auto)
+  // PROXY SUPPORT
   // ---------------------------------
   PROXY:
     process.env.HTTP_PROXY ||
@@ -106,14 +141,14 @@ export const CONFIG = {
   // FALLBACK SETTINGS
   // =====================================================
   FALLBACK: {
-    MAX_RETRIES: 4,             // 4 retries per source
-    RETRY_DELAY_MS: 500,        // 0.5s delay between tries
+    MAX_RETRIES: 4,
+    RETRY_DELAY_MS: 500,
     SWITCH_SOURCE_AFTER_FAIL: true,
-    SWITCH_MARKET_IF_ALL_FAIL: false // rare but optional
+    SWITCH_MARKET_IF_ALL_FAIL: false
   },
 
   // =====================================================
-  // KEEP-ALIVE PING FOR RENDER
+  // Keep Alive
   // =====================================================
   SELF_PING_URL: process.env.SELF_PING_URL || null,
 
