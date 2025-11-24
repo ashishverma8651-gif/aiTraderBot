@@ -167,7 +167,10 @@ function formatTelegramUI({ symbol, price, tfSummaries, fib1h, fusion, tps, mlSu
  *   - tfs (array) optional
  *   - forceNews / forceElliott
  */
-export async function generateMergeSignal(symbol = (CONFIG.DEFAULT_BY_MARKET?.CRYPTO || "BTCUSDT"), opts = {}) {
+
+export async function generateMergeSignal(symbol = CONFIG.ACTIVE_SYMBOL, opts = {})
+
+{
   symbol = String(symbol).toUpperCase();
   const mainTF = opts.mainTF || "15m";
   const tfs = opts.tfs || TF_ORDER;
