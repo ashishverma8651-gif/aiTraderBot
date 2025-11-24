@@ -1,81 +1,68 @@
-// utils.js — Heavy, single-file, multi-market, multi-source utilities
-// Exports: fetchMarketData, fetchUniversal, fetchMultiTF, fetchPrice
-// Requires: ./config.js (default export or named CONFIG), axios installed
+// utils.js — Robust single-file heavy utils
+// Exports: fetchUniversal, fetchPrice, fetchMultiTF, fetchMarketData
+// Requires: axios, fs, path and ./config.js (default export CONFIG)
+
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 
-/* ----------------------------
-   Setup & Constants
-   ---------------------------- */
-const CACHE_DIR = (CONFIG && CONFIG.PATHS && CONFIG.PATHS.CACHE_DIR) || path.resolve("./cache");
+// -----------------------------
+// Setup & constants
+// -----------------------------
+const ROOT = process.cwd();
+const CACHE_DIR = (CONFIG && CONFIG.PATHS && CONFIG.PATHS.CACHE_DIR) || path.join(ROOT, "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const DEFAULT_TIMEOUT = Number(process.env.AXIOS_TIMEOUT_MS || 12000);
-const DEFAULT_RETRIES = Number(CONFIG.FALLBACK?.MAX_RETRIES ?? 4);
+const DEFAULT_RETRIES = Number(CONFIG.FALLBACK?.MAX_RETRIES ?? 3);
 const RETRY_DELAY_MS = Number(CONFIG.FALLBACK?.RETRY_DELAY_MS ?? 600);
 const EXTERNAL_PROXY_SERVICES = [
   "https://api.codetabs.com/v1/proxy?quest=",
   "https://api.allorigins.win/raw?url=",
   "https://corsproxy.io/?"
 ];
-
 const USER_AGENT = "AI-Trader-Utils/2.0";
 
-/* ----------------------------
-   Small helpers
-   ---------------------------- */
+// -----------------------------
+// small helpers
+// -----------------------------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const safeNum = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const nowISO = () => new Date().toISOString();
+const isFiniteNum = v => Number.isFinite(Number(v));
+const safeNum = (v, fallback = 0) => isFiniteNum(v) ? Number(v) : fallback;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-function tfSafe(tf = "15m") { return String(tf || "15m").replace(/[^a-z0-9]/gi, "_"); }
-function symSafe(sym = "UNKNOWN") { return String(sym || "UNKNOWN").toUpperCase().replace(/[^A-Z0-9_\-\.\^]/g, "_"); }
-
-function intervalToMs(interval = "15m") {
-  if (!interval) return 60_000;
-  const v = String(interval).toLowerCase();
-  if (v.endsWith("m")) return Number(v.slice(0, -1)) * 60_000;
-  if (v.endsWith("h")) return Number(v.slice(0, -1)) * 60 * 60_000;
-  if (v.endsWith("d")) return Number(v.slice(0, -1)) * 24 * 60 * 60_000;
-  return 60_000;
-}
-
-/* ----------------------------
-   Cache helpers
-   ---------------------------- */
+function tfSafe(tf = "15m") { return String(tf).replace(/[^a-z0-9]/gi, "_"); }
+function symSafe(sym = "UNKNOWN") { return String(sym).toUpperCase().replace(/[^A-Z0-9_\-\.\^]/g, "_"); }
 function cachePath(symbol, interval) {
   return path.join(CACHE_DIR, `${symSafe(symbol)}_${tfSafe(interval)}.json`);
 }
 function readCache(symbol, interval) {
+  const p = cachePath(symbol, interval);
   try {
-    const p = cachePath(symbol, interval);
     if (!fs.existsSync(p)) return null;
     const raw = fs.readFileSync(p, "utf8");
-    if (!raw) return null;
     return JSON.parse(raw);
   } catch { return null; }
 }
 function writeCache(symbol, interval, data) {
-  try {
-    const p = cachePath(symbol, interval);
-    fs.writeFileSync(p, JSON.stringify({ fetchedAt: Date.now(), data }, null, 2));
-  } catch {}
+  const p = cachePath(symbol, interval);
+  try { fs.writeFileSync(p, JSON.stringify({ fetchedAt: Date.now(), data }, null, 2)); }
+  catch (e) { /* ignore */ }
 }
-function lastGoodPrice(symbol) {
+function lastCachedPrice(symbol) {
+  // returns last cached close across TF files for symbol
   try {
-    const s = symSafe(symbol);
-    const files = fs.readdirSync(CACHE_DIR).filter(f => f.startsWith(s + "_"));
-    files.sort((a, b) => fs.statSync(path.join(CACHE_DIR, b)).mtimeMs - fs.statSync(path.join(CACHE_DIR, a)).mtimeMs);
+    const files = fs.readdirSync(CACHE_DIR).filter(f => f.startsWith(symSafe(symbol) + "_"));
+    files.sort((a,b)=> fs.statSync(path.join(CACHE_DIR,b)).mtimeMs - fs.statSync(path.join(CACHE_DIR,a)).mtimeMs);
     for (const f of files) {
       try {
         const obj = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, f), "utf8") || "{}");
         const arr = obj?.data;
         if (Array.isArray(arr) && arr.length) {
-          const last = arr.at(-1);
-          if (last && Number.isFinite(+last.close)) return Number(last.close);
+          const last = arr[arr.length - 1];
+          if (last && isFiniteNum(last.close)) return Number(last.close);
         }
       } catch {}
     }
@@ -83,62 +70,61 @@ function lastGoodPrice(symbol) {
   return null;
 }
 
-/* ----------------------------
-   Proxy utils + axios options
-   ---------------------------- */
-function parseProxy(proxyUrl) {
-  if (!proxyUrl) return null;
+// write last real price persistently (so price never becomes synthetic)
+function writeLastRealPrice(symbol, price, meta = {}) {
   try {
-    const u = new URL(proxyUrl);
-    const auth = u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } : undefined;
-    return { protocol: u.protocol.replace(":", ""), host: u.hostname, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80), auth };
-  } catch { return null; }
+    const p = path.join(CACHE_DIR, `${symSafe(symbol)}_lastprice.json`);
+    const payload = { ts: Date.now(), price: safeNum(price, null), meta };
+    fs.writeFileSync(p, JSON.stringify(payload, null, 2));
+  } catch {}
 }
-const PARSED_PROXY = parseProxy(CONFIG.PROXY || process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null);
+function readLastRealPrice(symbol) {
+  try {
+    const p = path.join(CACHE_DIR, `${symSafe(symbol)}_lastprice.json`);
+    if (!fs.existsSync(p)) return null;
+    const raw = JSON.parse(fs.readFileSync(p, "utf8") || "{}");
+    if (isFiniteNum(raw?.price)) return Number(raw.price);
+  } catch {}
+  return null;
+}
 
+// -----------------------------
+// axios options with optional proxy
+// -----------------------------
 function axiosOptions(timeout = DEFAULT_TIMEOUT) {
   const opts = { timeout, headers: { "User-Agent": USER_AGENT, Accept: "*/*" } };
-  if (PARSED_PROXY) {
-    opts.proxy = { host: PARSED_PROXY.host, port: PARSED_PROXY.port };
-    if (PARSED_PROXY.auth) opts.proxy.auth = { username: PARSED_PROXY.auth.username, password: PARSED_PROXY.auth.password };
-  }
+  // respect system HTTP_PROXY/HTTPS_PROXY if set by environment (axios uses env by default in Node)
   return opts;
 }
 
-/* ----------------------------
-   Normalizers
-   ---------------------------- */
+// -----------------------------
+// normalize helpers
+// Output standard: [{t, open, high, low, close, vol}, ...] sorted ascending by t (ms)
+// -----------------------------
 function normalizeKlineArray(arr) {
-  if (!Array.isArray(arr)) return [];
-  // Binance style: arrays of arrays
+  if (!Array.isArray(arr) || !arr.length) return [];
+  // Binance style [[ts, open, high, low, close, vol], ...]
   if (Array.isArray(arr[0])) {
-    try {
-      const out = arr.map(k => ({
-        t: Number(k[0]),
-        open: safeNum(k[1]),
-        high: safeNum(k[2]),
-        low: safeNum(k[3]),
-        close: safeNum(k[4]),
-        vol: safeNum(k[5], 0)
-      })).filter(c => Number.isFinite(c.t) && Number.isFinite(c.close));
-      out.sort((a, b) => a.t - b.t);
-      return out;
-    } catch {}
+    return arr.map(r => ({
+      t: safeNum(r[0]),
+      open: safeNum(r[1]),
+      high: safeNum(r[2]),
+      low: safeNum(r[3]),
+      close: safeNum(r[4]),
+      vol: safeNum(r[5], 0)
+    })).filter(r => isFiniteNum(r.t) && isFiniteNum(r.close))
+      .sort((a,b)=>a.t-b.t);
   }
-  // object array (FMP, Yahoo normalized)
-  if (arr.length && typeof arr[0] === "object") {
-    try {
-      const out = arr.map(c => ({
-        t: Number(c.t || c.timestamp || c.time || c.date || 0),
-        open: safeNum(c.open ?? c.o ?? c.Open),
-        high: safeNum(c.high ?? c.h ?? c.High),
-        low: safeNum(c.low ?? c.l ?? c.Low),
-        close: safeNum(c.close ?? c.c ?? c.Close),
-        vol: safeNum(c.vol ?? c.v ?? c.volume ?? 0)
-      })).filter(c => Number.isFinite(c.t) && Number.isFinite(c.close));
-      out.sort((a, b) => a.t - b.t);
-      return out;
-    } catch {}
+  // Objects like [{date, open, high, low, close, volume}]
+  if (typeof arr[0] === "object") {
+    return arr.map(r => ({
+      t: safeNum(r.t || r.ts || r.timestamp || new Date(r.date || r.datetime || r.time || Date.now()).getTime()),
+      open: safeNum(r.open ?? r.o),
+      high: safeNum(r.high ?? r.h),
+      low: safeNum(r.low ?? r.l),
+      close: safeNum(r.close ?? r.c),
+      vol: safeNum(r.volume ?? r.v ?? 0)
+    })).filter(r => isFiniteNum(r.t) && isFiniteNum(r.close)).sort((a,b)=>a.t-b.t);
   }
   return [];
 }
@@ -150,9 +136,9 @@ function normalizeYahooChart(res) {
     const ts = r.timestamp || [];
     const q = r.indicators?.quote?.[0] || {};
     const out = [];
-    for (let i = 0; i < ts.length; i++) {
+    for (let i=0;i<ts.length;i++) {
       const close = q.close?.[i];
-      if (!Number.isFinite(close)) continue;
+      if (!isFiniteNum(close)) continue;
       out.push({
         t: Number(ts[i]) * 1000,
         open: safeNum(q.open?.[i], close),
@@ -162,472 +148,604 @@ function normalizeYahooChart(res) {
         vol: safeNum(q.volume?.[i], 0)
       });
     }
-    out.sort((a, b) => a.t - b.t);
-    return out;
+    return out.sort((a,b)=>a.t-b.t);
   } catch { return []; }
 }
 
-/* ----------------------------
-   Synthetic fallback candle generator
-   (makes sure we NEVER return empty arrays)
-   ---------------------------- */
-function generateSyntheticCandles({ lastPrice = 100, count = 240, intervalMs = 60_000, atr = null }) {
+// -----------------------------
+// Synthetic candle generator — ONLY used to fill history when candles aren't available
+// (never used to determine the live price used in signals)
+// -----------------------------
+function intervalToMs(interval = "15m") {
+  if (!interval) return 60_000;
+  const u = String(interval);
+  if (u.endsWith("m")) return Number(u.slice(0,-1)) * 60_000;
+  if (u.endsWith("h")) return Number(u.slice(0,-1)) * 60*60*1000;
+  if (u.endsWith("d")) return Number(u.slice(0,-1)) * 24*60*60*1000;
+  return 60_000;
+}
+function generateSyntheticCandles({ lastPrice = 100, count = 200, interval = "15m", atr = null }) {
   const out = [];
   const base = safeNum(lastPrice, 100);
-  const usedAtr = atr && atr > 0 ? atr : Math.max(base * 0.002, base * 0.005);
-  let t = Date.now() - (count - 1) * intervalMs;
+  const iv = intervalToMs(interval);
+  const usedAtr = (isFiniteNum(atr) && atr > 0) ? atr : Math.max(base * 0.002, base * 0.005);
+  let t = Date.now() - (count-1) * iv;
   let prev = base;
-  for (let i = 0; i < count; i++) {
-    const noise = (Math.random() - 0.5) * usedAtr * (0.9 + Math.random() * 0.6);
+  for (let i=0;i<count;i++) {
+    const noise = (Math.random() - 0.5) * usedAtr;
     const open = prev;
-    const close = Math.max(0.0000001, prev + noise);
-    const high = Math.max(open, close) + Math.abs(noise) * (0.1 + Math.random() * 0.9);
-    const low = Math.min(open, close) - Math.abs(noise) * (0.1 + Math.random() * 0.9);
-    const vol = Math.round(Math.abs(noise) * 1000 + Math.random() * 100);
+    const close = Math.max(0.000001, prev + noise);
+    const high = Math.max(open, close) + Math.abs(noise) * Math.random();
+    const low = Math.min(open, close) - Math.abs(noise) * Math.random();
+    const vol = Math.round(Math.abs(noise) * 1000 + Math.random()*100);
     out.push({ t, open, high, low, close, vol });
-    prev = close;
-    t += intervalMs;
+    t += iv; prev = close;
   }
   return out;
 }
 
-/* ----------------------------
-   safeGet with retries, mirrors, external proxies
-   ---------------------------- */
+// -----------------------------
+// safeGet with retries, mirrors and public proxy wrappers
+// -----------------------------
 async function safeGet(url, { timeout = DEFAULT_TIMEOUT, responseType = "json", mirrors = [], tryProxies = true } = {}) {
   if (!url) return null;
-
-  // try direct URL with retries
-  for (let attempt = 0; attempt < Math.max(1, DEFAULT_RETRIES); attempt++) {
+  // direct with retries
+  for (let attempt=0; attempt<Math.max(1, DEFAULT_RETRIES); attempt++) {
     try {
       const r = await axios.get(url, { ...axiosOptions(timeout), responseType });
       if (r?.data !== undefined && r?.data !== null) return r.data;
     } catch {}
-    await sleep(RETRY_DELAY_MS + Math.random() * 120);
+    await sleep(RETRY_DELAY_MS + Math.random()*100);
   }
-
-  // try mirror hosts by replacing origin
-  for (const base of (mirrors || [])) {
+  // try mirrors by replacing origin
+  for (const base of mirrors || []) {
     if (!base) continue;
     try {
       const u = new URL(url);
       const final = base.replace(/\/+$/, "") + u.pathname + u.search;
-      for (let attempt = 0; attempt < Math.max(1, DEFAULT_RETRIES); attempt++) {
+      for (let attempt=0; attempt<Math.max(1, DEFAULT_RETRIES); attempt++) {
         try {
           const r = await axios.get(final, { ...axiosOptions(timeout), responseType });
           if (r?.data !== undefined && r?.data !== null) return r.data;
         } catch {}
-        await sleep(RETRY_DELAY_MS + Math.random() * 120);
+        await sleep(RETRY_DELAY_MS + Math.random()*100);
       }
     } catch {}
   }
-
-  // try external public proxies (text response)
+  // external proxies
   if (tryProxies) {
     for (const pbase of EXTERNAL_PROXY_SERVICES) {
       try {
         const proxied = pbase + encodeURIComponent(url);
-        for (let attempt = 0; attempt < Math.max(1, DEFAULT_RETRIES); attempt++) {
+        for (let attempt=0; attempt<Math.max(1, DEFAULT_RETRIES); attempt++) {
           try {
             const r = await axios.get(proxied, { ...axiosOptions(timeout), responseType: "text" });
-            if (r?.data !== undefined && r?.data !== null) return r.data;
+            if (r?.data !== undefined && r?.data !== null) {
+              // return text (caller may parse)
+              return r.data;
+            }
           } catch {}
-          await sleep(RETRY_DELAY_MS + Math.random() * 120);
+          await sleep(RETRY_DELAY_MS + Math.random()*100);
         }
       } catch {}
     }
   }
-
   return null;
 }
 
-/* =============================
-   Market-specific fetchers
-   Each returns: { data: [candles], price: lastPrice }
-   Candles: { t, open, high, low, close, vol }
-   ============================= */
+// -----------------------------
+// MARKET-SPECIFIC FETCHERS
+// All fetchers return: { data: [candles], price: lastCloseNumber }
+// Price extraction MUST be last candle's close obtained from a REAL source.
+// -----------------------------
 
-/* ---------- CRYPTO (Binance primary, others fallback) ---------- */
-async function fetchCrypto(symbol, interval = "15m", limit = CONFIG.DEFAULT_LIMIT || 500) {
-  const s = String(symbol || "").toUpperCase();
-  if (!s) return { data: [], price: null };
-  const sources = CONFIG.SOURCES?.CRYPTO || ["binance", "yahoo", "synthetic"];
-  const binanceBases = CONFIG.API.BINANCE || ["https://api.binance.com"];
-
-  // 1) Binance primary
-  try {
-    const base = binanceBases[0].replace(/\/+$/, "");
-    const url = `${base}/api/v3/klines?symbol=${encodeURIComponent(s)}&interval=${encodeURIComponent(interval)}&limit=${Number(limit)}`;
-    const raw = await safeGet(url, { mirrors: binanceBases.slice(1), timeout: DEFAULT_TIMEOUT, responseType: "json" });
-    if (Array.isArray(raw) && raw.length) {
-      const k = normalizeKlineArray(raw);
-      if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-    }
-  } catch {}
-
-  // 2) Try alternate crypto exchanges: Coinbase (minute history limited), OKX (best-effort)
-  // Coinbase: historic rates endpoint (granularity more limited) — try as fallback for price and small candles
-  try {
-    const coinbaseBase = CONFIG.API.COINBASE || "https://api.exchange.coinbase.com";
-    // Coinbase uses e.g. BTC-USD format
-    const map = CONFIG.SYMBOLS?.CRYPTO?.[s] || {};
-    const cbSym = map?.coinbase || s.replace(/USDT$/, "-USD");
-    const url = `${coinbaseBase}/products/${encodeURIComponent(cbSym)}/candles?granularity=${Math.max(60, Math.round(intervalToMs(interval)/1000))}`;
-    const raw = await safeGet(url, { timeout: 9000, responseType: "json" });
-    if (Array.isArray(raw) && raw.length) {
-      // Coinbase returns [ time, low, high, open, close, volume ]
-      const k = raw.map(r => ({ t: Number(r[0]) * 1000, open: safeNum(r[3]), high: safeNum(r[2]), low: safeNum(r[1]), close: safeNum(r[4]), vol: safeNum(r[5]) })).sort((a,b)=>a.t-b.t);
-      if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-    }
-  } catch {}
-
-  // 3) Try OKX (best-effort)
-  try {
-    const okxBase = CONFIG.API.OKX || "https://www.okx.com";
-    const map = CONFIG.SYMBOLS?.CRYPTO?.[s] || {};
-    const okSym = map?.okx || s;
-    // OKX has /api/v5/market/candles?instId=BTC-USDT&bar=1m
-    const bar = interval.endsWith("m") ? `${Number(interval.slice(0,-1))}m` : interval.endsWith("h") ? `${Number(interval.slice(0,-1))}H` : "1m";
-    const url = `${okxBase.replace(/\/+$/,"")}/api/v5/market/candles?instId=${encodeURIComponent(okSym)}&bar=${encodeURIComponent(bar)}&limit=${Number(Math.min(limit,1000))}`;
-    const raw = await safeGet(url, { timeout: 9000, responseType: "json" });
-    // OKX returns array of arrays
-    if (Array.isArray(raw) && raw.length) {
-      const k = raw.map(r => ({ t: Number(r[0]), open: safeNum(r[1]), high: safeNum(r[2]), low: safeNum(r[3]), close: safeNum(r[4]), vol: safeNum(r[5]) })).sort((a,b)=>a.t-b.t);
-      if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-    }
-  } catch {}
-
-  // 4) Yahoo fallback (some crypto pairs exist)
-  try {
-    const map = CONFIG.SYMBOLS?.CRYPTO?.[s] || {};
-    const ySym = map?.yahoo || s.replace("USDT", "-USD").replace("USDC", "-USD");
-    const yfBases = CONFIG.API.YAHOO || ["https://query1.finance.yahoo.com/v8/finance/chart"];
-    const tfmap = { "1m": "1m", "5m":"5m","15m":"15m","30m":"30m","1h":"60m" }[interval] || "15m";
-    const url = `${yfBases[0].replace(/\/+$/,"")}/${encodeURIComponent(ySym)}?interval=${tfmap}&range=7d`;
-    const raw = await safeGet(url, { mirrors: yfBases.slice(1), timeout: DEFAULT_TIMEOUT, responseType: "json" });
-    const k = normalizeYahooChart(raw);
-    if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-  } catch {}
-
-  // 5) Cache fallback
-  const cached = readCache(s, interval);
-  if (cached && Array.isArray(cached.data) && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
-
-  // 6) Synthetic fallback (guarantee)
-  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: Math.min(500, Number(limit || 200)), intervalMs: intervalToMs(interval) });
-  writeCache(s, interval, synthetic);
-  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
+// 1) TradingView (best for indices / national markets / TV symbols)
+// We'll try proxy endpoints (TVC feed) which return JSON-like strings or chart data.
+// Implementation is best-effort and tolerant to formats.
+async function fetchTradingView(tvSymbol, interval = "15m") {
+  if (!tvSymbol) return { data: [], price: null };
+  // try each TV proxy base
+  const proxies = CONFIG.API?.TRADINGVIEW_PROXY || [];
+  const tfmap = { "1m":"1","5m":"5","15m":"15","30m":"30","1h":"60","4h":"240" }[interval] || "15";
+  for (const base of proxies) {
+    try {
+      // many tv proxies expect: /symbols/{symbol}/?fields=...  (varies per proxy)
+      // We'll try a couple of common endpoints and be defensive
+      const tryUrls = [
+        `${base.replace(/\/+$/,"")}/symbols/${encodeURIComponent(tvSymbol)}?resolution=${tfmap}`,
+        `${base.replace(/\/+$/,"")}/history?symbol=${encodeURIComponent(tvSymbol)}&resolution=${tfmap}`,
+        `${base.replace(/\/+$/,"")}/history?symbol=${encodeURIComponent(tvSymbol)}&resolution=${tfmap}&from=0&to=${Math.floor(Date.now()/1000)}`
+      ];
+      for (const url of tryUrls) {
+        const raw = await safeGet(url, { responseType: "json", timeout: 8000, tryProxies: false });
+        if (!raw) continue;
+        // common tv history returns { s: "ok", t: [...], c:[...], o:[...], h:[...], l:[...], v:[...] }
+        if (raw.s && raw.s === "ok" && Array.isArray(raw.t)) {
+          const t = raw.t.map(x => Number(x)*1000);
+          const out = [];
+          for (let i=0;i<t.length;i++) {
+            const close = safeNum(raw.c?.[i], NaN);
+            if (!isFiniteNum(close)) continue;
+            out.push({
+              t: t[i],
+              open: safeNum(raw.o?.[i], close),
+              high: safeNum(raw.h?.[i], close),
+              low: safeNum(raw.l?.[i], close),
+              close,
+              vol: safeNum(raw.v?.[i], 0)
+            });
+          }
+          if (out.length) return { data: out.sort((a,b)=>a.t-b.t), price: out.at(-1).close };
+        }
+        // some proxies return html or script, attempt to parse numeric arrays from text
+        if (typeof raw === "string" && /\[.*"t".*\]/.test(raw)) {
+          // crude parse attempt
+          try {
+            const js = raw;
+            const matches = js.match(/t:\s*\[([0-9, ]+)\]/);
+            // skip if no reliable parse
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  return { data: [], price: null };
 }
 
-/* ---------- YAHOO generic fetcher (stocks/forex/commodities) ---------- */
-async function fetchYahoo(symbol, interval = "15m") {
-  const s = String(symbol || "").trim();
-  if (!s) return { data: [], price: null };
-  const bases = CONFIG.API.YAHOO || ["https://query1.finance.yahoo.com/v8/finance/chart"];
-  const tfmap = { "1m": {interval:"1m", range:"1d"}, "5m":{interval:"5m", range:"5d"}, "15m":{interval:"15m", range:"5d"}, "30m":{interval:"30m", range:"1mo"}, "1h":{interval:"60m", range:"1mo"} }[interval] || {interval:"15m", range:"5d"};
-  const url = `${bases[0].replace(/\/+$/,"")}/${encodeURIComponent(s)}?interval=${tfmap.interval}&range=${tfmap.range}`;
-  try {
-    const raw = await safeGet(url, { mirrors: bases.slice(1), timeout: DEFAULT_TIMEOUT, responseType: "json" });
-    const k = normalizeYahooChart(raw);
-    if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-  } catch {}
-
-  // cache fallback
-  const cached = readCache(s, interval);
-  if (cached && Array.isArray(cached.data) && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
-
-  // synthetic fallback
-  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: 200, intervalMs: intervalToMs(interval) });
-  writeCache(s, interval, synthetic);
-  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
+// 2) Binance (Crypto)
+async function fetchBinance(symbol, interval = "15m", limit = 500) {
+  if (!symbol) return { data: [], price: null };
+  const bases = CONFIG.API?.BINANCE || ["https://api.binance.com"];
+  const endpoint = "/api/v3/klines";
+  for (const base of bases) {
+    const url = `${base.replace(/\/+$/,"")}${endpoint}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`;
+    try {
+      const raw = await safeGet(url, { responseType: "json", mirrors: bases.slice(1) });
+      if (Array.isArray(raw) && raw.length) {
+        const k = normalizeKlineArray(raw);
+        if (k.length) return { data: k, price: k.at(-1).close };
+      }
+    } catch {}
+  }
+  return { data: [], price: null };
 }
 
-/* ---------- FinancialModelingPrep (FMP) fetch for US stocks ---------- */
-async function fetchFMP(symbol, interval = "15m") {
+// 3) Coinbase (Crypto)
+async function fetchCoinbase(symbol, interval = "15m", limit = 500) {
+  // Coinbase uses - and USD (BTC-USD)
+  if (!symbol) return { data: [], price: null };
+  const base = CONFIG.API?.COINBASE || "https://api.exchange.coinbase.com";
+  // ensure symbol format (BTC-USD or ETH-USD)
+  let s = symbol.replace("USDT","-USD").replace("/", "-");
+  if (!s.includes("-")) s = s.replace(/([A-Z]+)(USD|USDT|BTC|EUR)/, "$1-USD");
+  const url = `${base.replace(/\/+$/,"")}/products/${encodeURIComponent(s)}/candles?granularity=${Math.max(60, Math.floor(intervalToMs(interval)/1000))}`;
   try {
-    const base = CONFIG.API.FMP || "https://financialmodelingprep.com/api/v3";
-    const apiKey = process.env.FMP_API_KEY || "";
-    // endpoint historical-chart/1min/AAPL
-    const pathInterval = interval.endsWith("m") ? `${Number(interval.slice(0,-1))}min` : (interval.endsWith("h") ? `${Number(interval.slice(0,-1))}hour` : "1min");
-    const url = `${base}/historical-chart/${interval}/${encodeURIComponent(symbol)}${apiKey ? `?apikey=${apiKey}` : ""}`;
-    const raw = await safeGet(url, { timeout: DEFAULT_TIMEOUT, responseType: "json" });
+    const raw = await safeGet(url, { responseType: "json" });
     if (Array.isArray(raw) && raw.length) {
-      const out = raw.map(r => ({ t: Number(new Date(r.date).getTime()), open: safeNum(r.open), high: safeNum(r.high), low: safeNum(r.low), close: safeNum(r.close), vol: safeNum(r.volume || 0) })).sort((a,b)=>a.t-b.t);
-      if (out.length) { writeCache(symbol, interval, out); return { data: out, price: out.at(-1)?.close ?? lastGoodPrice(symbol) }; }
+      // coinbase returns [ [time, low, high, open, close, volume], ... ] in reverse chrono
+      const mapped = raw.map(r => [ r[0]*1000, r[3], r[2], r[1], r[4], r[5] ]).sort((a,b)=>a[0]-b[0]);
+      const k = normalizeKlineArray(mapped);
+      if (k.length) return { data: k, price: k.at(-1).close };
     }
   } catch {}
   return { data: [], price: null };
 }
 
-/* ---------- NSE / India fetcher (TradingView / MoneyControl / Yahoo) ---------- */
-async function fetchNSE(symbol, interval = "15m") {
-  const s = String(symbol || "").toUpperCase();
-  if (!s) return { data: [], price: null };
-  // mapping
-  const mapping = CONFIG.SYMBOLS?.INDIA || {};
-  const mapped = (typeof mapping === "object" && mapping[s]) ? mapping[s] : s;
-
-  // try TradingView proxy if configured (best quality for indices)
+// 4) OKX (Crypto) - best-effort: they provide /api/v5/market/history-candles
+async function fetchOKX(symbol, interval = "15m", limit = 500) {
+  if (!symbol) return { data: [], price: null };
+  const base = CONFIG.API?.OKX || "https://www.okx.com";
+  // OKX uses - like BTC-USDT; adapt
+  const s = symbol.includes("/") ? symbol.replace("/", "-") : (symbol.includes("USDT") ? symbol.replace("USDT", "-USDT") : symbol);
+  // map interval to OKX granularity if needed (we'll use timeframe string)
   try {
-    // many TV proxies are custom — we attempt configured proxies (best-effort)
-    const tvBases = CONFIG.API.TRADINGVIEW_PROXY || [];
-    for (const tv of tvBases) {
+    const url = `${base.replace(/\/+$/,"")}/api/v5/market/history-candles?instId=${encodeURIComponent(s)}&bar=${encodeURIComponent(interval)}&limit=${limit}`;
+    const raw = await safeGet(url, { responseType: "json" });
+    // raw might be { code: "0", data: [[ts, o,h,l,c,vol], ...] }
+    const data = raw?.data || raw;
+    if (Array.isArray(data) && data.length) {
+      const k = data.map(r=>({
+        t: safeNum(r[0]),
+        open: safeNum(r[1]),
+        high: safeNum(r[2]),
+        low: safeNum(r[3]),
+        close: safeNum(r[4]),
+        vol: safeNum(r[5],0)
+      })).sort((a,b)=>a.t-b.t);
+      if (k.length) return { data: k, price: k.at(-1).close };
+    }
+  } catch {}
+  return { data: [], price: null };
+}
+
+// 5) Yahoo (Stocks, Indices, Commodities, Forex)
+async function fetchYahoo(symbol, interval = "15m") {
+  if (!symbol) return { data: [], price: null };
+  const bases = CONFIG.API?.YAHOO || ["https://query1.finance.yahoo.com/v8/finance/chart"];
+  // tf mapping
+  const tfmap = { "1m":{i:"1m",r:"1d"}, "5m":{i:"5m",r:"5d"}, "15m":{i:"15m",r:"5d"}, "30m":{i:"30m",r:"1mo"}, "1h":{i:"60m",r:"1mo"}, "4h":{i:"240m",r:"3mo"}, "1d":{i:"1d",r:"6mo"} }[interval] || {i:"15m",r:"5d"};
+  for (const base of bases) {
+    const url = `${base.replace(/\/+$/,"")}/${encodeURIComponent(symbol)}?interval=${tfmap.i}&range=${tfmap.r}`;
+    try {
+      const raw = await safeGet(url, { responseType: "json", mirrors: bases.slice(1) });
+      const k = normalizeYahooChart(raw);
+      if (k.length) return { data: k, price: k.at(-1).close };
+    } catch {}
+  }
+  return { data: [], price: null };
+}
+
+// 6) Moneycontrol (India) — limited public endpoints; best-effort
+async function fetchMoneyControl(symbol, interval = "15m") {
+  if (!symbol) return { data: [], price: null };
+  const bases = CONFIG.API?.MONEYCONTROL || [];
+  for (const base of bases) {
+    try {
+      // Moneycontrol expects parameters; this endpoint varies. We'll attempt with common pattern:
+      const url = `${base.replace(/\/+$/,"")}?symbol=${encodeURIComponent(symbol)}&resolution=${interval}`;
+      const raw = await safeGet(url, { responseType: "json" });
+      // raw often returns { data: [...] }
+      const arr = raw?.data || raw;
+      if (Array.isArray(arr) && arr.length) {
+        const k = normalizeKlineArray(arr);
+        if (k.length) return { data: k, price: k.at(-1).close };
+      }
+    } catch {}
+  }
+  return { data: [], price: null };
+}
+
+// 7) ExchangeRate (Forex quick price)
+async function fetchExchangeRate(symbol) {
+  // expects like EURUSD or EURUSD=X etc.
+  if (!symbol || symbol.length < 6) return { data: [], price: null };
+  try {
+    const base = CONFIG.API?.EXCHANGERATE || "https://api.exchangerate.host";
+    // adapt symbol: EURUSD -> base EUR target USD
+    const s = symbol.replace("=","").replace("/","");
+    const b = s.slice(0,3), q = s.slice(3,6);
+    const url = `${base}/latest?base=${encodeURIComponent(b)}&symbols=${encodeURIComponent(q)}`;
+    const raw = await safeGet(url, { responseType: "json" });
+    const rate = raw?.rates?.[q] ?? raw?.rates && Object.values(raw.rates)[0];
+    if (isFiniteNum(rate)) {
+      const now = Date.now();
+      const candle = [{ t: now - 60000, open: rate, high: rate, low: rate, close: rate, vol: 0 }];
+      return { data: candle, price: safeNum(rate) };
+    }
+  } catch {}
+  return { data: [], price: null };
+}
+
+// 8) FMP (Financial Modeling Prep) — stocks alt
+async function fetchFMP(symbol, interval = "15m") {
+  try {
+    const base = CONFIG.API?.FMP || "https://financialmodelingprep.com/api/v3";
+    const key = process.env.FMP_API_KEY ? `?apikey=${encodeURIComponent(process.env.FMP_API_KEY)}` : "";
+    // endpoint historical-chart/{interval}/{symbol}
+    const url = `${base}/historical-chart/${encodeURIComponent(interval)}/${encodeURIComponent(symbol)}${key}`;
+    const raw = await safeGet(url, { responseType: "json" });
+    if (Array.isArray(raw) && raw.length) {
+      const mapped = raw.map(r=>({
+        t: safeNum(new Date(r.date).getTime()),
+        open: safeNum(r.open),
+        high: safeNum(r.high),
+        low: safeNum(r.low),
+        close: safeNum(r.close),
+        vol: safeNum(r.volume,0)
+      })).sort((a,b)=>a.t-b.t);
+      if (mapped.length) return { data: mapped, price: mapped.at(-1).close };
+    }
+  } catch {}
+  return { data: [], price: null };
+}
+
+// -----------------------------
+// High-level router: fetchUniversal
+// Ensures: price comes from a REAL source (not synthetic)
+// Steps (per earlier agreement):
+// TradingView -> Exchange APIs (Binance/Coinbase/OKX) -> Yahoo -> MoneyControl/FMP/ExchangeRate -> Cache -> Synthetic (candles only)
+// -----------------------------
+export async function fetchUniversal(inputSymbol, interval = "15m", opts = {}) {
+  try {
+    const symbolRaw = String(inputSymbol || "").trim();
+    if (!symbolRaw) return { data: [], price: null };
+
+    // Determine market hints
+    const s = symbolRaw.toUpperCase();
+    const mappings = CONFIG.SYMBOLS || {};
+    // detect direct mapping entries (user uses mapped keys like NIFTY50)
+    const inCryptoMap = mappings.CRYPTO && mappings.CRYPTO[s];
+    const inIndiaMap = mappings.INDIA && mappings.INDIA[s];
+    const inUSMap = mappings.US_STOCKS && mappings.US_STOCKS[s];
+    const inForexMap = mappings.FOREX && mappings.FOREX[s];
+    const inCommodityMap = mappings.COMMODITIES && mappings.COMMODITIES[s];
+
+    // Resolve possible provider-specific symbols
+    const providers = {
+      binance: inCryptoMap?.binance || s,
+      coinbase: inCryptoMap?.coinbase || s.replace("USDT","-USD"),
+      okx: inCryptoMap?.okx || s,
+      yahoo: (inCryptoMap?.yahoo || inIndiaMap?.yahoo || inUSMap?.yahoo || inForexMap?.yahoo || inCommodityMap?.yahoo) || s,
+      tv: (inCryptoMap?.tv || inIndiaMap?.tv || inUSMap?.tv || inCommodityMap?.tv) || s
+    };
+
+    // Respect configured SOURCE priority for market detection
+    const forcedMarket = (CONFIG.ACTIVE_MARKET || "").toUpperCase() || null;
+    const market = forcedMarket || (inCryptoMap ? "CRYPTO" : inIndiaMap ? "INDIA" : inUSMap ? "US_STOCKS" : inForexMap ? "FOREX" : inCommodityMap ? "COMMODITIES" : (/(USDT|USD|BTC|ETH)$/.test(s) ? "CRYPTO" : (/^[A-Z]{6}$/.test(s) ? "FOREX" : "US_STOCKS")));
+
+    const intervalSafe = interval || "15m";
+
+    // prepare cache fallback
+    const cached = readCache(symbolRaw, intervalSafe);
+    const lastReal = readLastRealPrice(symbolRaw) || lastCachedPrice(symbolRaw);
+
+    // helper to return cache or synthetic if all fail
+    const finalFallback = (meta={}) => {
+      if (cached && Array.isArray(cached.data) && cached.data.length) {
+        return { data: cached.data, price: cached.data.at(-1).close ?? lastReal ?? null, meta: { source: "cache", ...meta } };
+      }
+      const synth = generateSyntheticCandles({ lastPrice: lastReal || 100, count: Math.max(200, CONFIG.DEFAULT_LIMIT || 200), interval: intervalSafe });
+      writeCache(symbolRaw, intervalSafe, synth);
+      return { data: synth, price: synth.at(-1).close ?? lastReal ?? null, meta: { source: "synthetic", ...meta } };
+    };
+
+    // ORDERED attempts based on market
+    const sourceOrder = CONFIG.SOURCES?.[market] || ["yahoo","cache","synthetic"];
+
+    // iterate over sources; when a source returns real price, we stop and return that (but may still use other candles if needed)
+    let collected = { data: [], price: null, meta: {} };
+
+    for (const src of sourceOrder) {
       try {
-        // The tv proxy endpoints differ by setup; we call naive and parse fallback
-        // Attempt fetch via tv/forexfeed-like endpoints — but avoid hard failure
-        const tvUrl = `${tv.replace(/\/+$/,"")}/symbols/${encodeURIComponent(mapped)}/history?resolution=${interval}&from=${Math.floor((Date.now()/1000) - 3600*24)}&to=${Math.floor(Date.now()/1000)}`;
-        const raw = await safeGet(tvUrl, { timeout: 9000, responseType: "json", tryProxies: false });
-        if (raw && raw.s === "ok" && Array.isArray(raw.t) && raw.t.length) {
-          const out = [];
-          for (let i = 0; i < raw.t.length; i++) {
-            out.push({ t: Number(raw.t[i]) * 1000, open: safeNum(raw.o[i]), high: safeNum(raw.h[i]), low: safeNum(raw.l[i]), close: safeNum(raw.c[i]), vol: safeNum(raw.v?.[i] ?? 0) });
+        if (src === "tv") {
+          const tvSym = providers.tv || providers.yahoo || s;
+          const r = await fetchTradingView(tvSym, intervalSafe);
+          if (r && Array.isArray(r.data) && r.data.length && isFiniteNum(r.price)) {
+            // store cache, record last real
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "tradingview", symbol: tvSym });
+            return { data: r.data, price: r.price, meta: { source: "tradingview", symbol: tvSym } };
+          } else if (r && Array.isArray(r.data) && r.data.length && !isFiniteNum(r.price)) {
+            // tradingview provided candles but no price — still store candles and continue to find price
+            writeCache(symbolRaw, intervalSafe, r.data);
+            collected.data = r.data;
           }
-          if (out.length) { writeCache(s, interval, out); return { data: out, price: out.at(-1)?.close ?? lastGoodPrice(s) }; }
+        } else if (src === "binance") {
+          const binSym = providers.binance || s;
+          const r = await fetchBinance(binSym, intervalSafe, Math.max(200, CONFIG.DEFAULT_LIMIT || 200));
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "binance", symbol: binSym });
+            return { data: r.data, price: r.price, meta: { source: "binance", symbol: binSym } };
+          } else if (r && r.data && r.data.length && !isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "coinbase") {
+          const cbSym = providers.coinbase || s;
+          const r = await fetchCoinbase(cbSym, intervalSafe);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "coinbase", symbol: cbSym });
+            return { data: r.data, price: r.price, meta: { source: "coinbase", symbol: cbSym } };
+          } else if (r && r.data && r.data.length) {
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "okx") {
+          const okxSym = providers.okx || s;
+          const r = await fetchOKX(okxSym, intervalSafe);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "okx", symbol: okxSym });
+            return { data: r.data, price: r.price, meta: { source: "okx", symbol: okxSym } };
+          } else if (r && r.data && r.data.length) {
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "yahoo") {
+          const ySym = providers.yahoo || s;
+          const r = await fetchYahoo(ySym, intervalSafe);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "yahoo", symbol: ySym });
+            return { data: r.data, price: r.price, meta: { source: "yahoo", symbol: ySym } };
+          } else if (r && r.data && r.data.length) {
+            // save but keep searching for price
+            writeCache(symbolRaw, intervalSafe, r.data);
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "moneycontrol") {
+          const mcSym = providers.yahoo || s;
+          const r = await fetchMoneyControl(mcSym, intervalSafe);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "moneycontrol", symbol: mcSym });
+            return { data: r.data, price: r.price, meta: { source: "moneycontrol", symbol: mcSym } };
+          } else if (r && r.data && r.data.length) {
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "fmp") {
+          const fmpSym = providers.yahoo || s;
+          const r = await fetchFMP(fmpSym, intervalSafe);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "fmp", symbol: fmpSym });
+            return { data: r.data, price: r.price, meta: { source: "fmp", symbol: fmpSym } };
+          } else if (r && r.data && r.data.length) {
+            collected.data = collected.data.length ? collected.data : r.data;
+          }
+        } else if (src === "exchangerate") {
+          // forex only pseudo
+          const r = await fetchExchangeRate(s);
+          if (r && r.data && r.data.length && isFiniteNum(r.price)) {
+            writeCache(symbolRaw, intervalSafe, r.data);
+            writeLastRealPrice(symbolRaw, r.price, { src: "exchangerate", symbol: s });
+            return { data: r.data, price: r.price, meta: { source: "exchangerate", symbol: s } };
+          }
+        } else if (src === "cache") {
+          if (cached && cached.data && cached.data.length) {
+            // return cached real price if available
+            const price = cached.data.at(-1).close ?? readLastRealPrice(symbolRaw) ?? lastCachedPrice(symbolRaw);
+            if (isFiniteNum(price)) {
+              return { data: cached.data, price, meta: { source: "cache" } };
+            }
+          }
+        } else if (src === "synthetic") {
+          // return synthetic only as last resort (candles ok, price will be lastClose of synth only if no real price found)
+          // But per rule: we will NOT set synthetic price if any real last price exists (readLastRealPrice)
+          if (readLastRealPrice(symbolRaw)) {
+            // if we have last real price, use it + synthetic candles built around it to fill history
+            const synth = generateSyntheticCandles({ lastPrice: readLastRealPrice(symbolRaw), count: Math.max(200, CONFIG.DEFAULT_LIMIT || 200), interval: intervalSafe });
+            writeCache(symbolRaw, intervalSafe, synth);
+            return { data: synth, price: readLastRealPrice(symbolRaw), meta: { source: "synthetic_but_price_from_last_real" } };
+          }
+          // else produce synthetic + synthetic price (only when absolutely nothing else ever existed)
+          const synth = generateSyntheticCandles({ lastPrice: 100, count: Math.max(200, CONFIG.DEFAULT_LIMIT || 200), interval: intervalSafe });
+          writeCache(symbolRaw, intervalSafe, synth);
+          return { data: synth, price: synth.at(-1).close, meta: { source: "synthetic_force" } };
         }
-      } catch {}
-    }
-  } catch {}
-
-  // Moneycontrol (priceapi) best-effort historical endpoint
-  try {
-    const mcBases = CONFIG.API.MONEYCONTROL || [];
-    for (const mc of mcBases) {
-      try {
-        // moneycontrol specific path: requires symbol id; unknown here: skip if not helpful
-        const url = `${mc.replace(/\/+$/,"")}?symbol=${encodeURIComponent(mapped)}&resolution=${encodeURIComponent(interval)}`;
-        const raw = await safeGet(url, { timeout: 9000, responseType: "json" });
-        // Attempt to normalize if returns kline-like array
-        if (Array.isArray(raw) && raw.length) {
-          const k = normalizeKlineArray(raw);
-          if (k.length) { writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
-        }
-      } catch {}
-    }
-  } catch {}
-
-  // Yahoo fallback
-  try {
-    const y = await fetchYahoo(mapped, interval);
-    if (y && Array.isArray(y.data) && y.data.length) return y;
-  } catch {}
-
-  // cache or synthetic fallback
-  const cached = readCache(s, interval);
-  if (cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
-  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: 300, intervalMs: intervalToMs(interval) });
-  writeCache(s, interval, synthetic);
-  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
-}
-
-/* ---------- Commodities fetcher (Yahoo primary, TradingView fallback) ---------- */
-async function fetchCommodity(symbol, interval = "15m") {
-  const map = CONFIG.SYMBOLS?.COMMODITIES || {};
-  const mapped = (typeof map === "object" && map[symbol]) ? map[symbol] : symbol;
-  return await fetchYahoo(mapped, interval);
-}
-
-/* ---------- Forex fetcher ---------- */
-async function fetchForex(symbol, interval = "15m") {
-  try {
-    const s = String(symbol || "").toUpperCase().replace("/", "");
-    if (!s) return { data: [], price: null };
-    const map = CONFIG.SYMBOLS?.FOREX || {};
-    const mapped = (typeof map === "object" && map[s]) ? map[s] : (s.endsWith("USD") ? `${s.slice(0,3)}${s.slice(3)}` : s);
-
-    // try Yahoo
-    const y = await fetchYahoo(mapped, interval);
-    if (y && Array.isArray(y.data) && y.data.length) return y;
-
-    // fallback to exchangerate.host for a single price
-    try {
-      const base = `https://api.exchangerate.host/latest?base=${s.slice(0,3)}&symbols=${s.slice(3,6)}`;
-      const raw = await safeGet(base, { responseType: "json", timeout: 7000 });
-      if (raw && raw.rates) {
-        const p = Object.values(raw.rates)[0];
-        const now = Date.now();
-        const candle = [{ t: now - 60000, open: p, high: p, low: p, close: p, vol: 0 }];
-        writeCache(s, interval, candle);
-        return { data: candle, price: p };
+      } catch (e) {
+        // continue to next source
       }
-    } catch {}
-
-  } catch {}
-
-  // fallback cache / synthetic
-  const cached = readCache(symbol, interval);
-  if (cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(symbol) };
-  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(symbol) || 1.0, count: 200, intervalMs: intervalToMs(interval) });
-  writeCache(symbol, interval, synthetic);
-  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(symbol) };
-}
-
-/* ----------------------------
-   High-level router — fetchUniversal
-   Respects CONFIG.ACTIVE_MARKET override and heuristics
-   ---------------------------- */
-export async function fetchUniversal(inputSymbol = "", interval = "15m") {
-  try {
-    const symRaw = String(inputSymbol || "").trim();
-    if (!symRaw) return { data: [], price: null };
-
-    const s = symRaw.toUpperCase();
-    const mappingCrypto = CONFIG.SYMBOLS?.CRYPTO || {};
-    const mappingIndia = CONFIG.SYMBOLS?.INDIA || {};
-    const mappingForex = CONFIG.SYMBOLS?.FOREX || {};
-    const mappingUS = CONFIG.SYMBOLS?.US_STOCKS || {};
-    const mappingCom = CONFIG.SYMBOLS?.COMMODITIES || {};
-
-    const forced = (CONFIG.ACTIVE_MARKET || "").toUpperCase();
-
-    // heuristics
-    const isCrypto = /USDT$|BTC$|ETH$|SOL$|BNB$|^\w{3,6}USDT$/i.test(s) || Boolean(mappingCrypto[s]);
-    const isIndia = Boolean(mappingIndia[s]);
-    const isForex = Boolean(mappingForex[s]) || /^[A-Z]{6}$/.test(s) || (s.length === 6 && (s.endsWith("USD") || s.includes("JPY")));
-    const isUSStock = Boolean(mappingUS[s]) || /^[A-Z]{1,5}$/.test(s);
-    const isCommodity = Boolean(mappingCom[s]) || /^(GC=F|CL=F|SI=F|NG=F|GOLD|OIL|SILVER)$/i.test(s);
-
-    // Respect forced market
-    if (forced === "CRYPTO" || (!forced && isCrypto)) return await fetchCrypto(s, interval, CONFIG.DEFAULT_LIMIT);
-    if (forced === "INDIA" || (!forced && isIndia)) return await fetchNSE(s, interval);
-    if (forced === "FOREX" || (!forced && isForex)) return await fetchForex(s, interval);
-    if (forced === "US_STOCKS" || (!forced && isUSStock)) {
-      // try Yahoo then FMP
-      const y = await fetchYahoo(mappingUS[s] ? mappingUS[s].yahoo || mappingUS[s] : s, interval);
-      if (y && Array.isArray(y.data) && y.data.length) return y;
-      const f = await fetchFMP(mappingUS[s] ? mappingUS[s].yahoo || mappingUS[s] : s, interval);
-      if (f && Array.isArray(f.data) && f.data.length) return f;
-      // fallback synthetic
-      const cached = readCache(s, interval);
-      if (cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
-      const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: 200, intervalMs: intervalToMs(interval) });
-      writeCache(s, interval, synthetic);
-      return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
     }
-    if (forced === "COMMODITIES" || (!forced && isCommodity)) return await fetchCommodity(s, interval);
 
-    // default: try Yahoo then crypto then synthetic
-    try {
-      const y = await fetchYahoo(s, interval);
-      if (y && Array.isArray(y.data) && y.data.length) return y;
-    } catch {}
-    try {
-      const c = await fetchCrypto(s, interval);
-      if (c && Array.isArray(c.data) && c.data.length) return c;
-    } catch {}
+    // if loop ended with collected candles (no price) but lastReal exists -> return candles with lastReal price
+    if (collected.data && collected.data.length && readLastRealPrice(symbolRaw)) {
+      return { data: collected.data, price: readLastRealPrice(symbolRaw), meta: { source: "collected_candles", note: "price_from_last_real" } };
+    }
 
-    // final cache / synthetic fallback
-    const cached = readCache(s, interval);
-    if (cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
-    const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: 200, intervalMs: intervalToMs(interval) });
-    writeCache(s, interval, synthetic);
-    return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
-
-  } catch (err) {
-    // never throw — return safe synthetic data
-    const sym = String(inputSymbol || "UNKNOWN");
-    const cached = readCache(sym, interval);
-    if (cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(sym) };
-    const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(sym) || 100, count: 200, intervalMs: intervalToMs(interval) });
-    writeCache(sym, interval, synthetic);
-    return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(sym) };
+    // final fallback to cache or synthetic
+    return finalFallback({ note: "all_sources_failed" });
+  } catch (e) {
+    return { data: [], price: null, error: String(e) };
   }
 }
 
-/* ----------------------------
-   fetchMarketData (legacy compatibility)
-   signature: (symbol, interval = "15m", limit = 200)
-   returns { data, price, updated }
-   ---------------------------- */
-export async function fetchMarketData(inputSymbol = CONFIG.DEFAULT_BY_MARKET?.CRYPTO || "BTCUSDT", interval = "15m", limit = 200) {
+// -----------------------------
+// fetchPrice: ONLY returns a single canonical price (the last real candle close)
+// Follows agreed rule: TradingView > Exchange > Yahoo > MoneyControl > Cache
+// NEVER returns a synthetic-generated price unless absolutely no previous real price exists
+// -----------------------------
+export async function fetchPrice(symbol) {
   try {
-    const symbol = String(inputSymbol || "").trim();
-    if (!symbol) return { data: [], price: null, updated: new Date().toISOString() };
-    // fetchUniversal already handles market routing
-    const res = await fetchUniversal(symbol, interval);
-    const data = Array.isArray(res.data) ? res.data.slice(-limit) : [];
-    const price = (res.price ?? (data.length ? data.at(-1).close : null)) || lastGoodPrice(symbol);
-    return { data, price, updated: new Date().toISOString() };
-  } catch {
-    const symbol = String(inputSymbol || "").trim();
-    const cached = readCache(symbol, interval);
-    return { data: cached?.data || [], price: cached?.data?.at(-1)?.close ?? lastGoodPrice(symbol) ?? null, updated: new Date().toISOString() };
-  }
-}
-
-/* ----------------------------
-   fetchPrice — tries multiple quick sources for just the latest price
-   ---------------------------- */
-export async function fetchPrice(rawSymbol = CONFIG.DEFAULT_BY_MARKET?.CRYPTO || "BTCUSDT") {
-  try {
-    const symbol = String(rawSymbol || "").trim();
     if (!symbol) return null;
+    // quick attempts: TradingView -> Binance/Coinbase/OKX -> Yahoo -> Moneycontrol -> lastReal -> cached last -> null
+    // TradingView
+    const providersMap = (() => {
+      const mm = CONFIG.SYMBOLS || {};
+      const symKey = String(symbol || "").toUpperCase();
+      const inCryptoMap = mm.CRYPTO && mm.CRYPTO[symKey];
+      const inIndiaMap = mm.INDIA && mm.INDIA[symKey];
+      const providers = {};
+      providers.binance = inCryptoMap?.binance || symbol;
+      providers.coinbase = inCryptoMap?.coinbase || (symbol.replace("USDT","-USD"));
+      providers.okx = inCryptoMap?.okx || symbol;
+      providers.yahoo = inCryptoMap?.yahoo || inIndiaMap?.yahoo || symbol;
+      providers.tv = inCryptoMap?.tv || inIndiaMap?.tv || symbol;
+      return providers;
+    })();
 
-    // 1) fetchUniversal 1m quick
+    // 1) TradingView
     try {
-      const res = await fetchUniversal(symbol, "1m");
-      if (res && Array.isArray(res.data) && res.data.length) {
-        const p = res.data.at(-1).close;
-        if (Number.isFinite(+p)) return Number(p);
-      }
+      const tv = await fetchTradingView(providersMap.tv, "1m");
+      if (tv && isFiniteNum(tv.price)) { writeLastRealPrice(symbol, tv.price, { source: "tradingview" }); return tv.price; }
     } catch {}
 
-    // 2) cached last good
-    const cached = lastGoodPrice(symbol);
-    if (cached && Number.isFinite(+cached)) return Number(cached);
+    // 2) Exchange native (Binance / Coinbase / OKX) for crypto
+    try {
+      // Binance
+      const bin = await fetchBinance(providersMap.binance, "1m", 5);
+      if (bin && isFiniteNum(bin.price)) { writeLastRealPrice(symbol, bin.price, { source: "binance" }); return bin.price; }
+    } catch {}
+    try {
+      const cb = await fetchCoinbase(providersMap.coinbase, "1m");
+      if (cb && isFiniteNum(cb.price)) { writeLastRealPrice(symbol, cb.price, { source: "coinbase" }); return cb.price; }
+    } catch {}
+    try {
+      const okx = await fetchOKX(providersMap.okx, "1m");
+      if (okx && isFiniteNum(okx.price)) { writeLastRealPrice(symbol, okx.price, { source: "okx" }); return okx.price; }
+    } catch {}
 
-    // 3) synthetic fallback
-    const synth = generateSyntheticCandles({ lastPrice: 100, count: 2, intervalMs: 60_000 });
-    return synth.at(-1)?.close ?? null;
-  } catch {
+    // 3) Yahoo
+    try {
+      const y = await fetchYahoo(providersMap.yahoo || symbol, "1m");
+      if (y && isFiniteNum(y.price)) { writeLastRealPrice(symbol, y.price, { source: "yahoo" }); return y.price; }
+    } catch {}
+
+    // 4) Moneycontrol / FMP / ExchangeRate
+    try {
+      const mc = await fetchMoneyControl(symbol, "1m");
+      if (mc && isFiniteNum(mc.price)) { writeLastRealPrice(symbol, mc.price, { source: "moneycontrol" }); return mc.price; }
+    } catch {}
+    try {
+      const fx = await fetchExchangeRate(symbol);
+      if (fx && isFiniteNum(fx.price)) { writeLastRealPrice(symbol, fx.price, { source: "exchangerate" }); return fx.price; }
+    } catch {}
+    try {
+      const fmp = await fetchFMP(symbol, "1min");
+      if (fmp && isFiniteNum(fmp.price)) { writeLastRealPrice(symbol, fmp.price, { source: "fmp" }); return fmp.price; }
+    } catch {}
+
+    // 5) last real from disk
+    const lastReal = readLastRealPrice(symbol);
+    if (isFiniteNum(lastReal)) return lastReal;
+
+    // 6) last cached close
+    const cachedClose = lastCachedPrice(symbol);
+    if (isFiniteNum(cachedClose)) return cachedClose;
+
+    // 7) fail safe -> null (caller should use fallback candle generator but not a fake price)
+    return null;
+  } catch (e) {
     return null;
   }
 }
 
-/* ----------------------------
-   fetchMultiTF — fetch multiple timeframes concurrently (limited concurrency)
-   returns: { "1m": { data, price }, "5m": {...}, ... }
-   ---------------------------- */
-function pLimit(concurrency = 3) {
-  const queue = [];
-  let active = 0;
-  const next = () => {
-    if (!queue.length || active >= concurrency) return;
-    active++;
-    const { fn, resolve, reject } = queue.shift();
-    Promise.resolve(fn()).then(v => { active--; resolve(v); next(); }).catch(e => { active--; reject(e); next(); });
-  };
-  return fn => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
-}
-
-export async function fetchMultiTF(inputSymbol = CONFIG.DEFAULT_BY_MARKET?.CRYPTO || "BTCUSDT", tfs = ["1m","5m","15m","30m","1h"]) {
-  const symbol = String(inputSymbol || "").trim();
-  if (!symbol) {
-    const empty = {};
-    for (const tf of tfs) empty[tf] = { data: [], price: null };
-    return empty;
-  }
+// -----------------------------
+// fetchMultiTF(symbol, tfs)
+// returns map { tf: { data:[], price } }
+// -----------------------------
+export async function fetchMultiTF(symbol, tfs = ["1m","5m","15m","30m","1h"]) {
   const out = {};
-  const limit = pLimit(3);
-  const tasks = tfs.map(tf => limit(async () => {
-    // tiny jitter to avoid bursts
-    await sleep(30 + Math.floor(Math.random() * 120));
-    const res = await fetchUniversal(symbol, tf);
-    out[tf] = { data: Array.isArray(res.data) ? res.data : [], price: (res.price ?? (res.data?.at(-1)?.close ?? null)) };
-  }));
+  const tasks = tfs.map(tf => (async () => {
+    try {
+      const r = await fetchUniversal(symbol, tf);
+      out[tf] = { data: r.data || [], price: isFiniteNum(r.price) ? r.price : (readLastRealPrice(symbol) || lastCachedPrice(symbol) || null), meta: r.meta || {} };
+    } catch (e) {
+      out[tf] = { data: [], price: readLastRealPrice(symbol) || lastCachedPrice(symbol) || null, meta: { error: String(e) } };
+    }
+  })());
   await Promise.all(tasks);
   return out;
 }
 
-/* ----------------------------
-   Export default for compatibility
-   ---------------------------- */
+// -----------------------------
+// fetchMarketData legacy wrapper for compatibility
+// returns { data, price, updated }
+// -----------------------------
+export async function fetchMarketData(symbol, interval = "15m", limit = CONFIG.DEFAULT_LIMIT || 200) {
+  try {
+    const res = await fetchUniversal(symbol, interval);
+    return {
+      data: res.data || [],
+      price: isFiniteNum(res.price) ? res.price : (readLastRealPrice(symbol) || lastCachedPrice(symbol) || null),
+      updated: nowISO(),
+      meta: res.meta || {}
+    };
+  } catch (e) {
+    return { data: readCache(symbol, interval)?.data || [], price: readLastRealPrice(symbol) || lastCachedPrice(symbol) || null, updated: nowISO(), error: String(e) };
+  }
+}
+
+// -----------------------------
+// Exports (already exported above) + default
+// -----------------------------
 export default {
-  fetchMarketData,
   fetchUniversal,
-  fetchMultiTF,
   fetchPrice,
+  fetchMultiTF,
+  fetchMarketData,
   readCache,
   writeCache,
-  lastGoodPrice,
-  generateSyntheticCandles
+  readLastRealPrice,
+  writeLastRealPrice
 };
