@@ -1,6 +1,7 @@
 // ===================================================
-// core_indicators.js — Enhanced Universal Indicators
-// Crypto + Stocks + Forex + Indices (NSE, US, Global)
+// core_indicators.js — Universal Indicators Engine
+// Crypto / Stocks / Forex / Indices (NSE / US / Global)
+// With: Normalizer + Multi-TF + Multi-Market safe logic
 // ===================================================
 
 // ---------------------------
@@ -12,7 +13,35 @@ function N(x, fallback = 0) {
 }
 
 // ===================================================
-// RSI — Smoothed & More Accurate
+// CANDLE NORMALIZER (SUPER IMPORTANT)
+// Ensures: sorted, numeric, no null, consistent output
+// ===================================================
+export function normalizeCandles(candles = []) {
+  if (!Array.isArray(candles)) return [];
+
+  const out = candles
+    .map(c => ({
+      t: Number(c.t),
+      open: N(c.open),
+      high: N(c.high),
+      low: N(c.low),
+      close: N(c.close),
+      vol: N(c.vol, 0)   // Yahoo/NSE safe
+    }))
+    .filter(c =>
+      Number.isFinite(c.t) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
+    );
+
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
+// ===================================================
+// RSI (Smoothed Version)
 // ===================================================
 export function computeRSI(candles = [], length = 14) {
   if (!Array.isArray(candles) || candles.length < length + 2) return 50;
@@ -30,7 +59,6 @@ export function computeRSI(candles = [], length = 14) {
 
   if (!gains && !losses) return 50;
 
-  // Avoid div-zero
   const avgGain = gains / length;
   const avgLoss = (losses || 0.000001) / length;
 
@@ -68,12 +96,11 @@ export function computeATR(candles = [], length = 14) {
 }
 
 // ===================================================
-// EMA — SMA-Initialized (PRO LEVEL)
+// EMA — SMA-initialized (professional accuracy)
 // ===================================================
 function ema(values = [], period = 12) {
   if (values.length < period) return [];
 
-  // SMA start — MUCH more accurate for small datasets
   const sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
 
   const k = 2 / (period + 1);
@@ -94,7 +121,7 @@ function ema(values = [], period = 12) {
 }
 
 // ===================================================
-// MACD — Noise-Reduced Output
+// MACD — Noise Reduced
 // ===================================================
 export function computeMACD(candles = []) {
   if (candles.length < 35) return { hist: 0, line: 0, signal: 0 };
@@ -118,7 +145,7 @@ export function computeMACD(candles = []) {
 }
 
 // ===================================================
-// Volume Trend (Safe for Yahoo/NSE null volumes)
+// Volume Trend (Yahoo/NSE safe)
 // ===================================================
 export function volumeTrend(candles = []) {
   if (candles.length < 2) return "STABLE";
@@ -134,7 +161,7 @@ export function volumeTrend(candles = []) {
 }
 
 // ===================================================
-// Volume Analyzer — More granular
+// Volume Score (granular)
 // ===================================================
 export function analyzeVolume(candles = []) {
   if (candles.length < 3) return { status: "UNKNOWN", strength: 0 };
@@ -153,7 +180,7 @@ export function analyzeVolume(candles = []) {
 }
 
 // ===================================================
-// Fibonacci Levels — No change (already optimal)
+// Fibonacci Levels
 // ===================================================
 export function computeFibLevelsFromCandles(candles = []) {
   if (!candles.length) return null;
@@ -179,7 +206,7 @@ export function computeFibLevelsFromCandles(candles = []) {
 }
 
 // ===================================================
-// Price Trend — NEW! (Better signals)
+// Price Trend
 // ===================================================
 export function computePriceTrend(candles = []) {
   if (candles.length < 4) return "FLAT";
@@ -196,14 +223,43 @@ export function computePriceTrend(candles = []) {
 }
 
 // ===================================================
-// deriveSignal — Better weighting
+// Single-TF Indicator Bundle
+// ===================================================
+export function computeIndicators(candles = []) {
+  candles = normalizeCandles(candles);
+
+  return {
+    RSI: computeRSI(candles),
+    ATR: computeATR(candles),
+    MACD: computeMACD(candles),
+    priceTrend: computePriceTrend(candles),
+    volumeTrend: volumeTrend(candles),
+    volumeScore: analyzeVolume(candles),
+    fib: computeFibLevelsFromCandles(candles)
+  };
+}
+
+// ===================================================
+// MULTI-TIMEFRAME INDICATOR ENGINE
+// ===================================================
+export function computeMultiTF(allTF) {
+  const out = {};
+  for (const tf in allTF) {
+    const candles = allTF[tf]?.data || [];
+    out[tf] = computeIndicators(candles);
+  }
+  return out;
+}
+
+// ===================================================
+// SIGNAL GENERATOR (weighted)
 // ===================================================
 export function deriveSignal(ind) {
   if (!ind) return "NEUTRAL";
 
   let score = 0;
 
-  // RSI Weighting
+  // RSI Weight
   if (typeof ind.RSI === "number") {
     if (ind.RSI < 30) score += 2;
     if (ind.RSI < 20) score += 1;
@@ -211,20 +267,17 @@ export function deriveSignal(ind) {
     if (ind.RSI > 80) score -= 1;
   }
 
-  // MACD
-  if (ind.MACD) {
-    score += ind.MACD.hist > 0 ? 2 : -2;
-  }
+  // MACD weight
+  if (ind.MACD) score += ind.MACD.hist > 0 ? 2 : -2;
 
-  // Price Trend
+  // Trend
   if (ind.priceTrend === "UP") score += 1;
   if (ind.priceTrend === "DOWN") score -= 1;
 
-  // Volume confirmation
+  // Volume
   if (ind.volumeTrend === "INCREASING") score += 1;
   if (ind.volumeTrend === "DECREASING") score -= 1;
 
-  // Final Signal
   if (score >= 3) return "BUY";
   if (score <= -3) return "SELL";
   return "HOLD";
