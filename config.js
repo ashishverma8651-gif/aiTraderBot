@@ -9,11 +9,13 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 export const CONFIG = {
   MODE: process.env.NODE_ENV || "production",
 
-  // default market + symbol (can be changed at runtime by bot)
-  ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO",
+  // runtime overrideable
+  ACTIVE_MARKET: (process.env.ACTIVE_MARKET || "CRYPTO").toUpperCase(),
   ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT",
 
-  // symbol maps (4 per market). Commodities used instead of US stocks per request.
+  // --------------------------
+  // SYMBOL MAPPINGS (4 each market)
+  // --------------------------
   SYMBOLS: {
     CRYPTO: {
       BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD" },
@@ -21,18 +23,21 @@ export const CONFIG = {
       BNBUSDT: { binance: "BNBUSDT", yahoo: "BNB-USD" },
       SOLUSDT: { binance: "SOLUSDT", yahoo: "SOL-USD" }
     },
+
     INDIA: {
       NIFTY50: { yahoo: "^NSEI", tv: "NSE:NIFTY" },
       BANKNIFTY: { yahoo: "^NSEBANK", tv: "NSE:BANKNIFTY" },
       RELIANCE: { yahoo: "RELI.NS", tv: "NSE:RELIANCE" },
       TCS: { yahoo: "TCS.NS", tv: "NSE:TCS" }
     },
+
     FOREX: {
       EURUSD: { yahoo: "EURUSD=X" },
       GBPUSD: { yahoo: "GBPUSD=X" },
       USDJPY: { yahoo: "JPY=X" },
       AUDUSD: { yahoo: "AUDUSD=X" }
     },
+
     COMMODITIES: {
       GOLD: { yahoo: "GC=F" },
       SILVER: { yahoo: "SI=F" },
@@ -51,14 +56,15 @@ export const CONFIG = {
   INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
   DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 500),
 
-  // multiple data sources (priority)
+  // multi-source endpoints (primary + mirrors)
   API: {
     BINANCE: [
       "https://api.binance.com",
       "https://api1.binance.com",
-      "https://api2.binance.com",
       "https://data-api.binance.vision"
     ],
+    COINBASE: "https://api.exchange.coinbase.com",
+    OKX: "https://www.okx.com",
     YAHOO: [
       "https://query1.finance.yahoo.com/v8/finance/chart",
       "https://query2.finance.yahoo.com/v8/finance/chart"
@@ -76,8 +82,8 @@ export const CONFIG = {
   PROXY: process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.PROXY || null,
 
   FALLBACK: {
-    MAX_RETRIES: 3,
-    RETRY_DELAY_MS: 500,
+    MAX_RETRIES: Number(process.env.MAX_RETRIES || 4),
+    RETRY_DELAY_MS: Number(process.env.RETRY_DELAY_MS || 600),
     ALWAYS_SYNTHETIC_IF_ALL_FAIL: true
   },
 
