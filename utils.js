@@ -1,65 +1,83 @@
-// utils.js — Robust single-file utils
+// utils.js — Robust multi-source fetch + caching + synthetic fallback
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import CONFIG from "./config.js";
 
-const CACHE_DIR = (CONFIG.PATHS && CONFIG.PATHS.CACHE_DIR) || path.resolve("./cache");
+const CACHE_DIR = CONFIG.PATHS?.CACHE_DIR || path.resolve("./cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-const DEFAULT_TIMEOUT = Number(process.env.AXIOS_TIMEOUT_MS || 12000);
-const DEFAULT_RETRIES = Number(CONFIG.FALLBACK?.MAX_RETRIES || 3);
-const RETRY_DELAY_MS = Number(CONFIG.FALLBACK?.RETRY_DELAY_MS || 500);
-const USER_AGENT = "AI-Trader-Utils/1.0";
+const DEFAULT_TIMEOUT = 12000;
+const DEFAULT_RETRIES = CONFIG.FALLBACK?.MAX_RETRIES || 3;
+const RETRY_DELAY = CONFIG.FALLBACK?.RETRY_DELAY_MS || 500;
+const EXTERNAL_PROXY_SERVICES = [
+  "https://api.codetabs.com/v1/proxy?quest=",
+  "https://api.allorigins.win/raw?url=",
+  "https://corsproxy.io/?"
+];
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-function safeNum(v, fallback=0){ const n = Number(v); return Number.isFinite(n)?n:fallback; }
-function symSafe(s=''){ return String(s||'').toUpperCase().replace(/[^A-Z0-9_\-\.^]/g,'_'); }
-function tfSafe(tf='15m'){ return String(tf||'15m').replace(/[^a-z0-9]/gi,'_'); }
+function safeNum(x,d=0){ const n=Number(x); return Number.isFinite(n)?n:d; }
+function tfSafe(tf="15m"){ return String(tf).replace(/[^a-z0-9]/gi,"_"); }
+function symSafe(s=""){ return String(s||"").toUpperCase().replace(/[^A-Z0-9_\-\.\^]/g,"_"); }
 function cachePath(symbol, interval){ return path.join(CACHE_DIR, `${symSafe(symbol)}_${tfSafe(interval)}.json`); }
 function readCache(symbol, interval){
-  try{
-    const p = cachePath(symbol, interval);
-    if(!fs.existsSync(p)) return null;
-    return JSON.parse(fs.readFileSync(p,'utf8')||'null');
-  }catch(e){ return null; }
+  try{ const p=cachePath(symbol,interval); if(!fs.existsSync(p)) return null; return JSON.parse(fs.readFileSync(p,"utf8")||"null"); }catch(e){return null;}
 }
 function writeCache(symbol, interval, data){
-  try{ fs.writeFileSync(cachePath(symbol, interval), JSON.stringify({fetchedAt:Date.now(), data}, null, 2)); }catch(e){}
+  try{ fs.writeFileSync(cachePath(symbol,interval), JSON.stringify({ fetchedAt: Date.now(), data }, null, 2)); }catch {}
 }
-function lastCachedPrice(symbol){
+function lastGoodPrice(symbol){
   try{
     const s = symSafe(symbol);
-    if(!fs.existsSync(CACHE_DIR)) return null;
-    const files = fs.readdirSync(CACHE_DIR).filter(f=>f.startsWith(s+'_')).sort((a,b)=>fs.statSync(path.join(CACHE_DIR,b)).mtimeMs - fs.statSync(path.join(CACHE_DIR,a)).mtimeMs);
+    const files = fs.readdirSync(CACHE_DIR).filter(f => f.startsWith(s + "_"));
+    files.sort((a,b)=>fs.statSync(path.join(CACHE_DIR,b)).mtimeMs - fs.statSync(path.join(CACHE_DIR,a)).mtimeMs);
     for(const f of files){
-      try{
-        const obj = JSON.parse(fs.readFileSync(path.join(CACHE_DIR,f),'utf8')||'{}');
-        const arr = obj?.data;
-        if(Array.isArray(arr) && arr.length){ const last = arr[arr.length-1]; if(last && Number.isFinite(+last.close)) return Number(last.close); }
-      }catch(e){}
+      try{ const obj=JSON.parse(fs.readFileSync(path.join(CACHE_DIR,f),"utf8")||"{}"); const arr=obj?.data; if(Array.isArray(arr)&&arr.length){ const last=arr.at(-1); if(last && Number.isFinite(+last.close)) return Number(last.close);} }catch{}
     }
-  }catch(e){}
+  }catch{}
   return null;
 }
 
-function axiosOpts(timeout=DEFAULT_TIMEOUT){
-  return { timeout, headers: { "User-Agent": USER_AGENT, Accept: "*/*" } };
+function generateSyntheticCandles({ lastPrice=100, count=200, intervalMs=60_000 }){
+  const out=[]; const base = safeNum(lastPrice,100); const atr = Math.max(base*0.002, base*0.005);
+  let t = Date.now() - (count-1)*intervalMs; let prev = base;
+  for(let i=0;i<count;i++){
+    const noise = (Math.random()-0.5) * atr * (0.6 + Math.random()*1.4);
+    const open = prev;
+    const close = Math.max(0.0000001, prev + noise);
+    const high = Math.max(open, close) + Math.abs(noise)*Math.random();
+    const low = Math.min(open, close) - Math.abs(noise)*Math.random();
+    const vol = Math.round(Math.abs(noise)*1000 + Math.random()*100);
+    out.push({ t, open: +open, high: +high, low: +low, close: +close, vol });
+    prev = close; t += intervalMs;
+  }
+  return out;
 }
 
-// ---------------- Normalizers ----------------
-function normalizeBinance(raw){
-  if(!Array.isArray(raw)) return [];
-  try{
-    return raw.map(r=>({
-      t: Number(r[0]),
-      open: safeNum(r[1]),
-      high: safeNum(r[2]),
-      low: safeNum(r[3]),
-      close: safeNum(r[4]),
-      vol: safeNum(r[5],0)
+// normalizers
+function normalizeKlineArray(arr){
+  if(!Array.isArray(arr)) return [];
+  if(Array.isArray(arr[0])){
+    try{
+      const out = arr.map(k=>({ t: Number(k[0]), open: safeNum(k[1]), high: safeNum(k[2]), low: safeNum(k[3]), close: safeNum(k[4]), vol: safeNum(k[5],0) }))
+        .filter(c=>Number.isFinite(c.t) && Number.isFinite(c.close));
+      out.sort((a,b)=>a.t-b.t);
+      return out;
+    }catch{}
+  }
+  if(arr.length && typeof arr[0] === "object"){
+    const out = arr.map(c=>({
+      t: Number(c.t||c.timestamp||c.time||0),
+      open: safeNum(c.open??c.o),
+      high: safeNum(c.high??c.h),
+      low: safeNum(c.low??c.l),
+      close: safeNum(c.close??c.c),
+      vol: safeNum(c.vol??c.volume||0)
     })).filter(c=>Number.isFinite(c.t) && Number.isFinite(c.close)).sort((a,b)=>a.t-b.t);
-  }catch(e){ return []; }
+    return out;
+  }
+  return [];
 }
 
 function normalizeYahooChart(res){
@@ -67,267 +85,220 @@ function normalizeYahooChart(res){
     if(!res || !res.chart || !Array.isArray(res.chart.result) || !res.chart.result[0]) return [];
     const r = res.chart.result[0];
     const ts = r.timestamp || [];
-    const q = (r.indicators && r.indicators.quote && r.indicators.quote[0]) || {};
-    const out = [];
+    const q = r.indicators?.quote?.[0] || {};
+    const out=[];
     for(let i=0;i<ts.length;i++){
-      const close = q.close && q.close[i];
+      const close = q.close?.[i];
       if(!Number.isFinite(close)) continue;
-      out.push({
-        t: Number(ts[i]) * 1000,
-        open: safeNum(q.open && q.open[i], close),
-        high: safeNum(q.high && q.high[i], close),
-        low: safeNum(q.low && q.low[i], close),
-        close: safeNum(close),
-        vol: safeNum(q.volume && q.volume[i],0)
-      });
+      out.push({ t: Number(ts[i])*1000, open: safeNum(q.open?.[i], close), high: safeNum(q.high?.[i], close), low: safeNum(q.low?.[i], close), close: safeNum(close), vol: safeNum(q.volume?.[i],0) });
     }
-    return out.sort((a,b)=>a.t-b.t);
-  }catch(e){ return []; }
+    out.sort((a,b)=>a.t-b.t);
+    return out;
+  }catch{ return []; }
 }
 
-// ---------------- Synthetic candles (never empty) ----------------
-function intervalToMs(tf='15m'){
-  const s = String(tf||'15m').toLowerCase();
-  if(s.endsWith('m')) return Number(s.slice(0,-1))*60_000;
-  if(s.endsWith('h')) return Number(s.slice(0,-1))*60*60_000;
-  if(s.endsWith('d')) return Number(s.slice(0,-1))*24*60*60_000;
-  return 60_000;
-}
-function generateSynthetic({lastPrice=100, count=200, interval='15m'}) {
-  const ms = intervalToMs(interval);
-  const out = [];
-  let t = Date.now() - (count-1)*ms;
-  let prev = safeNum(lastPrice,100);
-  const atr = Math.max(prev*0.001, prev*0.002);
-  for(let i=0;i<count;i++){
-    const noise = (Math.random()-0.5)*atr;
-    const open = prev;
-    const close = Math.max(0.000001, prev + noise);
-    const high = Math.max(open,close) + Math.abs(noise)*Math.random();
-    const low = Math.min(open,close) - Math.abs(noise)*Math.random();
-    const vol = Math.round(Math.abs(noise)*1000 + Math.random()*100);
-    out.push({ t, open, high, low, close, vol });
-    prev = close;
-    t += ms;
-  }
-  return out;
-}
-
-// ---------------- safeGet (retries + mirrors) ----------------
-async function safeGet(url, opts={timeout:DEFAULT_TIMEOUT, mirrors:[]}) {
+// axios safeGet
+async function safeGet(url, { timeout = DEFAULT_TIMEOUT, responseType = "json", mirrors = [], tryProxies = true } = {}){
   if(!url) return null;
-  const timeout = opts.timeout || DEFAULT_TIMEOUT;
-  const mirrors = opts.mirrors || [];
-  // try primary
-  for(let i=0;i<DEFAULT_RETRIES;i++){
+  for(let attempt=0; attempt<Math.max(1,DEFAULT_RETRIES); attempt++){
     try{
-      const r = await axios.get(url, axiosOpts(timeout));
-      if(typeof r.data !== 'undefined' && r.data !== null) return r.data;
-    }catch(e){}
-    await sleep(RETRY_DELAY_MS);
+      const r = await axios.get(url, { timeout, responseType, headers: { "User-Agent": "AI-Trader-Utils/1.0", Accept: "*/*" } });
+      if(r?.data !== undefined && r?.data !== null) return r.data;
+    }catch{}
+    await sleep(RETRY_DELAY + Math.random()*100);
   }
-  // try mirrors by replacing base
-  try{
-    const u = new URL(url);
-    for(const base of mirrors){
-      if(!base) continue;
-      const final = base.replace(/\/+$/,'') + u.pathname + u.search;
-      for(let i=0;i<DEFAULT_RETRIES;i++){
+  for(const base of mirrors || []){
+    try{
+      const u = new URL(url);
+      const final = base.replace(/\/+$/,"") + u.pathname + u.search;
+      for(let attempt=0; attempt<Math.max(1,DEFAULT_RETRIES); attempt++){
         try{
-          const r = await axios.get(final, axiosOpts(timeout));
-          if(typeof r.data !== 'undefined' && r.data !== null) return r.data;
-        }catch(e){}
-        await sleep(RETRY_DELAY_MS);
+          const r = await axios.get(final, { timeout, responseType, headers: { "User-Agent": "AI-Trader-Utils/1.0" } });
+          if(r?.data !== undefined && r?.data !== null) return r.data;
+        }catch{}
+        await sleep(RETRY_DELAY + Math.random()*100);
       }
-    }
-  }catch(e){}
-  // external proxy fallback - try one
-  try{
-    const p = "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(url);
-    for(let i=0;i<2;i++){
+    }catch{}
+  }
+  if(tryProxies){
+    for(const pbase of EXTERNAL_PROXY_SERVICES){
       try{
-        const r = await axios.get(p, axiosOpts(timeout));
-        if(typeof r.data !== 'undefined' && r.data !== null) return r.data;
-      }catch(e){}
-      await sleep(RETRY_DELAY_MS);
+        const prox = pbase + encodeURIComponent(url);
+        for(let attempt=0; attempt<Math.max(1,DEFAULT_RETRIES); attempt++){
+          try{
+            const r = await axios.get(prox, { timeout: DEFAULT_TIMEOUT, responseType: "text", headers: { "User-Agent": "AI-Trader-Utils/1.0" } });
+            if(r?.data !== undefined && r?.data !== null) return r.data;
+          }catch{}
+          await sleep(RETRY_DELAY + Math.random()*100);
+        }
+      }catch{}
     }
-  }catch(e){}
+  }
   return null;
 }
 
-// ---------------- Fetchers ----------------
+// interval ms
+function intervalToMs(interval="15m"){
+  const v = String(interval).toLowerCase();
+  if(v.endsWith("m")) return Number(v.slice(0,-1)) * 60_000;
+  if(v.endsWith("h")) return Number(v.slice(0,-1)) * 60*60_000;
+  if(v.endsWith("d")) return Number(v.slice(0,-1)) * 24*60*60_000;
+  return 60_000;
+}
 
-// 1) fetchCrypto (Binance primary)
-export async function fetchCrypto(symbol, interval='15m', limit=500){
-  const s = String(symbol||'').toUpperCase();
+// --------------- Market-specific fetchers ---------------
+
+// crypto (binance primary)
+async function fetchCrypto(symbol, interval="15m", limit=500){
+  const s = String(symbol||"").toUpperCase();
   if(!s) return { data: [], price: null };
-  const sources = CONFIG.API?.BINANCE && CONFIG.API.BINANCE.length ? CONFIG.API.BINANCE : ["https://api.binance.com"];
-  const base = sources[0].replace(/\/+$/,'');
+  const sources = CONFIG.API?.BINANCE || ["https://api.binance.com"];
+  const base = sources[0].replace(/\/+$/,"");
   const url = `${base}/api/v3/klines?symbol=${encodeURIComponent(s)}&interval=${encodeURIComponent(interval)}&limit=${Number(limit)}`;
   const mirrors = sources.slice(1);
-  const cache = readCache(s, interval);
-
+  const cached = readCache(s, interval);
   try{
-    const raw = await safeGet(url, { timeout: DEFAULT_TIMEOUT, mirrors });
+    const raw = await safeGet(url, { responseType: "json", mirrors });
     if(Array.isArray(raw) && raw.length){
-      const k = normalizeBinance(raw);
-      if(k.length){ writeCache(s, interval, k); return { data:k, price: k[k.length-1].close }; }
+      const k = normalizeKlineArray(raw);
+      if(k.length){ writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
     }
-  }catch(e){}
-
-  // try mirrors explicitly
-  for(const m of mirrors){
-    try{
-      const url2 = `${m.replace(/\/+$/,'')}/api/v3/klines?symbol=${encodeURIComponent(s)}&interval=${encodeURIComponent(interval)}&limit=${Number(limit)}`;
-      const raw2 = await safeGet(url2, { timeout: DEFAULT_TIMEOUT });
-      if(Array.isArray(raw2) && raw2.length){
-        const k = normalizeBinance(raw2);
-        if(k.length){ writeCache(s, interval, k); return { data:k, price:k[k.length-1].close }; }
-      }
-    }catch(e){}
-  }
-
-  // last cache or synthetic
-  if(cache && cache.data && cache.data.length) return { data: cache.data, price: cache.data[cache.data.length-1].close || lastCachedPrice(s) };
-  const synthetic = generateSynthetic({ lastPrice: lastCachedPrice(s) || 100, count: Math.min(500, limit), interval });
+  }catch{}
+  // try Yahoo by common mapping (BTC-USD etc)
+  try{
+    const yf = (CONFIG.API?.YAHOO?.[0]||"https://query1.finance.yahoo.com/v8/finance/chart").replace(/\/+$/,"");
+    const tf = interval === "1m" ? "1m" : interval === "5m" ? "5m" : interval === "15m" ? "15m" : interval === "30m" ? "30m" : "60m";
+    // try BTC-USD style
+    const altSym = s.replace("USDT","-USD").replace("BTC","BTC");
+    const yurl = `${yf}/${encodeURIComponent(altSym)}?interval=${tf}&range=7d`;
+    const yraw = await safeGet(yurl, { responseType: "json" });
+    const ky = normalizeYahooChart(yraw);
+    if(ky.length){ writeCache(s, interval, ky); return { data: ky, price: ky.at(-1)?.close ?? lastGoodPrice(s) }; }
+  }catch{}
+  if(cached && Array.isArray(cached.data) && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
+  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: Math.min(500, limit), intervalMs: intervalToMs(interval) });
   writeCache(s, interval, synthetic);
-  return { data: synthetic, price: synthetic[synthetic.length-1].close };
+  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
 }
 
-// 2) fetchYahoo (generic)
-export async function fetchYahoo(symbol, interval='15m'){
-  const s = String(symbol||'').trim();
+// yahoo generic (stocks/indices/commodities/forex)
+async function fetchYahoo(symbol, interval="15m"){
+  const s = String(symbol||"").trim();
   if(!s) return { data: [], price: null };
-  const sources = CONFIG.API?.YAHOO && CONFIG.API.YAHOO.length ? CONFIG.API.YAHOO : ["https://query1.finance.yahoo.com/v8/finance/chart"];
-  const base = sources[0].replace(/\/+$/,'');
+  const base = (CONFIG.API?.YAHOO?.[0] || "https://query1.finance.yahoo.com/v8/finance/chart").replace(/\/+$/,"");
   const tfmap = { "1m":{interval:"1m",range:"1d"}, "5m":{interval:"5m",range:"5d"}, "15m":{interval:"15m",range:"5d"}, "30m":{interval:"30m",range:"1mo"}, "1h":{interval:"60m",range:"1mo"} }[interval] || {interval:"15m",range:"5d"};
   const url = `${base}/${encodeURIComponent(s)}?interval=${tfmap.interval}&range=${tfmap.range}`;
-  const cache = readCache(s, interval);
+  const cached = readCache(s, interval);
   try{
-    const raw = await safeGet(url, { timeout: DEFAULT_TIMEOUT, mirrors: sources.slice(1) });
-    const k = normalizeYahooChart(raw);
-    if(k.length){ writeCache(s, interval, k); return { data:k, price:k[k.length-1].close }; }
-  }catch(e){}
-  if(cache && cache.data && cache.data.length) return { data:cache.data, price: cache.data[cache.data.length-1].close || lastCachedPrice(s) };
-
-  // synthetic fallback
-  const synthetic = generateSynthetic({ lastPrice: lastCachedPrice(s) || 100, count:200, interval });
+    const res = await safeGet(url, { responseType:"json", mirrors: CONFIG.API?.YAHOO || [] });
+    const k = normalizeYahooChart(res);
+    if(k.length){ writeCache(s, interval, k); return { data: k, price: k.at(-1)?.close ?? lastGoodPrice(s) }; }
+  }catch{}
+  if(cached && Array.isArray(cached.data) && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(s) };
+  const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(s) || 100, count: 200, intervalMs: intervalToMs(interval) });
   writeCache(s, interval, synthetic);
-  return { data: synthetic, price: synthetic[synthetic.length-1].close };
+  return { data: synthetic, price: synthetic.at(-1)?.close ?? lastGoodPrice(s) };
 }
 
-// 3) fetchForex (exchangerate.host fallback)
-export async function fetchForex(symbol, interval='15m'){
-  const sIn = String(symbol||'').toUpperCase().replace('/','');
-  if(!sIn) return { data: [], price: null };
-  // try Yahoo mapping first if common format provided
-  const yahooSymbol = (CONFIG.SYMBOLS?.FOREX && CONFIG.SYMBOLS.FOREX[sIn] && CONFIG.SYMBOLS.FOREX[sIn].yahoo) ? CONFIG.SYMBOLS.FOREX[sIn].yahoo : sIn;
-  const yres = await fetchYahoo(yahooSymbol, interval);
-  if(yres && Array.isArray(yres.data) && yres.data.length) return yres;
-
-  // fallback to exchangerate host for instant rate
+// exchangerate (for forex quick price)
+async function fetchExchangeRatePair(symbol, interval="15m"){
   try{
+    const s = String(symbol||"").replace("=","").replace("/","");
+    if(!s || s.length < 6) return { data: [], price: null };
+    const b = s.slice(0,3), q = s.slice(3,6);
     const base = CONFIG.API?.EXCHANGERATE || "https://api.exchangerate.host";
-    const b = sIn.slice(0,3), q = sIn.slice(3,6);
-    if(b.length===3 && q.length===3){
-      const url = `${base}/latest?base=${encodeURIComponent(b)}&symbols=${encodeURIComponent(q)}`;
-      const raw = await safeGet(url, { timeout: DEFAULT_TIMEOUT });
-      if(raw && raw.rates){
-        const rate = raw.rates[q] || Object.values(raw.rates)[0];
-        if(Number.isFinite(+rate)){
-          const now = Date.now();
-          const candle = [{ t: now - 60000, open:rate, high:rate, low:rate, close:rate, vol:0 }];
-          writeCache(sIn, interval, candle);
-          return { data: candle, price: rate };
-        }
-      }
+    const url = `${base}/latest?base=${encodeURIComponent(b)}&symbols=${encodeURIComponent(q)}`;
+    const raw = await safeGet(url, { responseType: "json" });
+    const rate = raw && raw.rates ? (raw.rates[q] || Object.values(raw.rates)[0]) : null;
+    if(typeof rate === "number"){
+      const now = Date.now();
+      const candle = [{ t: now - 60000, open: rate, high: rate, low: rate, close: rate, vol: 0 }];
+      writeCache(symbol, interval, candle);
+      return { data: candle, price: rate };
     }
-  }catch(e){}
-
-  const cache = readCache(sIn, interval);
-  if(cache && cache.data && cache.data.length) return { data: cache.data, price: cache.data[cache.data.length-1].close || lastCachedPrice(sIn) };
-  const synthetic = generateSynthetic({ lastPrice: lastCachedPrice(sIn) || 1, count:200, interval });
-  writeCache(sIn, interval, synthetic);
-  return { data: synthetic, price: synthetic[synthetic.length-1].close };
+  }catch{}
+  return { data: [], price: null };
 }
 
-// 4) fetchNSE (India indices) - uses mapping in CONFIG.SYMBOLS.INDIA -> yahoo
-export async function fetchNSE(symbol, interval='15m'){
+// unified router
+export async function fetchUniversal(inputSymbol, interval="15m"){
   try{
-    const s = String(symbol||'').toUpperCase();
-    const mapping = CONFIG.SYMBOLS && CONFIG.SYMBOLS.INDIA && CONFIG.SYMBOLS.INDIA[s] ? CONFIG.SYMBOLS.INDIA[s].yahoo : s;
-    return await fetchYahoo(mapping, interval);
-  }catch(e){}
-  const cache = readCache(symbol, interval);
-  if(cache && cache.data && cache.data.length) return { data:cache.data, price: cache.data[cache.data.length-1].close || lastCachedPrice(symbol) };
-  const synthetic = generateSynthetic({ lastPrice: lastCachedPrice(symbol) || 100, count:200, interval });
-  writeCache(symbol, interval, synthetic);
-  return { data: synthetic, price: synthetic[synthetic.length-1].close };
-}
+    const raw = String(inputSymbol||"").trim();
+    if(!raw) return { data: [], price: null };
+    // detect market via CONFIG.SYMBOLS maps
+    const maps = CONFIG.SYMBOLS || {};
+    const findIn = (market) => { const m = maps[market] || {}; return (m && (m[raw] || Object.keys(m).includes(raw))); };
+    const isCrypto = !!(maps.CRYPTO && (maps.CRYPTO[raw] || Object.keys(maps.CRYPTO).includes(raw)));
+    const isIndia = !!(maps.INDIA && (maps.INDIA[raw] || Object.keys(maps.INDIA).includes(raw)));
+    const isForex = !!(maps.FOREX && (maps.FOREX[raw] || Object.keys(maps.FOREX).includes(raw)));
+    const isCommodity = !!(maps.COMMODITIES && (maps.COMMODITIES[raw] || Object.keys(maps.COMMODITIES).includes(raw)));
 
-// 5) fetchCommodity — gateway to Yahoo
-export async function fetchCommodity(symbol, interval='15m'){
-  const map = CONFIG.SYMBOLS?.COMMODITIES && CONFIG.SYMBOLS.COMMODITIES[symbol] ? CONFIG.SYMBOLS.COMMODITIES[symbol].yahoo : symbol;
-  return await fetchYahoo(map, interval);
-}
+    // forced active market
+    const forced = (CONFIG.ACTIVE_MARKET || "").toUpperCase();
 
-// ---------------- Master router ----------------
-export async function fetchUniversal(inputSymbol, interval='15m'){
-  try{
-    const symbol = String(inputSymbol||'').trim();
-    if(!symbol) return { data: [], price: null };
-
-    // heuristics: explicit config maps first
-    if(CONFIG.SYMBOLS && CONFIG.SYMBOLS.CRYPTO && CONFIG.SYMBOLS.CRYPTO[symbol]) return await fetchCrypto(CONFIG.SYMBOLS.CRYPTO[symbol].binance || symbol, interval);
-    if(CONFIG.SYMBOLS && CONFIG.SYMBOLS.INDIA && CONFIG.SYMBOLS.INDIA[symbol]) return await fetchNSE(symbol, interval);
-    if(CONFIG.SYMBOLS && CONFIG.SYMBOLS.FOREX && CONFIG.SYMBOLS.FOREX[symbol]) return await fetchForex(symbol, interval);
-    if(CONFIG.SYMBOLS && CONFIG.SYMBOLS.COMMODITIES && CONFIG.SYMBOLS.COMMODITIES[symbol]) return await fetchCommodity(symbol, interval);
-
-    // fallback heuristics by pattern
-    if(/USDT$|BTC$|ETH$/.test(symbol)) return await fetchCrypto(symbol, interval);
-    if(/=X$/.test(symbol) || symbol.length===6 && symbol.endsWith("USD")) return await fetchForex(symbol, interval);
-    if(/=F$/.test(symbol) || /GOLD|SILVER|CRUDE|OIL|NG/.test(symbol.toUpperCase())) return await fetchCommodity(symbol, interval);
-
-    // finally try Yahoo generic
-    return await fetchYahoo(symbol, interval);
+    if(forced === "CRYPTO" || isCrypto) return await fetchCrypto(raw, interval, CONFIG.DEFAULT_LIMIT || 500);
+    if(forced === "INDIA" || isIndia){
+      const mapping = (maps.INDIA && maps.INDIA[raw]) ? (maps.INDIA[raw].yahoo || raw) : raw;
+      return await fetchYahoo(mapping, interval);
+    }
+    if(forced === "FOREX" || isForex){
+      const mapping = (maps.FOREX && maps.FOREX[raw]) ? (maps.FOREX[raw].yahoo || raw) : raw;
+      // try exchangerate quick
+      const ex = await fetchExchangeRatePair(mapping, interval);
+      if(ex && ex.price) return ex;
+      return await fetchYahoo(mapping, interval);
+    }
+    if(forced === "COMMODITIES" || isCommodity){
+      const mapping = (maps.COMMODITIES && maps.COMMODITIES[raw]) ? (maps.COMMODITIES[raw].yahoo || raw) : raw;
+      return await fetchYahoo(mapping, interval);
+    }
+    // fallback: try crypto then yahoo
+    const c = await fetchCrypto(raw, interval, CONFIG.DEFAULT_LIMIT || 200);
+    if(c && c.data && c.data.length) return c;
+    return await fetchYahoo(raw, interval);
   }catch(e){
-    const cache = readCache(inputSymbol, interval);
-    if(cache && cache.data && cache.data.length) return { data: cache.data, price: cache.data[cache.data.length-1].close || lastCachedPrice(inputSymbol) };
-    const synthetic = generateSynthetic({ lastPrice: lastCachedPrice(inputSymbol) || 100, count:200, interval });
+    console.log("fetchUniversal error:", e?.message || e);
+    const cached = readCache(inputSymbol, interval);
+    if(cached && cached.data && cached.data.length) return { data: cached.data, price: cached.data.at(-1)?.close ?? lastGoodPrice(inputSymbol) };
+    const synthetic = generateSyntheticCandles({ lastPrice: lastGoodPrice(inputSymbol) || 100, count: 200, intervalMs: intervalToMs(interval) });
     writeCache(inputSymbol, interval, synthetic);
-    return { data: synthetic, price: synthetic[synthetic.length-1].close };
+    return { data: synthetic, price: synthetic.at(-1)?.close ?? null };
   }
 }
 
-// ---------------- Multi-TF helper ----------------
-function pLimit(concurrency=3){
-  const queue = []; let active=0;
-  const next = ()=>{ if(!queue.length || active>=concurrency) return; active++; const item = queue.shift(); item.fn().then(item.resolve).catch(item.reject).finally(()=>{active--; next();}); };
-  return (fn)=> new Promise((res,rej)=>{ queue.push({fn, resolve:res, reject:rej}); next(); });
-}
-
-export async function fetchMultiTF(symbol, tfs = ["1m","5m","15m"]) {
-  const sym = String(symbol||'').toUpperCase();
-  if(!sym) {
-    const empty={}; for(const tf of tfs) empty[tf]={data:[], price:null}; return empty;
-  }
-  const out = {}; const limit = pLimit(3);
-  const tasks = tfs.map(tf => limit(async ()=>{
-    await sleep(30 + Math.floor(Math.random()*80));
-    out[tf] = await fetchUniversal(sym, tf);
-  }));
-  await Promise.all(tasks);
+// fetchMultiTF
+export async function fetchMultiTF(symbol, tfs = ["1m","5m","15m","30m","1h"]){
+  const out = {};
+  const promises = tfs.map(tf => (async ()=>{
+    try{ await sleep(Math.random()*120+20); out[tf] = await fetchUniversal(symbol, tf); }catch(e){ out[tf] = { data: [], price: null }; }
+  })());
+  await Promise.all(promises);
   return out;
 }
 
-// legacy compatibility
-export async function fetchMarketData(symbol, interval='15m', limit=200){
-  const res = await fetchUniversal(symbol, interval);
-  return { data: res.data || [], price: res.price || null, updated: new Date().toISOString() };
+// compatibility wrapper (legacy)
+export async function fetchMarketData(symbol, interval="15m", limit=200){
+  const r = await fetchUniversal(symbol, interval);
+  return { data: r.data || [], price: r.price ?? lastGoodPrice(symbol) ?? null, updated: new Date().toISOString() };
 }
 
 export async function fetchPrice(symbol){
-  const u = await fetchUniversal(symbol, '1m');
-  const p = (u && Number(u.price)) ? Number(u.price) : lastCachedPrice(symbol);
-  return p || null;
+  try{
+    const s = String(symbol||"").trim();
+    if(!s) return null;
+    // try fetchUniversal 1m
+    const u = await fetchUniversal(s, "1m");
+    if(u && u.price) return u.price;
+    // last cached
+    const last = lastGoodPrice(s);
+    if(last) return last;
+    return null;
+  }catch{return null;}
 }
+
+// exports
+export default {
+  fetchMarketData, fetchUniversal, fetchMultiTF, fetchPrice
+};
+
+export { fetchMarketData, fetchUniversal, fetchMultiTF, fetchPrice };
