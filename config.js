@@ -1,4 +1,4 @@
-// config.js — FINAL FULLY COMPATIBLE WITH utils.js
+// config.js — SINGLE EXPORT (NO CONFLICTS)
 
 import fs from "fs";
 import path from "path";
@@ -7,13 +7,13 @@ const ROOT = process.cwd();
 const CACHE_DIR = path.join(ROOT, "cache");
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-export const CONFIG = {
+const CONFIG = {
   MODE: process.env.NODE_ENV || "production",
 
   ACTIVE_MARKET: "CRYPTO",
   ACTIVE_SYMBOL: "BTCUSDT",
 
-  // ================= SYMBOL MAP (ALL 100% FIXED) =================
+  // ===================== SYMBOLS =====================
   SYMBOLS: {
     CRYPTO: {
       BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD" },
@@ -54,7 +54,6 @@ export const CONFIG = {
   INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
   DEFAULT_LIMIT: 500,
 
-  // ================= API SOURCES =================
   API: {
     BINANCE: [
       "https://api.binance.com",
@@ -62,7 +61,6 @@ export const CONFIG = {
       "https://api2.binance.com",
       "https://data-api.binance.vision"
     ],
-
     YAHOO: [
       "https://query1.finance.yahoo.com/v8/finance/chart",
       "https://query2.finance.yahoo.com/v8/finance/chart",
@@ -72,25 +70,10 @@ export const CONFIG = {
 
   PATHS: { CACHE_DIR },
 
-  PROXY:
-    process.env.HTTP_PROXY ||
-    process.env.HTTPS_PROXY ||
-    process.env.PROXY ||
-    null,
-
   FALLBACK: {
     MAX_RETRIES: 3,
-    RETRY_DELAY_MS: 400,
-    ALWAYS_SYNTHETIC_IF_ALL_FAIL: true
-  },
-
-  TELEGRAM: {
-    BOT_TOKEN: process.env.BOT_TOKEN || "",
-    CHAT_ID: process.env.CHAT_ID || "",
-    ENABLED: Boolean(process.env.BOT_TOKEN && process.env.CHAT_ID)
-  },
-
-  REPORT_INTERVAL_MS: 10 * 60 * 1000
+    RETRY_DELAY_MS: 400
+  }
 };
 
 export default CONFIG;
