@@ -1,4 +1,4 @@
-// config.js — HEAVY CONFIG (final)
+// config.js — Heavy config (single source of truth)
 import fs from "fs";
 import path from "path";
 
@@ -9,29 +9,29 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 export const CONFIG = {
   MODE: process.env.NODE_ENV || "production",
 
-  // Active market/symbol (can be changed by bot panel)
+  // default market + symbol (can be changed at runtime by bot)
   ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO",
   ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT",
 
-  // Symbol maps (used by utils to route to correct external source)
+  // symbol maps (4 per market). Commodities used instead of US stocks per request.
   SYMBOLS: {
     CRYPTO: {
-      BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD", tv: "BINANCE:BTCUSDT" },
-      ETHUSDT: { binance: "ETHUSDT", yahoo: "ETH-USD", tv: "BINANCE:ETHUSDT" },
-      SOLUSDT: { binance: "SOLUSDT", yahoo: "SOL-USD", tv: "BINANCE:SOLUSDT" },
-      XRPUSDT: { binance: "XRPUSDT", yahoo: "XRP-USD", tv: "BINANCE:XRPUSDT" }
+      BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD" },
+      ETHUSDT: { binance: "ETHUSDT", yahoo: "ETH-USD" },
+      BNBUSDT: { binance: "BNBUSDT", yahoo: "BNB-USD" },
+      SOLUSDT: { binance: "SOLUSDT", yahoo: "SOL-USD" }
     },
     INDIA: {
-      NIFTY50: { tv: "NSE:NIFTY", yahoo: "^NSEI" },
-      BANKNIFTY: { tv: "NSE:BANKNIFTY", yahoo: "^NSEBANK" },
-      RELIANCE: { tv: "NSE:RELIANCE", yahoo: "RELI.NS" },
-      TCS: { tv: "NSE:TCS", yahoo: "TCS.NS" }
+      NIFTY50: { yahoo: "^NSEI", tv: "NSE:NIFTY" },
+      BANKNIFTY: { yahoo: "^NSEBANK", tv: "NSE:BANKNIFTY" },
+      RELIANCE: { yahoo: "RELI.NS", tv: "NSE:RELIANCE" },
+      TCS: { yahoo: "TCS.NS", tv: "NSE:TCS" }
     },
     FOREX: {
       EURUSD: { yahoo: "EURUSD=X" },
       GBPUSD: { yahoo: "GBPUSD=X" },
       USDJPY: { yahoo: "JPY=X" },
-      XAUUSD: { yahoo: "GC=F" } // gold as forex/commodity pair
+      AUDUSD: { yahoo: "AUDUSD=X" }
     },
     COMMODITIES: {
       GOLD: { yahoo: "GC=F" },
@@ -48,10 +48,10 @@ export const CONFIG = {
     COMMODITIES: "GOLD"
   },
 
-  INTERVALS: ["1m","5m","15m","30m","1h"],
+  INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
   DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 500),
 
-  // API endpoints / mirrors you can modify to add more mirrors
+  // multiple data sources (priority)
   API: {
     BINANCE: [
       "https://api.binance.com",
@@ -64,10 +64,17 @@ export const CONFIG = {
       "https://query2.finance.yahoo.com/v8/finance/chart"
     ],
     EXCHANGERATE: "https://api.exchangerate.host",
-    FMP: "https://financialmodelingprep.com/api/v3"
+    FMP: "https://financialmodelingprep.com/api/v3",
+    TRADINGVIEW_PROXY: [
+      "https://tvc4.forexfeed.net",
+      "https://tvc5.forexfeed.net"
+    ]
   },
 
-  // Fallback / caching
+  PATHS: { CACHE_DIR },
+
+  PROXY: process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.PROXY || null,
+
   FALLBACK: {
     MAX_RETRIES: 3,
     RETRY_DELAY_MS: 500,
@@ -80,7 +87,7 @@ export const CONFIG = {
     ENABLED: Boolean(process.env.BOT_TOKEN && process.env.CHAT_ID)
   },
 
-  PATHS: { CACHE_DIR }
+  REPORT_INTERVAL_MS: Number(process.env.REPORT_INTERVAL_MS || 15 * 60 * 1000)
 };
 
 export default CONFIG;
