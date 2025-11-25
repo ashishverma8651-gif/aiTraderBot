@@ -1,5 +1,4 @@
-// config.js — FIXED MULTI-SOURCE CONFIG
-
+// config.js
 import fs from "fs";
 import path from "path";
 
@@ -10,10 +9,9 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 export const CONFIG = {
   MODE: process.env.NODE_ENV || "production",
 
-  ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO",
-  ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT",
+  ACTIVE_MARKET: "CRYPTO",
+  ACTIVE_SYMBOL: "BTCUSDT",
 
-  // SYMBOL MAPS — FIXED
   SYMBOLS: {
     CRYPTO: {
       BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD" },
@@ -44,29 +42,33 @@ export const CONFIG = {
     }
   },
 
-  INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
+  DEFAULT_BY_MARKET: {
+    CRYPTO: "BTCUSDT",
+    INDIA: "NIFTY50",
+    FOREX: "EURUSD",
+    COMMODITIES: "GOLD"
+  },
 
-  // FIXED — utils.js SE MATCHED NAMES
+  // Free and fast mirror APIs
   API: {
-    BINANCE_URLS: [
+    BINANCE: [
       "https://api.binance.com",
       "https://api1.binance.com",
       "https://api2.binance.com",
       "https://data-api.binance.vision"
     ],
-
-    YAHOO_URLS: [
+    YAHOO: [
       "https://query1.finance.yahoo.com/v8/finance/chart",
       "https://query2.finance.yahoo.com/v8/finance/chart"
-    ],
-
-    TV_PROXY: [
-      "https://tvc4.forexfeed.net",
-      "https://tvc5.forexfeed.net"
     ]
   },
 
-  PATHS: { CACHE_DIR }
+  PATHS: { CACHE_DIR },
+
+  TELEGRAM: {
+    BOT_TOKEN: process.env.BOT_TOKEN || "",
+    CHAT_ID: process.env.CHAT_ID || ""
+  }
 };
 
 export default CONFIG;
