@@ -2,7 +2,8 @@
 import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
 import { fetchPrice, fetchMultiTF } from "./utils.js";
-import { calcRSI, calcATR, calcTrend } from "./indicators.js";
+import { calcRSI, calcATR, calcTrend } from "./core_indicators.js";
+
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
