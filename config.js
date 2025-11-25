@@ -1,4 +1,5 @@
-// config.js — Heavy config (single source of truth)
+// config.js — Multi-Market + Real NSE + Binance + Yahoo + Fallback
+
 import fs from "fs";
 import path from "path";
 
@@ -9,13 +10,11 @@ if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 export const CONFIG = {
   MODE: process.env.NODE_ENV || "production",
 
-  // runtime overrideable
-  ACTIVE_MARKET: (process.env.ACTIVE_MARKET || "CRYPTO").toUpperCase(),
+  ACTIVE_MARKET: process.env.ACTIVE_MARKET || "CRYPTO",
   ACTIVE_SYMBOL: process.env.ACTIVE_SYMBOL || "BTCUSDT",
 
-  // --------------------------
-  // SYMBOL MAPPINGS (4 each market)
-  // --------------------------
+  MARKETS: ["CRYPTO", "INDIA", "FOREX", "COMMODITIES"],
+
   SYMBOLS: {
     CRYPTO: {
       BTCUSDT: { binance: "BTCUSDT", yahoo: "BTC-USD" },
@@ -24,11 +23,12 @@ export const CONFIG = {
       SOLUSDT: { binance: "SOLUSDT", yahoo: "SOL-USD" }
     },
 
+    // REAL NSE LIVE
     INDIA: {
-      NIFTY50: { yahoo: "^NSEI", tv: "NSE:NIFTY" },
-      BANKNIFTY: { yahoo: "^NSEBANK", tv: "NSE:BANKNIFTY" },
-      RELIANCE: { yahoo: "RELI.NS", tv: "NSE:RELIANCE" },
-      TCS: { yahoo: "TCS.NS", tv: "NSE:TCS" }
+      NIFTY50: { nse: "NIFTY 50" },
+      BANKNIFTY: { nse: "NIFTY BANK" },
+      RELIANCE: { nse: "RELIANCE" },
+      TCS: { nse: "TCS" }
     },
 
     FOREX: {
@@ -54,46 +54,39 @@ export const CONFIG = {
   },
 
   INTERVALS: ["1m", "5m", "15m", "30m", "1h"],
-  DEFAULT_LIMIT: Number(process.env.DEFAULT_LIMIT || 500),
+  DEFAULT_LIMIT: 500,
 
-  // multi-source endpoints (primary + mirrors)
   API: {
+    NSE: "https://www.nseindia.com",
+    NSE_QUOTE: "https://www.nseindia.com/api/quote-equity?symbol=",
+    NSE_INDEX: "https://www.nseindia.com/api/quote-index?index=",
+
     BINANCE: [
       "https://api.binance.com",
       "https://api1.binance.com",
+      "https://api2.binance.com",
       "https://data-api.binance.vision"
     ],
-    COINBASE: "https://api.exchange.coinbase.com",
-    OKX: "https://www.okx.com",
+
     YAHOO: [
       "https://query1.finance.yahoo.com/v8/finance/chart",
       "https://query2.finance.yahoo.com/v8/finance/chart"
-    ],
-    EXCHANGERATE: "https://api.exchangerate.host",
-    FMP: "https://financialmodelingprep.com/api/v3",
-    TRADINGVIEW_PROXY: [
-      "https://tvc4.forexfeed.net",
-      "https://tvc5.forexfeed.net"
     ]
   },
 
   PATHS: { CACHE_DIR },
 
-  PROXY: process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.PROXY || null,
-
   FALLBACK: {
-    MAX_RETRIES: Number(process.env.MAX_RETRIES || 4),
-    RETRY_DELAY_MS: Number(process.env.RETRY_DELAY_MS || 600),
+    MAX_RETRIES: 3,
+    RETRY_DELAY_MS: 400,
     ALWAYS_SYNTHETIC_IF_ALL_FAIL: true
   },
 
   TELEGRAM: {
-    BOT_TOKEN: process.env.BOT_TOKEN || null,
-    CHAT_ID: process.env.CHAT_ID || null,
+    BOT_TOKEN: process.env.BOT_TOKEN || "",
+    CHAT_ID: process.env.CHAT_ID || "",
     ENABLED: Boolean(process.env.BOT_TOKEN && process.env.CHAT_ID)
-  },
-
-  REPORT_INTERVAL_MS: Number(process.env.REPORT_INTERVAL_MS || 15 * 60 * 1000)
+  }
 };
 
 export default CONFIG;
