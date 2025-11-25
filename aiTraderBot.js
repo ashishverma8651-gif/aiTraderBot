@@ -1,6 +1,4 @@
-// aiTraderBot.js — CLEAN FINAL + SAFETY WATCHDOG + KEEPALIVE + PANEL
-// Single file handles: Telegram Commands + Buttons + Signal Calls + Safety
-
+// aiTraderBot.js — FINAL BOT + PANEL + SYMBOL Menus + Watchdog
 import fs from "fs";
 import path from "path";
 import express from "express";
@@ -8,329 +6,198 @@ import axios from "axios";
 import { Telegraf } from "telegraf";
 
 import CONFIG from "./config.js";
-import { generateMergeSignal } from "./merge_signals.js";
+import { generateMergeSignal } from "./merge_signals.js"; // adjust path if different
 
-// ----------------------- Instance lock -----------------------
-const LOCK = path.resolve(".aitraderbot.lock");
-function writeLock() {
-  try { fs.writeFileSync(LOCK, String(process.pid)); } catch {}
-}
-function clearLock() {
-  try { if (fs.existsSync(LOCK)) fs.unlinkSync(LOCK); } catch {}
-}
-if (fs.existsSync(LOCK)) {
-  try {
-    const pid = Number(fs.readFileSync(LOCK, "utf8"));
-    if (pid && pid > 0) {
-      try { process.kill(pid, 0); console.log("⚠ Another bot instance running — exiting."); process.exit(0); } catch {}
-    }
-  } catch {}
+// instance lock
+const LOCK_FILE = path.resolve(process.cwd(), ".aitraderbot.lock");
+function writeLock(){ try{ fs.writeFileSync(LOCK_FILE, String(process.pid)); }catch{} }
+function clearLock(){ try{ if(fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); }catch{} }
+if(fs.existsSync(LOCK_FILE)){
+  try{
+    const pid = Number(fs.readFileSync(LOCK_FILE,'utf8'));
+    if(pid && pid>0){ try{ process.kill(pid,0); console.log("Another instance running — exiting."); process.exit(0);}catch{} }
+  }catch(e){}
 }
 writeLock();
 process.once("exit", clearLock);
 
-// ----------------------- Globals & Tunables -----------------------
-const PORT = process.env.PORT || 10000;
-const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 3 * 60 * 1000); // 3m
-const WATCHDOG_INTERVAL_MS = Number(process.env.WATCHDOG_INTERVAL_MS || 30 * 1000); // 30s
-const MEM_THRESHOLD_MB = Number(process.env.MEM_THRESHOLD_MB || 400); // restart if > this
-const HUNG_TASK_MS = Number(process.env.HUNG_TASK_MS || 2 * 60 * 1000); // consider generate call hung after 2m
-const MAX_CONSECUTIVE_FAILURES = Number(process.env.MAX_CONSECUTIVE_FAILURES || 5); // restart after N fails
-const CRASH_NOTIFY_CHAT = CONFIG.TELEGRAM?.CHAT_ID || null;
-
-let consecutiveFailures = 0;
-let lastGenerateAt = 0;
-let lastGenerateId = null;
-let lastKeepAliveOk = true;
-
-// ----------------------- Telegram bot -----------------------
-const bot = new Telegraf(CONFIG.TELEGRAM.BOT_TOKEN || "", { username: undefined });
-
-// Safe telegram send (best-effort)
-async function safeTelegramSend(text) {
-  try {
-    if (!CONFIG.TELEGRAM?.ENABLED || !CONFIG.TELEGRAM?.CHAT_ID) return false;
-    await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, String(text).slice(0, 4000), { parse_mode: "HTML", disable_web_page_preview: true });
-    return true;
-  } catch (e) {
-    try {
-      // fallback HTTP
-      if (CONFIG.TELEGRAM?.BOT_TOKEN && CONFIG.TELEGRAM?.CHAT_ID) {
-        await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
-          chat_id: CONFIG.TELEGRAM.CHAT_ID,
-          text: String(text).slice(0, 4000),
-          parse_mode: "HTML",
-          disable_web_page_preview: true
-        }, { timeout: 5000 });
-        return true;
-      }
-    } catch {}
-    console.log("⚠ Telegram notify failed:", e?.message || e);
-    return false;
-  }
-}
-
-// ----------------------- Express server -----------------------
-const app = express();
-app.get("/", (req, res) => res.send("AI Trader Bot Running ✔"));
-app.get("/ping", (req, res) => {
-  res.send("pong");
-});
-
-// Health endpoint for watchdog + metrics
-app.get("/health", (req, res) => {
-  res.json({
-    pid: process.pid,
-    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    consecutiveFailures,
-    lastGenerateAt,
-    lastKeepAliveOk
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`🌍 Server listening on port ${PORT}`);
-});
-
-// ----------------------- Keep-alive ping -----------------------
-function detectPublicURL() {
-  return (process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || process.env.SELF_PING_URL || "").replace(/\/+$/, "") || `http://localhost:${PORT}`;
-}
-const PUBLIC_URL = detectPublicURL();
-const PING_URL = PUBLIC_URL + "/ping";
-
-function startKeepAlive() {
-  console.log("💓 KeepAlive enabled ->", PING_URL);
-  setInterval(async () => {
-    try {
-      await axios.get(PING_URL, { timeout: 5000 });
-      lastKeepAliveOk = true;
-    } catch (e) {
-      lastKeepAliveOk = false;
-      console.log("⚠ KeepAlive ping failed");
-    }
-  }, KEEPALIVE_INTERVAL_MS);
-}
-startKeepAlive();
-
-// ----------------------- Bot panel + callbacks -----------------------
-const homeKeyboard = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: "⚡ Generate Signal", callback_data: "GENERATE_SIGNAL" }],
-      [{ text: "Market: Crypto", callback_data: "SET_MARKET_CRYPTO" }, { text: "Market: India", callback_data: "SET_MARKET_INDIA" }],
-      [{ text: "Forex", callback_data: "SET_MARKET_FOREX" }, { text: "US Stocks", callback_data: "SET_MARKET_US" }],
-      [{ text: "Auto-Report: Toggle", callback_data: "TOGGLE_AUTOREPORT" }]
-    ]
-  },
-  parse_mode: "HTML"
+// simple symbol lists (4 each)
+const SYMBOLS_LIST = {
+  CRYPTO: ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"],
+  INDIA: ["NIFTY50","BANKNIFTY","RELIANCE","TCS"],
+  FOREX: ["EURUSD","GBPUSD","USDJPY","XAUUSD"],
+  COMMODITY: ["GOLD","SILVER","CRUDEOIL","NATGAS"]
 };
 
-let autoReportEnabled = Boolean(process.env.AUTO_REPORT_ENABLED === "true");
-function kbHome() { return homeKeyboard; }
+// Telegram bot init
+const TELE_TOKEN = CONFIG.TELEGRAM?.BOT_TOKEN || process.env.BOT_TOKEN || "";
+const TELE_CHAT = CONFIG.TELEGRAM?.CHAT_ID || process.env.CHAT_ID || "";
+const bot = new Telegraf(TELE_TOKEN || "");
 
-bot.command("start", (ctx) => ctx.reply("🏠 <b>AI Trader Control Panel</b>\nChoose an option:", kbHome()));
-bot.command("panel", (ctx) => ctx.reply("🏠 <b>AI Trader Control Panel</b>", kbHome()));
+// safe telegram send (best-effort)
+async function safeTelegramSend(text){
+  try{
+    if(TELE_TOKEN && TELE_CHAT){
+      await bot.telegram.sendMessage(TELE_CHAT, String(text).slice(0,4000), { parse_mode: "HTML", disable_web_page_preview: true });
+      return true;
+    }
+  }catch(e){ console.log("Telegram send failed:", e?.message || e); }
+  // fallback HTTP attempt
+  try{
+    if(TELE_TOKEN && TELE_CHAT){
+      await axios.post(`https://api.telegram.org/bot${TELE_TOKEN}/sendMessage`, { chat_id: TELE_CHAT, text: String(text).slice(0,4000), parse_mode:"HTML", disable_web_page_preview:true }, { timeout:5000 });
+      return true;
+    }
+  }catch(e){}
+  return false;
+}
+
+// Express server + health
+const app = express();
+const PORT = process.env.PORT || 10000;
+app.get("/", (req,res)=>res.send("AI Trader Bot Running ✔"));
+app.get("/ping", (req,res)=>res.send("pong"));
+app.listen(PORT, ()=>console.log("Server listening on", PORT));
+
+// Keepalive URL detection
+function detectPublicUrl(){ return (process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL || `http://localhost:${PORT}`).replace(/\/+$/,''); }
+const PUBLIC_URL = detectPublicUrl();
+
+// UI keyboards
+let autoReportEnabled = false;
+function buildHomeKeyboard(){
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text:"⚡ Generate Signal", callback_data: "GENERATE_SIGNAL" }],
+        [{ text:"Market: Crypto", callback_data:"SET_MARKET_CRYPTO" }, { text:"Market: India", callback_data:"SET_MARKET_INDIA" }],
+        [{ text:"Forex", callback_data:"SET_MARKET_FOREX" }, { text:"Commodity", callback_data:"SET_MARKET_COMMODITY" }],
+        [{ text: `Auto-Report: ${autoReportEnabled ? "ON":"OFF"}`, callback_data: "TOGGLE_AUTOREPORT"}]
+      ]
+    },
+    parse_mode: "HTML"
+  };
+}
+function buildSymbolKeyboard(market){
+  const arr = (SYMBOLS_LIST[market] || []).map(sym => [{ text: sym, callback_data: "SET_SYMBOL_"+sym }]);
+  arr.push([{ text: "⬅ Back", callback_data: "BACK_HOME" }]);
+  return { reply_markup: { inline_keyboard: arr }, parse_mode: "HTML" };
+}
+
+// Bot handlers
+bot.command("start", ctx => ctx.reply("🏠 <b>AI Trader Control Panel</b>\nChoose an option:", buildHomeKeyboard()));
+bot.command("panel", ctx => ctx.reply("🏠 <b>AI Trader Control Panel</b>", buildHomeKeyboard()));
+
+// Track generate state and guard
+let lastGenerateAt = 0;
+const HUNG_MS = Number(process.env.HUNG_TASK_MS || 120000);
 
 bot.on("callback_query", async (ctx) => {
-  try {
-    const data = ctx.callbackQuery.data;
+  try{
+    const data = ctx.callbackQuery && ctx.callbackQuery.data;
+    if(!data){ await ctx.answerCbQuery("No action"); return; }
 
-    if (data.startsWith("SET_MARKET_")) {
-      const mk = data.replace("SET_MARKET_", "");
-      if (mk === "CRYPTO") CONFIG.ACTIVE_MARKET = "CRYPTO";
-      if (mk === "INDIA") CONFIG.ACTIVE_MARKET = "INDIA";
-      if (mk === "FOREX") CONFIG.ACTIVE_MARKET = "FOREX";
-      if (mk === "US") CONFIG.ACTIVE_MARKET = "US_STOCKS";
+    // Market buttons show symbol list
+    if(data === "SET_MARKET_CRYPTO"){ await ctx.editMessageText("Select Crypto symbol:", buildSymbolKeyboard("CRYPTO")); return; }
+    if(data === "SET_MARKET_INDIA"){ await ctx.editMessageText("Select India symbol:", buildSymbolKeyboard("INDIA")); return; }
+    if(data === "SET_MARKET_FOREX"){ await ctx.editMessageText("Select Forex symbol:", buildSymbolKeyboard("FOREX")); return; }
+    if(data === "SET_MARKET_COMMODITY"){ await ctx.editMessageText("Select Commodity:", buildSymbolKeyboard("COMMODITY")); return; }
 
-      CONFIG.ACTIVE_SYMBOL = CONFIG.DEFAULT_BY_MARKET?.[CONFIG.ACTIVE_MARKET] || CONFIG.ACTIVE_SYMBOL;
+    // Back
+    if(data === "BACK_HOME"){ await ctx.editMessageText("🏠 Main Menu", buildHomeKeyboard()); return; }
 
-      await ctx.editMessageText(`🔄 Market switched to <b>${CONFIG.ACTIVE_MARKET}</b>\nSymbol: <b>${CONFIG.ACTIVE_SYMBOL}</b>`, kbHome());
+    // Toggle auto
+    if(data === "TOGGLE_AUTOREPORT"){ autoReportEnabled = !autoReportEnabled; await ctx.editMessageText(`Auto-report: <b>${autoReportEnabled ? "ON":"OFF"}</b>`, buildHomeKeyboard()); return; }
+
+    // Symbol select
+    if(data.startsWith("SET_SYMBOL_")){
+      const sym = data.replace("SET_SYMBOL_","");
+      CONFIG.ACTIVE_SYMBOL = sym;
+      await ctx.editMessageText(`Selected <b>${sym}</b>\nPress Generate Signal to run.`, buildHomeKeyboard());
       return;
     }
 
-    if (data === "TOGGLE_AUTOREPORT") {
-      autoReportEnabled = !autoReportEnabled;
-      await ctx.answerCbQuery(`Auto-report ${autoReportEnabled ? "enabled" : "disabled"}`);
-      await ctx.editMessageText(`Auto-report is now <b>${autoReportEnabled ? "ON" : "OFF"}</b>`, kbHome());
-      return;
-    }
-
-    if (data === "GENERATE_SIGNAL") {
+    // Generate signal
+    if(data === "GENERATE_SIGNAL"){
       await ctx.editMessageText("⏳ Generating signal...");
-
-      // generate and send UI text with timeout/hung detection
-      try {
-        const id = `${CONFIG.ACTIVE_SYMBOL}_${Date.now()}`;
-        lastGenerateId = id;
+      try{
         lastGenerateAt = Date.now();
-
-        const resPromise = generateMergeSignal(CONFIG.ACTIVE_SYMBOL, { mainTF: "15m" });
-        const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error("generateSignal timeout")), HUNG_TASK_MS));
-
-        const { uiText } = await Promise.race([resPromise, timeoutPromise]);
-        consecutiveFailures = 0;
+        // race with timeout
+        const resPromise = generateMergeSignal(CONFIG.ACTIVE_SYMBOL);
+        const timeout = new Promise((_,rej)=>setTimeout(()=>rej(new Error("generateSignal timeout")), HUNG_MS));
+        const res = await Promise.race([resPromise, timeout]);
         lastGenerateAt = Date.now();
-
-        await ctx.editMessageText(uiText, kbHome());
-      } catch (e) {
-        consecutiveFailures++;
-        console.log("❌ generateSignal failed:", e?.message || e);
-        await ctx.editMessageText("❌ Failed to generate signal: " + (e?.message || "error"), kbHome());
-
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          await notifyAndRestart("Consecutive generate failures threshold reached — restarting.");
+        if(res && res.uiText){
+          await ctx.editMessageText(res.uiText, buildHomeKeyboard());
+        } else {
+          await ctx.editMessageText("❌ No result from generateMergeSignal", buildHomeKeyboard());
         }
+      }catch(e){
+        await ctx.editMessageText("❌ Failed to generate signal: " + (e?.message || e), buildHomeKeyboard());
       }
       return;
     }
 
     await ctx.answerCbQuery("Unknown action");
-  } catch (e) {
-    console.log("Callback error:", e?.message || e);
+  }catch(e){
+    console.log("Callback handler error:", e);
   }
 });
 
-// Launch bot with Render-safe polling (if token present)
-(async () => {
-  try {
-    if (CONFIG.TELEGRAM?.ENABLED && CONFIG.TELEGRAM?.BOT_TOKEN) {
+// launch bot (polling)
+(async ()=>{
+  try{
+    if(CONFIG.TELEGRAM?.ENABLED && CONFIG.TELEGRAM?.BOT_TOKEN){
       await bot.launch({ polling: { interval: 300, timeout: 50 } });
-      console.log("🤖 Telegram Bot Running (polling)");
+      console.log("Telegram bot running (polling)");
     } else {
-      console.log("⚠ Telegram disabled or missing token — skipping bot launch");
+      console.log("Telegram not enabled or BOT_TOKEN missing, bot not launched");
     }
-  } catch (e) {
-    console.log("Telegram launch error:", e?.message || e);
-  }
+  }catch(e){ console.log("Bot launch error", e); }
 })();
 
-// ----------------------- Auto-report scheduler (light) -----------------------
-let autoReportTimer = null;
-async function doAutoReport() {
-  if (!autoReportEnabled) return;
-  try {
-    const { uiText } = await generateMergeSignal(CONFIG.ACTIVE_SYMBOL, { mainTF: "15m" });
+// Auto-report scheduler
+let autoTimer = null;
+async function runAutoReport(){
+  if(!autoReportEnabled) return;
+  try{
+    const { uiText } = await generateMergeSignal(CONFIG.ACTIVE_SYMBOL);
     await safeTelegramSend(`<b>AutoReport</b>\n${uiText}`);
-  } catch (e) {
+  }catch(e){
     console.log("AutoReport error:", e?.message || e);
-    consecutiveFailures++;
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) await notifyAndRestart("AutoReport failures threshold reached — restarting.");
+    await safeTelegramSend("⚠ AutoReport failed: " + (e?.message || e));
   }
 }
-function startAutoReport() {
-  const ms = Number(process.env.REPORT_INTERVAL_MS || CONFIG.REPORT_INTERVAL_MS || 15 * 60 * 1000);
-  if (autoReportTimer) clearInterval(autoReportTimer);
-  autoReportTimer = setInterval(async () => { if (autoReportEnabled) await doAutoReport(); }, ms);
-  // small initial trigger
-  setTimeout(() => { if (autoReportEnabled) doAutoReport(); }, 5_000);
+function startAuto(intervalMs = Number(process.env.REPORT_INTERVAL_MS || 15*60*1000)){
+  if(autoTimer) clearInterval(autoTimer);
+  autoTimer = setInterval(runAutoReport, intervalMs);
+  // small initial
+  setTimeout(()=>runAutoReport(), 5000);
 }
-startAutoReport();
+startAuto();
 
-// ----------------------- Watchdog & Safety -----------------------
-let watchdogFailures = 0;
+// Watchdog to detect hung generate
+setInterval(()=> {
+  try{
+    if(lastGenerateAt && (Date.now() - lastGenerateAt) > (HUNG_MS + 30_000)){
+      // notify
+      safeTelegramSend(`<b>AI Trader Watchdog</b>\nHung generate detected\nPID: ${process.pid}\nTime: ${new Date().toLocaleString("en-IN", {timeZone:"Asia/Kolkata"})}`);
+      // reset lastGenerateAt to avoid repeated spam
+      lastGenerateAt = 0;
+    }
+  }catch(e){ console.log("Watchdog error", e); }
+}, 30_000);
 
-async function notifyAndRestart(reason = "Watchdog triggered") {
-  try {
-    console.log("‼️ WATCHDOG: " + reason);
-    await safeTelegramSend(`<b>AI Trader Watchdog</b>\n${reason}\nPID: ${process.pid}\nTime: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`);
-  } catch (e) {
-    console.log("Notify failed:", e?.message || e);
-  }
-  // graceful shutdown sequence
-  try {
-    await gracefulShutdown();
-  } catch {}
-  // exit to let hosting restart process
-  process.exit(1);
+// graceful shutdown
+async function shutdown(){
+  console.log("Shutting down...");
+  try{ await bot.stop(); }catch(e){}
+  try{ if(autoTimer) clearInterval(autoTimer); }catch(e){}
+  clearLock();
+  process.exit(0);
 }
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
-async function gracefulShutdown() {
-  try {
-    console.log("🧹 Graceful shutdown starting...");
-    try { if (autoReportTimer) clearInterval(autoReportTimer); } catch {}
-    try { await bot.stop(); } catch {}
-    try { clearLock(); } catch {}
-    console.log("🧹 Graceful shutdown finished.");
-  } catch (e) {
-    console.log("Shutdown error:", e?.message || e);
-  }
-}
-
-// Periodic watchdog loop
-setInterval(async () => {
-  try {
-    // memory
-    const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    if (memMB > MEM_THRESHOLD_MB) {
-      watchdogFailures++;
-      console.log(`⚠ High memory detected: ${memMB}MB (threshold ${MEM_THRESHOLD_MB})`);
-      if (watchdogFailures >= 2) { // allow one transient spike
-        await notifyAndRestart(`Memory ${memMB}MB exceeded threshold ${MEM_THRESHOLD_MB}MB`);
-        return;
-      }
-    } else {
-      watchdogFailures = 0;
-    }
-
-    // hung generate detection
-    if (lastGenerateAt && (Date.now() - lastGenerateAt) > (HUNG_TASK_MS + 30_000)) {
-      console.log("⚠ Possible hung generate detected (last at)", new Date(lastGenerateAt).toISOString());
-      await notifyAndRestart("Hung generate task detected");
-      return;
-    }
-
-    // consecutive failures check (extra check)
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      await notifyAndRestart("Too many consecutive failures");
-      return;
-    }
-
-    // keepalive check - if ping has been failing for a while, alert
-    if (!lastKeepAliveOk) {
-      console.log("⚠ KeepAlive last ping failed");
-      // do not immediately restart — just alert once
-      await safeTelegramSend("⚠ KeepAlive ping failing. Check hosting network.");
-    }
-
-    // optional health self-check: call /health
-    try {
-      const h = await axios.get(PUBLIC_URL + "/health", { timeout: 4000 });
-      // if health returns unexpected content, log
-      if (!h || h.status !== 200) console.log("⚠ Health check returned non-200");
-    } catch {}
-  } catch (e) {
-    console.log("Watchdog error:", e?.message || e);
-  }
-}, WATCHDOG_INTERVAL_MS);
-
-// ----------------------- Process-level handlers -----------------------
-process.on("unhandledRejection", async (reason, p) => {
-  console.log("unhandledRejection:", reason);
-  try { await safeTelegramSend(`<b>UnhandledRejection</b>\n${String(reason).slice(0,1500)}`); } catch {}
-  consecutiveFailures++;
-  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) await notifyAndRestart("unhandledRejection threshold reached");
-});
-
-process.on("uncaughtException", async (err) => {
-  console.log("uncaughtException:", err?.message || err);
-  try { await safeTelegramSend(`<b>UncaughtException</b>\n${String(err?.stack || err).slice(0,1500)}`); } catch {}
-  // immediate restart
-  await notifyAndRestart("uncaughtException — restarting");
-});
-
-// ----------------------- Cleanup on signals -----------------------
-async function cleanupAndExit(code = 0) {
-  try { await gracefulShutdown(); } catch {}
-  process.exit(code);
-}
-process.on("SIGINT", () => cleanupAndExit(0));
-process.on("SIGTERM", () => cleanupAndExit(0));
-
-// ----------------------- Exported helpers (optional) -----------------------
-export default {
-  startKeepAlive,
-  startAutoReport,
-  gracefulShutdown
-};
+// Export (optional)
+export default { startAuto, shutdown };
