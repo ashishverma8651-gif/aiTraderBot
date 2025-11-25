@@ -1,150 +1,284 @@
-// =======================================================
-// aiTraderBot.js — FINAL STABLE AI TRADER (No Import Issues)
-// =======================================================
+// ===================================================
+// core_indicators.js — Universal Indicators Engine
+// Crypto / Stocks / Forex / Indices (NSE / US / Global)
+// With: Normalizer + Multi-TF + Multi-Market safe logic
+// ===================================================
 
-import TelegramBot from "node-telegram-bot-api";
-import CONFIG from "./config.js";
-import { fetchPrice, fetchMultiTF } from "./utils.js";
-import {
-  computeMultiTF,
-  deriveSignal
-} from "./core_indicators.js";
+// ---------------------------
+// SAFE NUMBER
+// ---------------------------
+function N(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+// ===================================================
+// CANDLE NORMALIZER (SUPER IMPORTANT)
+// Ensures: sorted, numeric, no null, consistent output
+// ===================================================
+export function normalizeCandles(candles = []) {
+  if (!Array.isArray(candles)) return [];
 
-// ===============================
-// TELEGRAM BUTTONS
-// ===============================
-const keyboard = {
-  reply_markup: {
-    keyboard: [
-      ["⚡ Generate Signal"],
-      ["Crypto", "India"],
-      ["Forex", "Commodities"],
-      ["Auto-Report: OFF"]
-    ],
-    resize_keyboard: true
-  }
-};
-
-// ===============================
-// ON /start
-// ===============================
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    `🔥 *AI Trader Bot Started*\nSelect market below`,
-    { parse_mode: "Markdown", ...keyboard }
-  );
-});
-
-// ============================================================
-// AUTO-REPORT TOGGLE
-// ============================================================
-let AUTO = false;
-
-bot.on("message", async (msg) => {
-  const t = msg.text;
-  const chat = msg.chat.id;
-
-  // ---------------- Market Switch ----------------
-  const switchMarket = (m) => {
-    CONFIG.ACTIVE_MARKET = m;
-    CONFIG.ACTIVE_SYMBOL = CONFIG.DEFAULT_BY_MARKET[m];
-
-    bot.sendMessage(
-      chat,
-      `🔄 Market switched to *${m}* \nSymbol: *${CONFIG.ACTIVE_SYMBOL}*`,
-      { parse_mode: "Markdown" }
+  const out = candles
+    .map(c => ({
+      t: Number(c.t),
+      open: N(c.open),
+      high: N(c.high),
+      low: N(c.low),
+      close: N(c.close),
+      vol: N(c.vol, 0)   // Yahoo/NSE safe
+    }))
+    .filter(c =>
+      Number.isFinite(c.t) &&
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close)
     );
-  };
 
-  if (t === "Crypto") return switchMarket("CRYPTO");
-  if (t === "India") return switchMarket("INDIA");
-  if (t === "Forex") return switchMarket("FOREX");
-  if (t === "Commodities") return switchMarket("COMMODITIES");
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
 
-  // ---------------- Auto Report ----------------
-  if (t.includes("Auto-Report")) {
-    AUTO = !AUTO;
-    bot.sendMessage(
-      chat,
-      `⏱ Auto Report: *${AUTO ? "ON" : "OFF"}*`,
-      { parse_mode: "Markdown", ...keyboard }
-    );
-    return;
+// ===================================================
+// RSI (Smoothed Version)
+// ===================================================
+export function computeRSI(candles = [], length = 14) {
+  if (!Array.isArray(candles) || candles.length < length + 2) return 50;
+
+  let gains = 0, losses = 0;
+
+  for (let i = candles.length - length - 1; i < candles.length - 1; i++) {
+    const prev = N(candles[i].close);
+    const curr = N(candles[i + 1].close);
+    const diff = curr - prev;
+
+    if (diff > 0) gains += diff;
+    else losses -= diff;
   }
 
-  // ----------------------------------------------------------
-  // GENERATE SIGNAL
-  // ----------------------------------------------------------
-  if (t === "⚡ Generate Signal") {
-    const market = CONFIG.ACTIVE_MARKET;
-    const symbol = CONFIG.ACTIVE_SYMBOL;
+  if (!gains && !losses) return 50;
 
-    bot.sendMessage(chat, `📡 Fetching *${symbol}* (${market})...`, {
-      parse_mode: "Markdown"
-    });
+  const avgGain = gains / length;
+  const avgLoss = (losses || 0.000001) / length;
 
-    // 1) LIVE PRICE
-    const price = await fetchPrice(symbol, market);
+  const rs = avgGain / avgLoss;
+  return Number((100 - 100 / (1 + rs)).toFixed(2));
+}
 
-    // 2) MULTI-TF OHLC
-    const tfData = await fetchMultiTF(symbol, market);
+// ===================================================
+// ATR — True Range
+// ===================================================
+export function computeATR(candles = [], length = 14) {
+  if (candles.length < length + 1) return 0;
 
-    // 3) APPLY INDICATOR ENGINE
-    const indicatorsTF = computeMultiTF(tfData);
+  const trs = [];
 
-    // 4) FINAL SIGNAL (weighted)
-    const finalSig = deriveSignal(indicatorsTF["5m"]); // base TF = 5m
+  for (let i = candles.length - length; i < candles.length; i++) {
+    const cur = candles[i];
+    const prev = candles[i - 1] || cur;
 
-    // ----------------------------------------------------------
-    // BUILD SIGNAL REPORT
-    // ----------------------------------------------------------
-    let out = `🔥 *${symbol} — AI Market Intelligence*\n`;
-    out += `Market: *${market}*\n`;
-    out += `Price: *${price}*\n`;
-    out += `━━━━━━━━━━━━━━\n`;
+    const high = N(cur.high);
+    const low = N(cur.low);
+    const prevC = N(prev.close);
 
-    for (const tf of ["1m", "5m", "15m", "30m", "1h"]) {
-      const d = indicatorsTF[tf];
-      if (!d) {
-        out += `🕒 ${tf}: ❌ No data\n`;
-        continue;
-      }
-      out += `🕒 *${tf}*\n`;
-      out += `• RSI: ${d.RSI}\n`;
-      out += `• ATR: ${d.ATR}\n`;
-      out += `• MACD.hist: ${d.MACD.hist}\n`;
-      out += `• Trend: ${d.priceTrend}\n`;
-      out += `• Vol: ${d.volumeTrend}\n\n`;
+    trs.push(
+      Math.max(
+        high - low,
+        Math.abs(high - prevC),
+        Math.abs(low - prevC)
+      )
+    );
+  }
+
+  const atr = trs.reduce((a, b) => a + b, 0) / trs.length;
+  return Number(atr.toFixed(4));
+}
+
+// ===================================================
+// EMA — SMA-initialized (professional accuracy)
+// ===================================================
+function ema(values = [], period = 12) {
+  if (values.length < period) return [];
+
+  const sma = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  const k = 2 / (period + 1);
+  let prev = sma;
+  const out = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const v = N(values[i]);
+    if (i < period) {
+      out.push(sma);
+      continue;
     }
-
-    out += `━━━━━━━━━━━━━━\n`;
-    out += `📌 Final Signal: *${finalSig}*\n`;
-    out += `🌐 Source: Binance / Yahoo / Forex / Proxies\n`;
-
-    bot.sendMessage(chat, out, { parse_mode: "Markdown" });
+    prev = (v * k) + (prev * (1 - k));
+    out.push(prev);
   }
-});
 
-// ===============================================================
-// OPTIONAL AUTO REPORT LOOP
-// ===============================================================
-setInterval(async () => {
-  if (!AUTO) return;
+  return out;
+}
 
-  const symbol = CONFIG.ACTIVE_SYMBOL;
-  const market = CONFIG.ACTIVE_MARKET;
+// ===================================================
+// MACD — Noise Reduced
+// ===================================================
+export function computeMACD(candles = []) {
+  if (candles.length < 35) return { hist: 0, line: 0, signal: 0 };
 
-  const price = await fetchPrice(symbol, market);
-  const tfData = await fetchMultiTF(symbol, market);
-  const ind = computeMultiTF(tfData);
-  const sig = deriveSignal(ind["5m"]);
+  const closes = candles.map(c => N(c.close));
 
-  bot.sendMessage(
-    CONFIG.TELEGRAM.CHAT_ID,
-    `⏱ Auto Report — *${symbol}*\nSignal: *${sig}*\nPrice: *${price}*`,
-    { parse_mode: "Markdown" }
-  );
-}, 60_000); // every 1 min
+  const e12 = ema(closes, 12);
+  const e26 = ema(closes, 26);
+  const macdLine = e12.map((v, i) => v - (e26[i] || 0));
+  const signal = ema(macdLine, 9);
+
+  const line = macdLine.at(-1) || 0;
+  const sig = signal.at(-1) || 0;
+  const hist = line - sig;
+
+  return {
+    hist: Number(hist.toFixed(6)),
+    line: Number(line.toFixed(6)),
+    signal: Number(sig.toFixed(6))
+  };
+}
+
+// ===================================================
+// Volume Trend (Yahoo/NSE safe)
+// ===================================================
+export function volumeTrend(candles = []) {
+  if (candles.length < 2) return "STABLE";
+
+  const last = N(candles.at(-1).vol);
+  const prev = N(candles.at(-2).vol);
+
+  if (!last || !prev) return "STABLE";
+
+  if (last > prev) return "INCREASING";
+  if (last < prev) return "DECREASING";
+  return "STABLE";
+}
+
+// ===================================================
+// Volume Score (granular)
+// ===================================================
+export function analyzeVolume(candles = []) {
+  if (candles.length < 3) return { status: "UNKNOWN", strength: 0 };
+
+  const v1 = N(candles.at(-3).vol);
+  const v2 = N(candles.at(-2).vol);
+  const v3 = N(candles.at(-1).vol);
+
+  if (v3 > v2 && v2 > v1) return { status: "RISING", strength: 3 };
+  if (v3 < v2 && v2 < v1) return { status: "FALLING", strength: -3 };
+
+  if (v3 > v2) return { status: "SLIGHT_UP", strength: 1 };
+  if (v3 < v2) return { status: "SLIGHT_DOWN", strength: -1 };
+
+  return { status: "STABLE", strength: 0 };
+}
+
+// ===================================================
+// Fibonacci Levels
+// ===================================================
+export function computeFibLevelsFromCandles(candles = []) {
+  if (!candles.length) return null;
+
+  const highs = candles.map(c => N(c.high));
+  const lows = candles.map(c => N(c.low));
+
+  const hi = Math.max(...highs);
+  const lo = Math.min(...lows);
+  const diff = hi - lo;
+
+  return {
+    lo,
+    hi,
+    retrace: {
+      "0.236": Number((hi - diff * 0.236).toFixed(6)),
+      "0.382": Number((hi - diff * 0.382).toFixed(6)),
+      "0.5":   Number((hi - diff * 0.5).toFixed(6)),
+      "0.618": Number((hi - diff * 0.618).toFixed(6)),
+      "0.786": Number((hi - diff * 0.786).toFixed(6))
+    }
+  };
+}
+
+// ===================================================
+// Price Trend
+// ===================================================
+export function computePriceTrend(candles = []) {
+  if (candles.length < 4) return "FLAT";
+
+  const c1 = N(candles.at(-4).close);
+  const c2 = N(candles.at(-3).close);
+  const c3 = N(candles.at(-2).close);
+  const c4 = N(candles.at(-1).close);
+
+  if (c4 > c3 && c3 > c2 && c2 > c1) return "UP";
+  if (c4 < c3 && c3 < c2 && c2 < c1) return "DOWN";
+
+  return "FLAT";
+}
+
+// ===================================================
+// Single-TF Indicator Bundle
+// ===================================================
+export function computeIndicators(candles = []) {
+  candles = normalizeCandles(candles);
+
+  return {
+    RSI: computeRSI(candles),
+    ATR: computeATR(candles),
+    MACD: computeMACD(candles),
+    priceTrend: computePriceTrend(candles),
+    volumeTrend: volumeTrend(candles),
+    volumeScore: analyzeVolume(candles),
+    fib: computeFibLevelsFromCandles(candles)
+  };
+}
+
+// ===================================================
+// MULTI-TIMEFRAME INDICATOR ENGINE
+// ===================================================
+export function computeMultiTF(allTF) {
+  const out = {};
+  for (const tf in allTF) {
+    const candles = allTF[tf]?.data || [];
+    out[tf] = computeIndicators(candles);
+  }
+  return out;
+}
+
+// ===================================================
+// SIGNAL GENERATOR (weighted)
+// ===================================================
+export function deriveSignal(ind) {
+  if (!ind) return "NEUTRAL";
+
+  let score = 0;
+
+  // RSI Weight
+  if (typeof ind.RSI === "number") {
+    if (ind.RSI < 30) score += 2;
+    if (ind.RSI < 20) score += 1;
+    if (ind.RSI > 70) score -= 2;
+    if (ind.RSI > 80) score -= 1;
+  }
+
+  // MACD weight
+  if (ind.MACD) score += ind.MACD.hist > 0 ? 2 : -2;
+
+  // Trend
+  if (ind.priceTrend === "UP") score += 1;
+  if (ind.priceTrend === "DOWN") score -= 1;
+
+  // Volume
+  if (ind.volumeTrend === "INCREASING") score += 1;
+  if (ind.volumeTrend === "DECREASING") score -= 1;
+
+  if (score >= 3) return "BUY";
+  if (score <= -3) return "SELL";
+  return "HOLD";
+}
