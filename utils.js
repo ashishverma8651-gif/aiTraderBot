@@ -1,10 +1,9 @@
-// utils.js — FINAL VERSION (NO CACHE, ALWAYS LIVE PRICE)
-
+// utils.js — FIXED FULL VERSION (LIVE PRICE + FULL OHLC)
 import axios from "axios";
 import CONFIG from "./config.js";
 
 // ---------------------------------------------------------
-// Universal HTTP fetch with proxy + retry
+// SAFE HTTP GET (Proxy + retry + timeout)
 // ---------------------------------------------------------
 async function safeGet(url, retry = 3) {
   try {
@@ -22,20 +21,17 @@ async function safeGet(url, retry = 3) {
 }
 
 // ---------------------------------------------------------
-// FETCH PRICE — Multi-Market Live Price
+// FETCH PRICE — MULTI-MARKET
 // ---------------------------------------------------------
 export async function fetchPrice(symbol, market) {
   try {
     const map = CONFIG.SYMBOLS[market][symbol];
-    if (!map) throw new Error("Invalid symbol-map");
+    if (!map) throw new Error("Invalid symbol map");
 
-    let price = null;
-
-    // ===============================
-    // 1) CRYPTO → BINANCE → YAHOO
-    // ===============================
+    // --------------------
+    // CRYPTO
+    // --------------------
     if (market === "CRYPTO") {
-      // try all binance mirrors
       for (const host of CONFIG.API.BINANCE) {
         try {
           let url = `${host}/api/v3/ticker/price?symbol=${map.binance}`;
@@ -44,7 +40,7 @@ export async function fetchPrice(symbol, market) {
         } catch {}
       }
 
-      // yahoo fallback
+      // fallback yahoo
       for (const y of CONFIG.API.YAHOO) {
         try {
           let url = `${y}/${map.yahoo}?interval=1m&range=1d`;
@@ -55,11 +51,10 @@ export async function fetchPrice(symbol, market) {
       }
     }
 
-    // ===============================
-    // 2) INDIA → YAHOO → TRADINGVIEW PROXY
-    // ===============================
+    // --------------------
+    // INDIA
+    // --------------------
     if (market === "INDIA") {
-      // yahoo finance index + stocks
       for (const y of CONFIG.API.YAHOO) {
         try {
           let url = `${y}/${map.yahoo}?interval=1m&range=1d`;
@@ -69,7 +64,7 @@ export async function fetchPrice(symbol, market) {
         } catch {}
       }
 
-      // TradingView proxy (index only)
+      // TradingView proxy
       if (map.tv) {
         for (const tv of CONFIG.API.TRADINGVIEW_PROXY) {
           try {
@@ -81,11 +76,10 @@ export async function fetchPrice(symbol, market) {
       }
     }
 
-    // ===============================
-    // 3) FOREX → YAHOO → EXCHANGERATE
-    // ===============================
+    // --------------------
+    // FOREX
+    // --------------------
     if (market === "FOREX") {
-      // yahoo
       for (const y of CONFIG.API.YAHOO) {
         try {
           let url = `${y}/${map.yahoo}?interval=1m&range=1d`;
@@ -95,9 +89,11 @@ export async function fetchPrice(symbol, market) {
         } catch {}
       }
 
-      // exchangerate.host fallback
+      // Fix: base / quote splitting
       try {
-        let [base, quote] = symbol.split("");
+        let base = symbol.slice(0, 3);
+        let quote = symbol.slice(3);
+
         let url = `${CONFIG.API.EXCHANGERATE}/latest?base=${base}&symbols=${quote}`;
         let r = await safeGet(url);
         let p = r?.data?.rates?.[quote];
@@ -105,9 +101,9 @@ export async function fetchPrice(symbol, market) {
       } catch {}
     }
 
-    // ===============================
-    // 4) COMMODITIES → YAHOO ONLY
-    // ===============================
+    // --------------------
+    // COMMODITIES
+    // --------------------
     if (market === "COMMODITIES") {
       for (const y of CONFIG.API.YAHOO) {
         try {
@@ -119,71 +115,78 @@ export async function fetchPrice(symbol, market) {
       }
     }
 
-    throw new Error(`ALL API FAILED for ${symbol} (${market})`);
-  } catch (err) {
-    console.error("PriceError:", err.message);
+    throw new Error(`ALL PRICE SOURCES FAILED for ${symbol}`);
+  } catch (e) {
+    console.error("PriceError:", e.message);
     return null;
   }
 }
 
 // ---------------------------------------------------------
-// Multi-timeframe Data Fetcher (Binance + Yahoo)
+// MULTI-TF FETCHER (RSI/ATR USES THIS)
 // ---------------------------------------------------------
 export async function fetchMultiTF(symbol, market, intervals = CONFIG.INTERVALS) {
-  let data = {};
+  let result = {};
 
   for (const tf of intervals) {
     let candles = await fetchOHLC(symbol, market, tf);
-    data[tf] = candles;
+    result[tf] = candles;
   }
 
-  return data;
+  return result;
 }
 
 // ---------------------------------------------------------
-// OHLC FETCHER (1m, 5m, 15m, 30m, 1h)
+// UNIVERSAL OHLC FETCHER
 // ---------------------------------------------------------
 async function fetchOHLC(symbol, market, interval) {
   try {
     const map = CONFIG.SYMBOLS[market][symbol];
     if (!map) throw new Error("Invalid symbol map");
 
-    // CRYPTO OHLC from binance
+    // --------------------
+    // CRYPTO → BINANCE
+    // --------------------
     if (market === "CRYPTO") {
       for (const host of CONFIG.API.BINANCE) {
         try {
-          let url = `${host}/api/v3/klines?symbol=${map.binance}&interval=${interval}&limit=100`;
+          let url = `${host}/api/v3/klines?symbol=${map.binance}&interval=${interval}&limit=200`;
           let r = await safeGet(url);
+
           return r.data.map(c => ({
             time: c[0],
             open: parseFloat(c[1]),
             high: parseFloat(c[2]),
             low: parseFloat(c[3]),
-            close: parseFloat(c[4])
+            close: parseFloat(c[4]),
+            volume: parseFloat(c[5])
           }));
         } catch {}
       }
     }
 
-    // EVERYTHING ELSE → YAHOO OHLC
+    // --------------------
+    // STOCK / INDEX / FOREX / COMMODITY → YAHOO
+    // --------------------
     for (const y of CONFIG.API.YAHOO) {
       try {
         let url = `${y}/${map.yahoo}?interval=${interval}&range=5d`;
         let r = await safeGet(url);
 
-        let result = r?.data?.chart?.result?.[0];
-        if (!result) continue;
+        let res = r?.data?.chart?.result?.[0];
+        if (!res || !res.timestamp) continue;
 
-        let ts = result.timestamp;
-        let o = result.indicators.quote[0];
+        let ts = res.timestamp;
+        let q = res.indicators?.quote?.[0];
 
         return ts.map((t, i) => ({
           time: t * 1000,
-          open: o.open[i],
-          high: o.high[i],
-          low: o.low[i],
-          close: o.close[i]
-        }));
+          open: q.open[i],
+          high: q.high[i],
+          low: q.low[i],
+          close: q.close[i],
+          volume: q.volume[i]
+        })).filter(x => Number.isFinite(x.close));
       } catch {}
     }
 
