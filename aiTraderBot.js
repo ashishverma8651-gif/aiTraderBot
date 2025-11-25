@@ -1,16 +1,21 @@
-// aiTraderBot.js — FINAL FIXED VERSION
+// =======================================================
+// aiTraderBot.js — FINAL STABLE AI TRADER (No Import Issues)
+// =======================================================
+
 import TelegramBot from "node-telegram-bot-api";
 import CONFIG from "./config.js";
 import { fetchPrice, fetchMultiTF } from "./utils.js";
-import { calcRSI, calcATR, calcTrend } from "./core_indicators.js";
-
+import {
+  computeMultiTF,
+  deriveSignal
+} from "./core_indicators.js";
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// --------------------------------------------------
-// STATIC TELEGRAM KEYBOARD
-// --------------------------------------------------
-const mainKeyboard = {
+// ===============================
+// TELEGRAM BUTTONS
+// ===============================
+const keyboard = {
   reply_markup: {
     keyboard: [
       ["⚡ Generate Signal"],
@@ -22,143 +27,124 @@ const mainKeyboard = {
   }
 };
 
-// Auto report state
-let autoReport = false;
-let autoInterval = null;
-
-// --------------------------------------------------
-// START COMMAND
-// --------------------------------------------------
+// ===============================
+// ON /start
+// ===============================
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🔥 *AI Trader Bot Ready*\nSelect a market or generate a signal!",
-    { parse_mode: "Markdown", ...mainKeyboard }
+    `🔥 *AI Trader Bot Started*\nSelect market below`,
+    { parse_mode: "Markdown", ...keyboard }
   );
 });
 
-// --------------------------------------------------
-// MARKET SWITCH
-// --------------------------------------------------
-const switchMarket = (chat, market) => {
-  CONFIG.ACTIVE_MARKET = market;
-  CONFIG.ACTIVE_SYMBOL = CONFIG.DEFAULT_BY_MARKET[market];
-  bot.sendMessage(chat, `✅ Market switched to *${market}*`, { parse_mode: "Markdown" });
-};
+// ============================================================
+// AUTO-REPORT TOGGLE
+// ============================================================
+let AUTO = false;
 
-// --------------------------------------------------
-// MAIN MESSAGE HANDLER
-// --------------------------------------------------
 bot.on("message", async (msg) => {
-  const text = msg.text;
+  const t = msg.text;
   const chat = msg.chat.id;
 
-  // MARKET BUTTONS
-  if (text === "Crypto") return switchMarket(chat, "CRYPTO");
-  if (text === "India") return switchMarket(chat, "INDIA");
-  if (text === "Forex") return switchMarket(chat, "FOREX");
-  if (text === "Commodities") return switchMarket(chat, "COMMODITIES");
+  // ---------------- Market Switch ----------------
+  const switchMarket = (m) => {
+    CONFIG.ACTIVE_MARKET = m;
+    CONFIG.ACTIVE_SYMBOL = CONFIG.DEFAULT_BY_MARKET[m];
 
-  // --------------------------------------------------
-  // AUTO REPORT TOGGLE
-  // --------------------------------------------------
-  if (text.startsWith("Auto-Report")) {
-    autoReport = !autoReport;
+    bot.sendMessage(
+      chat,
+      `🔄 Market switched to *${m}* \nSymbol: *${CONFIG.ACTIVE_SYMBOL}*`,
+      { parse_mode: "Markdown" }
+    );
+  };
 
-    if (autoReport) {
-      bot.sendMessage(chat, "🟢 Auto-report enabled (every 10 min)");
-      autoInterval = setInterval(() => generateSignal(chat, true), CONFIG.REPORT_INTERVAL_MS);
-    } else {
-      bot.sendMessage(chat, "🔴 Auto-report disabled");
-      clearInterval(autoInterval);
-    }
+  if (t === "Crypto") return switchMarket("CRYPTO");
+  if (t === "India") return switchMarket("INDIA");
+  if (t === "Forex") return switchMarket("FOREX");
+  if (t === "Commodities") return switchMarket("COMMODITIES");
 
-    bot.sendMessage(chat, "Updated!", { ...mainKeyboard });
+  // ---------------- Auto Report ----------------
+  if (t.includes("Auto-Report")) {
+    AUTO = !AUTO;
+    bot.sendMessage(
+      chat,
+      `⏱ Auto Report: *${AUTO ? "ON" : "OFF"}*`,
+      { parse_mode: "Markdown", ...keyboard }
+    );
     return;
   }
 
-  // --------------------------------------------------
-  // GENERATE SIGNAL BUTTON
-  // --------------------------------------------------
-  if (text === "⚡ Generate Signal") {
-    return generateSignal(chat, false);
+  // ----------------------------------------------------------
+  // GENERATE SIGNAL
+  // ----------------------------------------------------------
+  if (t === "⚡ Generate Signal") {
+    const market = CONFIG.ACTIVE_MARKET;
+    const symbol = CONFIG.ACTIVE_SYMBOL;
+
+    bot.sendMessage(chat, `📡 Fetching *${symbol}* (${market})...`, {
+      parse_mode: "Markdown"
+    });
+
+    // 1) LIVE PRICE
+    const price = await fetchPrice(symbol, market);
+
+    // 2) MULTI-TF OHLC
+    const tfData = await fetchMultiTF(symbol, market);
+
+    // 3) APPLY INDICATOR ENGINE
+    const indicatorsTF = computeMultiTF(tfData);
+
+    // 4) FINAL SIGNAL (weighted)
+    const finalSig = deriveSignal(indicatorsTF["5m"]); // base TF = 5m
+
+    // ----------------------------------------------------------
+    // BUILD SIGNAL REPORT
+    // ----------------------------------------------------------
+    let out = `🔥 *${symbol} — AI Market Intelligence*\n`;
+    out += `Market: *${market}*\n`;
+    out += `Price: *${price}*\n`;
+    out += `━━━━━━━━━━━━━━\n`;
+
+    for (const tf of ["1m", "5m", "15m", "30m", "1h"]) {
+      const d = indicatorsTF[tf];
+      if (!d) {
+        out += `🕒 ${tf}: ❌ No data\n`;
+        continue;
+      }
+      out += `🕒 *${tf}*\n`;
+      out += `• RSI: ${d.RSI}\n`;
+      out += `• ATR: ${d.ATR}\n`;
+      out += `• MACD.hist: ${d.MACD.hist}\n`;
+      out += `• Trend: ${d.priceTrend}\n`;
+      out += `• Vol: ${d.volumeTrend}\n\n`;
+    }
+
+    out += `━━━━━━━━━━━━━━\n`;
+    out += `📌 Final Signal: *${finalSig}*\n`;
+    out += `🌐 Source: Binance / Yahoo / Forex / Proxies\n`;
+
+    bot.sendMessage(chat, out, { parse_mode: "Markdown" });
   }
 });
 
-// --------------------------------------------------
-// MAIN SIGNAL GENERATION FUNCTION
-// --------------------------------------------------
-async function generateSignal(chat, isAutoReport = false) {
-  const market = CONFIG.ACTIVE_MARKET;
+// ===============================================================
+// OPTIONAL AUTO REPORT LOOP
+// ===============================================================
+setInterval(async () => {
+  if (!AUTO) return;
+
   const symbol = CONFIG.ACTIVE_SYMBOL;
+  const market = CONFIG.ACTIVE_MARKET;
 
-  if (!isAutoReport) {
-    bot.sendMessage(chat, `📡 Fetching *${symbol}* (${market})...\nPlease wait 2–4 sec`, {
-      parse_mode: "Markdown"
-    });
-  }
+  const price = await fetchPrice(symbol, market);
+  const tfData = await fetchMultiTF(symbol, market);
+  const ind = computeMultiTF(tfData);
+  const sig = deriveSignal(ind["5m"]);
 
-  // --------------------------------------------------
-  // WATCHDOG SAFETY (FIXED VERSION)
-  // --------------------------------------------------
-  const watchdog = setTimeout(() => {
-    bot.sendMessage(
-      chat,
-      "⚠ *AI Trader Watchdog* — Hung generate detected",
-      { parse_mode: "Markdown" }
-    );
-  }, 25000); // 25 sec timeout
-
-  try {
-    // 1) PRICE FETCH
-    const price = await fetchPrice(symbol, market);
-    if (!price) {
-      clearTimeout(watchdog);
-      return bot.sendMessage(chat, "❌ Could not fetch live price.");
-    }
-
-    // 2) MULTI TIMEFRAME OHLC
-    const multi = await fetchMultiTF(symbol, market);
-
-    // CANCEL WATCHDOG (important)
-    clearTimeout(watchdog);
-
-    // --------------------------------------------------
-    // BUILD FINAL REPORT
-    // --------------------------------------------------
-    let report = `🔥 *${symbol} — AI Market Intelligence*\n`;
-    report += `Market: ${market}\n`;
-    report += `Time: ${new Date().toLocaleString()}\n`;
-    report += `Price: *${price}*\n`;
-    report += `━━━━━━━━━━━━━━━━━━━━\n`;
-
-    for (const tf of CONFIG.INTERVALS) {
-      const data = multi[tf];
-      if (!data || data.length < 20) {
-        report += `🕒 ${tf}: ⚠ Not enough data\n`;
-        continue;
-      }
-
-      const rsi = calcRSI(data);
-      const atr = calcATR(data);
-      const trend = calcTrend(data);
-
-      report += `🕒 *${tf}* — ${trend.emoji} ${trend.signal}\n`;
-      report += `• RSI: *${rsi.toFixed(1)}*\n`;
-      report += `• ATR: *${atr.toFixed(2)}*\n`;
-      report += `• Trend: *${trend.label}*\n\n`;
-    }
-
-    report += `━━━━━━━━━━━━━━━━━━━━\n`;
-    report += `🌐 Fusion: Live-first | Sources: Yahoo/Binance/Proxy\n`;
-
-    bot.sendMessage(chat, report, {
-      parse_mode: "Markdown",
-      ...mainKeyboard
-    });
-
-  } catch (err) {
-    clearTimeout(watchdog);
-    bot.sendMessage(chat, "❌ Error: " + err.message);
-  }
-}
+  bot.sendMessage(
+    CONFIG.TELEGRAM.CHAT_ID,
+    `⏱ Auto Report — *${symbol}*\nSignal: *${sig}*\nPrice: *${price}*`,
+    { parse_mode: "Markdown" }
+  );
+}, 60_000); // every 1 min
