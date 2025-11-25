@@ -1,41 +1,43 @@
-// utils.js — FINAL FIX WITH GUARANTEED OHLC (Yahoo missing-data patch)
+// utils.js — FINAL STABLE VERSION
 
 import axios from "axios";
 import CONFIG from "./config.js";
 
-async function safeGet(url, retry = 3) {
+// Universal GET with retry
+async function safeGet(url, retry = 2) {
   try {
-    return await axios.get(url, {
-      timeout: 8000,
-      proxy: false,
-    });
-  } catch (err) {
+    return await axios.get(url, { timeout: 7000 });
+  } catch (e) {
     if (retry > 0) return safeGet(url, retry - 1);
     return null;
   }
 }
 
-// ---------------------------------------------------
-// LIVE PRICE FETCHER
-// ---------------------------------------------------
+// -------------------------------
+// FETCH PRICE
+// -------------------------------
 export async function fetchPrice(symbol, market) {
   try {
-    const map = CONFIG.SYMBOLS[market][symbol];
+    const sym = CONFIG.SYMBOLS[market]?.[symbol];
 
-    // ====== CRYPTO ======
-    if (market === "CRYPTO") {
+    if (!sym) {
+      console.log("❌ Symbol missing:", market, symbol);
+      return null;
+    }
+
+    // CRYPTO → Binance first
+    if (market === "CRYPTO" && sym.binance) {
       for (const host of CONFIG.API.BINANCE) {
-        const r = await safeGet(`${host}/api/v3/ticker/price?symbol=${map.binance}`);
-        const p = r?.data?.price;
-        if (p) return parseFloat(p);
+        let r = await safeGet(`${host}/api/v3/ticker/price?symbol=${sym.binance}`);
+        if (r?.data?.price) return parseFloat(r.data.price);
       }
     }
 
-    // ====== YAHOO PRICE ======
+    // Yahoo fallback (Crypto + India + Forex + Commodities)
     for (const y of CONFIG.API.YAHOO) {
-      const r = await safeGet(`${y}/${map.yahoo}?interval=1m&range=1d`);
-      const p = r?.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
-      if (p) return Number(p);
+      let r = await safeGet(`${y}/${sym.yahoo}?interval=1m&range=1d`);
+      let p = r?.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+      if (p) return parseFloat(p);
     }
 
     return null;
@@ -44,100 +46,66 @@ export async function fetchPrice(symbol, market) {
   }
 }
 
-// ---------------------------------------------------
-// MULTI-TIMEFRAME
-// ---------------------------------------------------
-export async function fetchMultiTF(symbol, market, intervals = CONFIG.INTERVALS) {
-  let out = {};
-  for (const tf of intervals) out[tf] = await fetchOHLC(symbol, market, tf);
-  return out;
-}
-
-// ---------------------------------------------------
-// OHLC FETCHER — GUARANTEED DATA
-// ---------------------------------------------------
+// -------------------------------
+// FETCH OHLC (for multi-TF)
+// -------------------------------
 async function fetchOHLC(symbol, market, interval) {
-  const map = CONFIG.SYMBOLS[market][symbol];
+  const sym = CONFIG.SYMBOLS[market]?.[symbol];
+  if (!sym) return [];
 
-  // ==========================================
-  // CRYPTO → BINANCE CANDLES (ALWAYS WORK)
-  // ==========================================
-  if (market === "CRYPTO") {
+  // CRYPTO → Binance OHLC
+  if (market === "CRYPTO" && sym.binance) {
     for (const host of CONFIG.API.BINANCE) {
-      const r = await safeGet(`${host}/api/v3/klines?symbol=${map.binance}&interval=${interval}&limit=100`);
+      let r = await safeGet(
+        `${host}/api/v3/klines?symbol=${sym.binance}&interval=${interval}&limit=100`
+      );
       if (r?.data) {
         return r.data.map(k => ({
           time: k[0],
-          open: Number(k[1]),
-          high: Number(k[2]),
-          low: Number(k[3]),
-          close: Number(k[4]),
-          volume: Number(k[5]) || 0,
+          open: +k[1],
+          high: +k[2],
+          low: +k[3],
+          close: +k[4],
+          volume: +k[5]
         }));
       }
     }
   }
 
-  // ======================================================
-  // NON-CRYPTO → YAHOO (BUT WITH MISSING DATA PATCH)
-  // ======================================================
+  // Yahoo OHLC
   for (const y of CONFIG.API.YAHOO) {
-    const r = await safeGet(`${y}/${map.yahoo}?interval=${interval}&range=5d`);
-    const res = r?.data?.chart?.result?.[0];
-    if (!res) continue;
+    let r = await safeGet(`${y}/${sym.yahoo}?interval=${interval}&range=5d`);
+    let result = r?.data?.chart?.result?.[0];
+    if (!result) continue;
 
-    const ts = res.timestamp || [];
-    const q = res.indicators?.quote?.[0] || {};
+    let ts = result.timestamp || [];
+    let q = result.indicators?.quote?.[0] || {};
 
-    // ---- FIX: Yahoo कभी-कभी null open/high/low/close देता है
-    const candles = ts.map((t, i) => {
-      const o = q.open?.[i];
-      const h = q.high?.[i];
-      const l = q.low?.[i];
-      const c = q.close?.[i];
-
-      // अगर close missing है → candle drop नहीं करते → patch: पिछली close से fill
-      const safeClose = Number.isFinite(c) ? c : q.close?.[i - 1] ?? null;
-      const safeOpen = Number.isFinite(o) ? o : safeClose;
-      const safeHigh = Number.isFinite(h) ? h : safeClose;
-      const safeLow = Number.isFinite(l) ? l : safeClose;
-
-      return {
-        time: t * 1000,
-        open: safeOpen,
-        high: safeHigh,
-        low: safeLow,
-        close: safeClose,
-        volume: q.volume?.[i] ?? 0,
-      };
-    }).filter(c => Number.isFinite(c.close));
-
-    if (candles.length > 10) return candles; // enough data
+    return ts.map((t, i) => ({
+      time: t * 1000,
+      open: q.open?.[i] ?? null,
+      high: q.high?.[i] ?? null,
+      low: q.low?.[i] ?? null,
+      close: q.close?.[i] ?? null,
+      volume: q.volume?.[i] ?? 0
+    })).filter(c => Number.isFinite(c.close));
   }
 
-  // ======================================================
-  // LAST RESORT → TRADINGVIEW-LITE FREE (NEVER FAILS)
-  // ======================================================
-  try {
-    const r = await safeGet(`https://api.tradingview.com/markets/history?symbol=${map.tv || map.yahoo}&resolution=${interval}&count=100`);
-    if (r?.t && r?.c) {
-      let out = [];
-      for (let i = 0; i < r.t.length; i++) {
-        out.push({
-          time: r.t[i] * 1000,
-          open: r.o?.[i] ?? r.c[i],
-          high: r.h?.[i] ?? r.c[i],
-          low: r.l?.[i] ?? r.c[i],
-          close: r.c[i],
-          volume: r.v?.[i] ?? 0,
-        });
-      }
-      return out;
-    }
-  } catch {}
-
-  // fallback empty
   return [];
+}
+
+// -------------------------------
+// MULTI-TF WRAPPER
+// -------------------------------
+export async function fetchMultiTF(symbol, market) {
+  const intervals = ["1m", "5m", "15m", "30m", "1h"];
+  let out = {};
+
+  for (const tf of intervals) {
+    out[tf] = await fetchOHLC(symbol, market, tf);
+  }
+
+  return out;
 }
 
 export default { fetchPrice, fetchMultiTF };
